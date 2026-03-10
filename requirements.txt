@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+yfinance
+pandas
+numpy
+pydantic
+pydantic-settings
+python-dotenv
+httpx
+pytest
+slowapi
