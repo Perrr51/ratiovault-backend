@@ -607,13 +607,17 @@ def get_asset_info(request: Request, tickers: str):
             industry = info.get("industry") or None
             name = info.get("shortName") or info.get("longName") or None
 
-            # If yfinance returned nothing useful, use pattern fallback
-            if not quote_type or quote_type == "NONE":
-                fallback = _infer_asset_type(t)
-                quote_type = fallback["quoteType"]
-                sector = sector or fallback["sector"]
-                industry = industry or fallback["industry"]
-                name = name or fallback["name"]
+            # Always check pattern-based override first (yfinance often misclassifies commodities as crypto)
+            override = _infer_asset_type(t)
+            if override["quoteType"] not in ("UNKNOWN",):
+                # Pattern matched — trust our classification over yfinance
+                quote_type = override["quoteType"]
+                sector = override["sector"] or sector
+                industry = override["industry"] or industry
+                name = name or override["name"]
+            elif not quote_type or quote_type == "NONE":
+                # yfinance returned nothing useful and no pattern match
+                quote_type = "UNKNOWN"
 
             result[t] = {
                 "quoteType": quote_type,
