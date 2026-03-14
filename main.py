@@ -73,18 +73,31 @@ def get_quotes(request: Request, tickers: str):
     data = yf.Tickers(validated.tickers)
     result = {}
     for t in ticker_list:
-        info = data.tickers[t].info
-        price = info.get("currentPrice") or info.get("regularMarketPrice") or 0.0
-        prev_close = info.get("previousClose") or info.get("regularMarketPreviousClose") or price
-        result[t] = {
-            "price": price,
-            "previousClose": prev_close,
-            "open": info.get("open") or info.get("regularMarketOpen") or price,
-            "high": info.get("dayHigh") or info.get("regularMarketDayHigh") or price,
-            "low": info.get("dayLow") or info.get("regularMarketDayLow") or price,
-            "trailingPE": info.get("trailingPE"),
-            "dividendYield": info.get("dividendYield")
-        }
+        try:
+            info = data.tickers[t].info
+            price = info.get("currentPrice") or info.get("regularMarketPrice") or 0.0
+            prev_close = info.get("previousClose") or info.get("regularMarketPreviousClose") or price
+            result[t] = {
+                "price": price,
+                "previousClose": prev_close,
+                "open": info.get("open") or info.get("regularMarketOpen") or price,
+                "high": info.get("dayHigh") or info.get("regularMarketDayHigh") or price,
+                "low": info.get("dayLow") or info.get("regularMarketDayLow") or price,
+                "trailingPE": info.get("trailingPE"),
+                "dividendYield": info.get("dividendYield")
+            }
+        except Exception as e:
+            logger.warning(f"Failed to fetch quote for {t}: {e}")
+            result[t] = {
+                "price": 0.0,
+                "previousClose": 0.0,
+                "open": 0.0,
+                "high": 0.0,
+                "low": 0.0,
+                "trailingPE": None,
+                "dividendYield": None,
+                "error": str(e)
+            }
     return result
 
 @app.get("/search")
