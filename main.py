@@ -567,14 +567,15 @@ def _infer_asset_type(ticker: str) -> dict:
 
     # Crypto patterns
     crypto_suffixes = ("-USD", "-EUR", "-BTC")
-    crypto_tickers = ("BTC", "ETH", "SOL", "ADA", "DOGE", "XRP", "DOT", "AVAX", "MATIC", "LINK")
+    crypto_exact = {"BTC-USD", "ETH-USD", "SOL-USD", "ADA-USD", "DOGE-USD", "XRP-USD", "DOT-USD", "AVAX-USD", "MATIC-USD", "LINK-USD",
+                     "BTC-EUR", "ETH-EUR", "SOL-EUR", "ADA-EUR", "DOGE-EUR", "XRP-EUR"}
+    if t in crypto_exact:
+        return {"quoteType": "CRYPTOCURRENCY", "sector": None, "industry": "Cryptocurrency", "name": t}
     if any(t.endswith(s) for s in crypto_suffixes):
         base = t.split("-")[0]
         # If it's a known commodity prefix, skip (already handled above)
         if not any(base.startswith(p) for p in commodity_prefixes):
             return {"quoteType": "CRYPTOCURRENCY", "sector": None, "industry": "Cryptocurrency", "name": t}
-    if any(t.startswith(ct) for ct in crypto_tickers):
-        return {"quoteType": "CRYPTOCURRENCY", "sector": None, "industry": "Cryptocurrency", "name": t}
 
     # Currency pairs
     if "=X" in t:
@@ -700,7 +701,7 @@ def get_news(request: Request, ticker: str):
                     # Parse ISO format date
                     parsed = dt.fromisoformat(pub_date.replace('Z', '+00:00'))
                     datetime_value = int(parsed.timestamp())
-                except:
+                except (ValueError, TypeError):
                     datetime_value = int(time.time())
             else:
                 datetime_value = article.get("providerPublishTime", int(time.time()))
