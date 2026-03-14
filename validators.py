@@ -9,7 +9,7 @@ from pydantic import BaseModel, validator, Field
 
 
 # Regex pattern for valid ticker symbols (alphanumeric + dash/period, 1-20 chars)
-TICKER_PATTERN = re.compile(r'^[A-Z0-9\.\-]{1,20}$')
+TICKER_PATTERN = re.compile(r'^[A-Z0-9\.\-\=\^]{1,20}$')
 
 
 class TickerValidator(BaseModel):
@@ -58,7 +58,7 @@ class QuotesRequest(BaseModel):
 
     @validator('tickers')
     def validate_tickers(cls, v):
-        ticker_list = TickerValidator.validate_ticker_list(v, max_count=10)
+        ticker_list = TickerValidator.validate_ticker_list(v, max_count=50)
         return ",".join(ticker_list)
 
 

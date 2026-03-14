@@ -70,34 +70,81 @@ def get_quotes(request: Request, tickers: str):
     # ✅ Validate input
     validated = QuotesRequest(tickers=tickers)
     ticker_list = validated.tickers.split(",")
-    data = yf.Tickers(validated.tickers)
     result = {}
-    for t in ticker_list:
+
+    def _fetch_single(t: str) -> dict:
+        """Fetch quote for a single ticker using fast_info + info fallback."""
         try:
-            info = data.tickers[t].info
-            price = info.get("currentPrice") or info.get("regularMarketPrice") or 0.0
+            stock = yf.Ticker(t)
+
+            # Try fast_info first (much faster, no full download)
+            try:
+                fi = stock.fast_info
+                price = fi.get("lastPrice", 0) or fi.get("regularMarketPrice", 0) or 0.0
+                prev_close = fi.get("previousClose", 0) or fi.get("regularMarketPreviousClose", 0) or price
+                day_open = fi.get("open", 0) or fi.get("regularMarketOpen", 0) or price
+                day_high = fi.get("dayHigh", 0) or fi.get("regularMarketDayHigh", 0) or price
+                day_low = fi.get("dayLow", 0) or fi.get("regularMarketDayLow", 0) or price
+                if price and price > 0:
+                    return {
+                        "price": float(price),
+                        "previousClose": float(prev_close),
+                        "open": float(day_open),
+                        "high": float(day_high),
+                        "low": float(day_low),
+                        "trailingPE": None,
+                        "dividendYield": None,
+                    }
+            except Exception:
+                pass  # fast_info failed, fall through to info
+
+            # Fallback: full info dict
+            info = stock.info
+            if not info or info.get("trailingPegRatio") is None and info.get("regularMarketPrice") is None and info.get("currentPrice") is None:
+                # Likely an invalid ticker — yfinance returns near-empty dict
+                # Try history as last resort
+                hist = stock.history(period="5d")
+                if hist.empty:
+                    return {
+                        "price": 0.0, "previousClose": 0.0, "open": 0.0,
+                        "high": 0.0, "low": 0.0, "trailingPE": None,
+                        "dividendYield": None, "error": f"No data found for {t}"
+                    }
+                last_row = hist.iloc[-1]
+                prev_row = hist.iloc[-2] if len(hist) >= 2 else last_row
+                return {
+                    "price": float(last_row["Close"]),
+                    "previousClose": float(prev_row["Close"]),
+                    "open": float(last_row["Open"]),
+                    "high": float(last_row["High"]),
+                    "low": float(last_row["Low"]),
+                    "trailingPE": None,
+                    "dividendYield": None,
+                }
+
+            price = info.get("currentPrice") or info.get("regularMarketPrice") or info.get("navPrice") or 0.0
             prev_close = info.get("previousClose") or info.get("regularMarketPreviousClose") or price
-            result[t] = {
-                "price": price,
-                "previousClose": prev_close,
-                "open": info.get("open") or info.get("regularMarketOpen") or price,
-                "high": info.get("dayHigh") or info.get("regularMarketDayHigh") or price,
-                "low": info.get("dayLow") or info.get("regularMarketDayLow") or price,
+            return {
+                "price": float(price),
+                "previousClose": float(prev_close),
+                "open": float(info.get("open") or info.get("regularMarketOpen") or price),
+                "high": float(info.get("dayHigh") or info.get("regularMarketDayHigh") or price),
+                "low": float(info.get("dayLow") or info.get("regularMarketDayLow") or price),
                 "trailingPE": info.get("trailingPE"),
-                "dividendYield": info.get("dividendYield")
+                "dividendYield": info.get("dividendYield"),
             }
         except Exception as e:
             logger.warning(f"Failed to fetch quote for {t}: {e}")
-            result[t] = {
-                "price": 0.0,
-                "previousClose": 0.0,
-                "open": 0.0,
-                "high": 0.0,
-                "low": 0.0,
-                "trailingPE": None,
-                "dividendYield": None,
-                "error": str(e)
+            return {
+                "price": 0.0, "previousClose": 0.0, "open": 0.0,
+                "high": 0.0, "low": 0.0, "trailingPE": None,
+                "dividendYield": None, "error": str(e)
             }
+
+    # Fetch each ticker individually to prevent one failure from breaking the batch
+    for t in ticker_list:
+        result[t] = _fetch_single(t)
+
     return result
 
 @app.get("/search")
