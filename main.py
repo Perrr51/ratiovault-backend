@@ -548,6 +548,87 @@ def get_forex_rates(request: Request):
         return {"USDEUR": 0.92, "USDCHF": 0.88, "fallback": True}
 
 
+def _infer_asset_type(ticker: str) -> dict:
+    """
+    Fallback classification when yfinance can't identify a ticker.
+    Uses ticker patterns to guess the asset type.
+    """
+    t = ticker.upper()
+
+    # Commodity patterns: precious metals, oil, etc.
+    commodity_prefixes = ("XAG", "XAU", "XPT", "XPD")  # Silver, Gold, Platinum, Palladium
+    commodity_keywords = ("CRUDE", "OIL", "GAS", "WHEAT", "CORN", "COFFEE", "SUGAR", "COTTON", "COPPER")
+    if any(t.startswith(p) for p in commodity_prefixes):
+        metal_names = {"XAG": "Plata (Silver)", "XAU": "Oro (Gold)", "XPT": "Platino", "XPD": "Paladio"}
+        prefix = t[:3]
+        return {"quoteType": "COMMODITY", "sector": "Precious Metals", "industry": "Precious Metals", "name": metal_names.get(prefix, t)}
+    if any(kw in t for kw in commodity_keywords):
+        return {"quoteType": "COMMODITY", "sector": "Commodities", "industry": "Commodities", "name": t}
+
+    # Crypto patterns
+    crypto_suffixes = ("-USD", "-EUR", "-BTC")
+    crypto_tickers = ("BTC", "ETH", "SOL", "ADA", "DOGE", "XRP", "DOT", "AVAX", "MATIC", "LINK")
+    if any(t.endswith(s) for s in crypto_suffixes):
+        base = t.split("-")[0]
+        # If it's a known commodity prefix, skip (already handled above)
+        if not any(base.startswith(p) for p in commodity_prefixes):
+            return {"quoteType": "CRYPTOCURRENCY", "sector": None, "industry": "Cryptocurrency", "name": t}
+    if any(t.startswith(ct) for ct in crypto_tickers):
+        return {"quoteType": "CRYPTOCURRENCY", "sector": None, "industry": "Cryptocurrency", "name": t}
+
+    # Currency pairs
+    if "=X" in t:
+        return {"quoteType": "CURRENCY", "sector": None, "industry": "Forex", "name": t}
+
+    # Index
+    if t.startswith("^"):
+        return {"quoteType": "INDEX", "sector": None, "industry": "Index", "name": t}
+
+    return {"quoteType": "UNKNOWN", "sector": None, "industry": None, "name": t}
+
+
+@app.get("/asset-info")
+@limiter.limit("30/minute")
+def get_asset_info(request: Request, tickers: str):
+    """
+    Get asset type (EQUITY, ETF, COMMODITY, etc.) and sector for each ticker.
+    Fetches each ticker individually to prevent one failure from breaking the batch.
+    Falls back to pattern-based classification when yfinance can't identify a ticker.
+    """
+    validated = QuotesRequest(tickers=tickers)
+    ticker_list = validated.tickers.split(",")
+    result = {}
+    for t in ticker_list:
+        try:
+            stock = yf.Ticker(t)
+            info = stock.info
+            quote_type = info.get("quoteType") or None
+            sector = info.get("sector") or None
+            industry = info.get("industry") or None
+            name = info.get("shortName") or info.get("longName") or None
+
+            # If yfinance returned nothing useful, use pattern fallback
+            if not quote_type or quote_type == "NONE":
+                fallback = _infer_asset_type(t)
+                quote_type = fallback["quoteType"]
+                sector = sector or fallback["sector"]
+                industry = industry or fallback["industry"]
+                name = name or fallback["name"]
+
+            result[t] = {
+                "quoteType": quote_type,
+                "sector": sector,
+                "industry": industry,
+                "name": name or t,
+            }
+        except Exception as e:
+            logger.warning(f"Failed to fetch asset info for {t}: {e}")
+            # Use pattern-based fallback
+            fallback = _infer_asset_type(t)
+            result[t] = {**fallback, "error": str(e)}
+    return result
+
+
 @app.get("/news")
 @limiter.limit("20/minute")  # ✅ 20 requests per minute
 def get_news(request: Request, ticker: str):
