@@ -472,6 +472,33 @@ def export_chart_data(request: Request, ticker: str, interval: str = "1M"):
     )
 
 
+@app.get("/forex")
+@limiter.limit("30/minute")
+def get_forex_rates(request: Request):
+    """
+    Get current USD-based exchange rates for EUR and CHF.
+    Uses yfinance forex tickers: EURUSD=X, USDCHF=X
+    Returns: { "USDEUR": rate, "USDCHF": rate }
+    """
+    try:
+        pairs = yf.Tickers("EURUSD=X USDCHF=X")
+        eur_info = pairs.tickers["EURUSD=X"].info
+        chf_info = pairs.tickers["USDCHF=X"].info
+
+        # EURUSD=X gives how many USD per 1 EUR → we want USD→EUR so invert
+        eurusd = eur_info.get("regularMarketPrice") or eur_info.get("previousClose") or 1
+        # USDCHF=X gives how many CHF per 1 USD → that's what we want
+        usdchf = chf_info.get("regularMarketPrice") or chf_info.get("previousClose") or 1
+
+        return {
+            "USDEUR": round(1 / eurusd, 6) if eurusd else 1,
+            "USDCHF": round(usdchf, 6),
+        }
+    except Exception as e:
+        logger.error(f"Error fetching forex rates: {e}")
+        return {"USDEUR": 0.92, "USDCHF": 0.88, "fallback": True}
+
+
 @app.get("/news")
 @limiter.limit("20/minute")  # ✅ 20 requests per minute
 def get_news(request: Request, ticker: str):
