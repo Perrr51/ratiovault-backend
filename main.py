@@ -485,6 +485,42 @@ def export_chart_data(request: Request, ticker: str, interval: str = "1M"):
     )
 
 
+@app.get("/sp500-performance")
+@limiter.limit("10/minute")
+def get_sp500_performance(request: Request):
+    """
+    Returns S&P 500 (^GSPC) YTD and 1Y return percentages.
+    """
+    try:
+        sp = yf.Ticker("^GSPC")
+        hist_1y = sp.history(period="1y")
+        hist_ytd = sp.history(period="ytd")
+
+        result = {}
+
+        if not hist_1y.empty and len(hist_1y) >= 2:
+            start_1y = hist_1y['Close'].iloc[0]
+            end_1y = hist_1y['Close'].iloc[-1]
+            result["return1Y"] = round(((end_1y - start_1y) / start_1y) * 100, 2)
+        else:
+            result["return1Y"] = None
+
+        if not hist_ytd.empty and len(hist_ytd) >= 2:
+            start_ytd = hist_ytd['Close'].iloc[0]
+            end_ytd = hist_ytd['Close'].iloc[-1]
+            result["returnYTD"] = round(((end_ytd - start_ytd) / start_ytd) * 100, 2)
+        else:
+            result["returnYTD"] = None
+
+        # Historical average annual return (long-term benchmark)
+        result["avgAnnual"] = 10.5
+
+        return result
+    except Exception as e:
+        logger.error(f"Error fetching S&P 500 performance: {e}")
+        return {"return1Y": None, "returnYTD": None, "avgAnnual": 10.5, "fallback": True}
+
+
 @app.get("/forex")
 @limiter.limit("30/minute")
 def get_forex_rates(request: Request):
