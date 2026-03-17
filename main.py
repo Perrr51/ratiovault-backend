@@ -72,6 +72,22 @@ def get_quotes(request: Request, tickers: str):
     ticker_list = validated.tickers.split(",")
     result = {}
 
+    import math
+
+    def _safe_float(v, default=0.0):
+        """Convert to float, replacing NaN/Inf with default."""
+        if v is None:
+            return default
+        try:
+            f = float(v)
+            return default if (math.isnan(f) or math.isinf(f)) else f
+        except (ValueError, TypeError):
+            return default
+
+    def _sanitize_quote(d: dict) -> dict:
+        """Replace any NaN/Inf float values in a quote dict."""
+        return {k: (_safe_float(v) if isinstance(v, float) else v) for k, v in d.items()}
+
     def _fetch_single(t: str) -> dict:
         """Fetch quote for a single ticker using fast_info + info fallback."""
         try:
@@ -152,7 +168,7 @@ def get_quotes(request: Request, tickers: str):
 
     # Fetch each ticker individually to prevent one failure from breaking the batch
     for t in ticker_list:
-        result[t] = _fetch_single(t)
+        result[t] = _sanitize_quote(_fetch_single(t))
 
     return result
 
