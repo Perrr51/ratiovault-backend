@@ -78,6 +78,7 @@ def get_quotes(request: Request, tickers: str):
             stock = yf.Ticker(t)
 
             # Try fast_info first (much faster, no full download)
+            quote_currency = None
             try:
                 fi = stock.fast_info
                 price = fi.get("lastPrice", 0) or fi.get("regularMarketPrice", 0) or 0.0
@@ -85,6 +86,8 @@ def get_quotes(request: Request, tickers: str):
                 day_open = fi.get("open", 0) or fi.get("regularMarketOpen", 0) or price
                 day_high = fi.get("dayHigh", 0) or fi.get("regularMarketDayHigh", 0) or price
                 day_low = fi.get("dayLow", 0) or fi.get("regularMarketDayLow", 0) or price
+                # Try to get currency from fast_info
+                quote_currency = fi.get("currency", None)
                 if price and price > 0:
                     return {
                         "price": float(price),
@@ -94,12 +97,15 @@ def get_quotes(request: Request, tickers: str):
                         "low": float(day_low),
                         "trailingPE": None,
                         "dividendYield": None,
+                        "currency": quote_currency,
                     }
             except Exception:
                 pass  # fast_info failed, fall through to info
 
-            # Fallback: full info dict
+            # Fallback: full info dict (slower but has currency)
             info = stock.info
+            quote_currency = info.get("currency") or info.get("financialCurrency") or None
+
             if not info or info.get("trailingPegRatio") is None and info.get("regularMarketPrice") is None and info.get("currentPrice") is None:
                 # Likely an invalid ticker — yfinance returns near-empty dict
                 # Try history as last resort
@@ -108,7 +114,8 @@ def get_quotes(request: Request, tickers: str):
                     return {
                         "price": 0.0, "previousClose": 0.0, "open": 0.0,
                         "high": 0.0, "low": 0.0, "trailingPE": None,
-                        "dividendYield": None, "error": f"No data found for {t}"
+                        "dividendYield": None, "currency": quote_currency,
+                        "error": f"No data found for {t}"
                     }
                 last_row = hist.iloc[-1]
                 prev_row = hist.iloc[-2] if len(hist) >= 2 else last_row
@@ -120,6 +127,7 @@ def get_quotes(request: Request, tickers: str):
                     "low": float(last_row["Low"]),
                     "trailingPE": None,
                     "dividendYield": None,
+                    "currency": quote_currency,
                 }
 
             price = info.get("currentPrice") or info.get("regularMarketPrice") or info.get("navPrice") or 0.0
@@ -132,6 +140,7 @@ def get_quotes(request: Request, tickers: str):
                 "low": float(info.get("dayLow") or info.get("regularMarketDayLow") or price),
                 "trailingPE": info.get("trailingPE"),
                 "dividendYield": info.get("dividendYield"),
+                "currency": quote_currency,
             }
         except Exception as e:
             logger.warning(f"Failed to fetch quote for {t}: {e}")
@@ -618,24 +627,54 @@ def get_sp500_annualized(request: Request, start_date: str):
 @limiter.limit("30/minute")
 def get_forex_rates(request: Request):
     """
-    Get current USD-based exchange rates for EUR and CHF.
-    Uses yfinance forex tickers: EURUSD=X, USDCHF=X
-    Returns: { "USDEUR": rate, "USDCHF": rate }
+    Get current USD-based exchange rates for EUR, CHF, GBP, GBX, JPY, CAD, AUD, SEK, NOK, DKK.
+    Uses yfinance forex tickers.
+    Returns: { "USDEUR": rate, "USDCHF": rate, "USDGBP": rate, ... }
     """
     try:
-        pairs = yf.Tickers("EURUSD=X USDCHF=X")
-        eur_info = pairs.tickers["EURUSD=X"].info
-        chf_info = pairs.tickers["USDCHF=X"].info
-
-        # EURUSD=X gives how many USD per 1 EUR → we want USD→EUR so invert
-        eurusd = eur_info.get("regularMarketPrice") or eur_info.get("previousClose") or 1
-        # USDCHF=X gives how many CHF per 1 USD → that's what we want
-        usdchf = chf_info.get("regularMarketPrice") or chf_info.get("previousClose") or 1
-
-        return {
-            "USDEUR": round(1 / eurusd, 6) if eurusd else 1,
-            "USDCHF": round(usdchf, 6),
+        # Pairs where ticker gives "how many USD per 1 unit" (e.g. EURUSD=X → 1 EUR = X USD)
+        # We invert these to get USDEUR (1 USD = X EUR)
+        invert_pairs = {
+            "EURUSD=X": "USDEUR",
+            "GBPUSD=X": "USDGBP",
+            "AUDUSD=X": "USDAUD",
         }
+        # Pairs where ticker gives "how many units per 1 USD" (e.g. USDCHF=X → 1 USD = X CHF)
+        direct_pairs = {
+            "USDCHF=X": "USDCHF",
+            "USDJPY=X": "USDJPY",
+            "USDCAD=X": "USDCAD",
+            "USDSEK=X": "USDSEK",
+            "USDNOK=X": "USDNOK",
+            "USDDKK=X": "USDDKK",
+        }
+
+        all_tickers = list(invert_pairs.keys()) + list(direct_pairs.keys())
+        pairs = yf.Tickers(" ".join(all_tickers))
+
+        result = {}
+
+        for yf_ticker, key in invert_pairs.items():
+            try:
+                info = pairs.tickers[yf_ticker].info
+                rate = info.get("regularMarketPrice") or info.get("previousClose") or 1
+                result[key] = round(1 / rate, 6) if rate else 1
+            except Exception:
+                pass
+
+        for yf_ticker, key in direct_pairs.items():
+            try:
+                info = pairs.tickers[yf_ticker].info
+                rate = info.get("regularMarketPrice") or info.get("previousClose") or 1
+                result[key] = round(rate, 6)
+            except Exception:
+                pass
+
+        # GBX (pence) = GBP / 100
+        if "USDGBP" in result:
+            result["USDGBX"] = round(result["USDGBP"] * 100, 6)
+
+        return result
     except Exception as e:
         logger.error(f"Error fetching forex rates: {e}")
         return {"USDEUR": 0.92, "USDCHF": 0.88, "fallback": True}
