@@ -285,3 +285,15 @@ class BenchmarkHistoryRequest(BaseModel):
         if parsed > date.today():
             raise ValueError(f"Date cannot be in the future: {v}")
         return v
+
+    @validator('end')
+    def validate_date_range(cls, v, values):
+        if 'start' in values:
+            start = date.fromisoformat(values['start'])
+            end = date.fromisoformat(v)
+            if end < start:
+                raise ValueError("End date must be after start date")
+            max_days = 365 * 10
+            if (end - start).days > max_days:
+                raise ValueError(f"Date range too large. Maximum {max_days} days (10 years)")
+        return v
