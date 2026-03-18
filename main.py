@@ -29,6 +29,7 @@ from validators import (
     NewsRequest,
     SECTickerRequest,
     HistoryRequest,
+    DividendsRequest,
 )
 
 # Configure logging
@@ -1260,3 +1261,64 @@ def get_history(request: Request, tickers: str, start: str, end: str):
     except Exception as e:
         logger.error(f"Error fetching history: {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch historical data")
+
+
+@app.get("/dividends")
+@limiter.limit("10/minute")
+def get_dividends(request: Request, tickers: str):
+    """Get dividend data for given tickers."""
+    validated = DividendsRequest(tickers=tickers)
+    ticker_list = validated.tickers.split(",")
+    result = {}
+
+    for ticker in ticker_list:
+        try:
+            t = yf.Ticker(ticker)
+            info = t.info or {}
+
+            # Get dividend history (last 5 years)
+            try:
+                divs = t.dividends
+                history = []
+                if divs is not None and not divs.empty:
+                    for date_idx, amount in divs.tail(20).items():
+                        history.append({
+                            "date": date_idx.strftime('%Y-%m-%d'),
+                            "amount": _safe_float(amount)
+                        })
+                    # Detect frequency from intervals
+                    if len(divs) >= 2:
+                        intervals = divs.index.to_series().diff().dropna().dt.days
+                        avg_interval = intervals.mean()
+                        if avg_interval < 45:
+                            frequency = "monthly"
+                        elif avg_interval < 100:
+                            frequency = "quarterly"
+                        elif avg_interval < 200:
+                            frequency = "semi-annual"
+                        else:
+                            frequency = "annual"
+                    else:
+                        frequency = "unknown"
+                else:
+                    frequency = "none"
+            except Exception:
+                history = []
+                frequency = "none"
+
+            result[ticker] = {
+                "annualDividend": _safe_float(info.get("trailingAnnualDividendRate")),
+                "dividendYield": _safe_float(info.get("trailingAnnualDividendYield")),
+                "exDate": info.get("exDividendDate", None),
+                "frequency": frequency,
+                "currency": info.get("currency", "USD"),
+                "history": history,
+            }
+        except Exception as e:
+            logger.warning(f"Failed to get dividend data for {ticker}: {e}")
+            result[ticker] = {
+                "annualDividend": 0, "dividendYield": 0, "exDate": None,
+                "frequency": "none", "currency": "USD", "history": []
+            }
+
+    return result

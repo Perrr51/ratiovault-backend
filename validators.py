@@ -244,3 +244,13 @@ class HistoryRequest(BaseModel):
             if end < start:
                 raise ValueError("End date must be after start date")
         return v
+
+
+class DividendsRequest(BaseModel):
+    """Validation for /dividends endpoint"""
+    tickers: str = Field(..., description="Comma-separated list of ticker symbols")
+
+    @validator('tickers')
+    def validate_tickers(cls, v):
+        ticker_list = TickerValidator.validate_ticker_list(v, max_count=30)
+        return ",".join(ticker_list)
