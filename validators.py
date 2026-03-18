@@ -297,3 +297,14 @@ class BenchmarkHistoryRequest(BaseModel):
             if (end - start).days > max_days:
                 raise ValueError(f"Date range too large. Maximum {max_days} days (10 years)")
         return v
+
+
+class CorrelationRequest(BaseModel):
+    """Validation for /correlation endpoint"""
+    tickers: str = Field(..., description="Comma-separated list of ticker symbols")
+    period: Literal["6mo", "1y", "2y"] = Field(default="1y", description="Historical period")
+
+    @validator('tickers')
+    def validate_tickers(cls, v):
+        ticker_list = TickerValidator.validate_ticker_list(v, max_count=10)
+        return ",".join(ticker_list)

@@ -32,6 +32,7 @@ from validators import (
     DividendsRequest,
     TERRequest,
     BenchmarkHistoryRequest,
+    CorrelationRequest,
 )
 
 # Configure logging
@@ -1364,3 +1365,48 @@ def get_benchmark_history(request: Request, symbol: str, start: str, end: str):
     except Exception as e:
         logger.error(f"Error fetching benchmark history for {validated.symbol}: {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch benchmark data")
+
+
+@app.get("/correlation")
+@limiter.limit("10/minute")
+def get_correlation(request: Request, tickers: str, period: str = "1y"):
+    """Get correlation matrix for given tickers."""
+    validated = CorrelationRequest(tickers=tickers, period=period)
+    ticker_list = validated.tickers.split(",")
+
+    # Cache check
+    cache_key = f"corr_{'_'.join(sorted(ticker_list))}_{validated.period}"
+    if cache_key in chart_cache:
+        entry = chart_cache[cache_key]
+        if time.time() - entry["cached_at"] < 86400:  # 24h
+            return entry["data"]
+
+    try:
+        data = yf.download(ticker_list, period=validated.period, progress=False, auto_adjust=True)
+        if data.empty:
+            return {"tickers": ticker_list, "matrix": [], "period": validated.period}
+
+        closes = data['Close']
+        if isinstance(closes, pd.Series):
+            closes = closes.to_frame(name=ticker_list[0])
+
+        returns = closes.pct_change().dropna()
+        corr_matrix = returns.corr()
+
+        # Build response with ordered tickers matching matrix
+        ordered_tickers = [t for t in ticker_list if t in corr_matrix.columns]
+        matrix = []
+        for t1 in ordered_tickers:
+            row = [_safe_float(corr_matrix.loc[t1, t2]) for t2 in ordered_tickers]
+            matrix.append(row)
+
+        result = {"tickers": ordered_tickers, "matrix": matrix, "period": validated.period}
+
+        # Cache
+        chart_cache[cache_key] = {"data": result, "cached_at": time.time()}
+        _cleanup_chart_cache()
+
+        return result
+    except Exception as e:
+        logger.error(f"Error computing correlation: {e}")
+        raise HTTPException(status_code=500, detail="Failed to compute correlation matrix")
