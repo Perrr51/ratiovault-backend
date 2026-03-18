@@ -308,3 +308,41 @@ class CorrelationRequest(BaseModel):
     def validate_tickers(cls, v):
         ticker_list = TickerValidator.validate_ticker_list(v, max_count=10)
         return ",".join(ticker_list)
+
+
+class AlertItem(BaseModel):
+    """Validation for a single alert in /alerts/evaluate"""
+    ticker: str = Field(..., max_length=20)
+    type: str = Field(default="price_above", max_length=30)
+    operator: str = Field(default=">", max_length=5)
+    targetValue: float = Field(default=0)
+    id: Optional[str] = Field(default=None, max_length=100)
+    enabled: Optional[bool] = Field(default=True)
+
+    @validator('ticker')
+    def validate_ticker(cls, v):
+        v = v.strip().upper()
+        if not TICKER_PATTERN.match(v):
+            raise ValueError(f"Invalid ticker format: {v}")
+        return v
+
+
+class AlertEvaluateRequest(BaseModel):
+    """Validation for /alerts/evaluate POST body"""
+    alerts: List[AlertItem] = Field(..., max_length=100)
+
+
+class PortfolioItemForAI(BaseModel):
+    """Validation for a portfolio item in /ai/chat"""
+    ticker: str = Field(default="", max_length=20)
+    value: float = Field(default=0)
+    cost: float = Field(default=0)
+    sector: str = Field(default="", max_length=100)
+    shares: float = Field(default=0)
+    pnl: float = Field(default=0)
+
+
+class AIChatRequest(BaseModel):
+    """Validation for /ai/chat POST body"""
+    message: str = Field(..., max_length=2000)
+    positions: List[PortfolioItemForAI] = Field(default=[], max_length=200)

@@ -33,6 +33,8 @@ from validators import (
     TERRequest,
     BenchmarkHistoryRequest,
     CorrelationRequest,
+    AlertEvaluateRequest,
+    AIChatRequest,
 )
 
 # Configure logging
@@ -42,7 +44,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="ThinkInvest API", version="1.0.0")
+import os
+_is_prod = os.getenv("ENVIRONMENT", "production") == "production"
+app = FastAPI(
+    title="RatioVault API",
+    version="1.0.0",
+    docs_url=None if _is_prod else "/docs",
+    redoc_url=None if _is_prod else "/redoc",
+    openapi_url=None if _is_prod else "/openapi.json",
+)
 
 # Validate configuration on startup
 validate_settings()
@@ -102,18 +112,6 @@ def get_quotes(request: Request, tickers: str):
     if len(ticker_list) > 30:
         raise HTTPException(status_code=400, detail="Maximum 30 tickers per request")
     result = {}
-
-    import math
-
-    def _safe_float(v, default=0.0):
-        """Convert to float, replacing NaN/Inf with default."""
-        if v is None:
-            return default
-        try:
-            f = float(v)
-            return default if (math.isnan(f) or math.isinf(f)) else f
-        except (ValueError, TypeError):
-            return default
 
     def _sanitize_quote(d: dict) -> dict:
         """Replace any NaN/Inf float values in a quote dict."""
@@ -397,7 +395,7 @@ def get_chart_data(request: Request, ticker: str, interval: str = "1M", indicato
     if cache_key in chart_cache:
         cached_data = chart_cache[cache_key]
         if time.time() - cached_data["cached_at"] < CHART_CACHE_TTL:
-            print(f"✅ Cache hit for {cache_key}")
+            logger.debug(f"Cache hit for {cache_key}")
             return cached_data["data"]
         else:
             # Cache expired, remove it
@@ -474,14 +472,12 @@ def get_chart_data(request: Request, ticker: str, interval: str = "1M", indicato
             "data": result,
             "cached_at": time.time()
         }
-        print(f"💾 Cached {cache_key}")
+        logger.debug(f"Cached {cache_key}")
 
         return result
 
     except Exception as e:
-        print(f"Error fetching chart data for {ticker}: {e}")
-        import traceback
-        traceback.print_exc()
+        logger.exception(f"Error fetching chart data for {ticker}: {e}")
         return {
             "timestamps": [],
             "prices": [],
@@ -522,10 +518,11 @@ def compare_tickers(request: Request, tickers: str, interval: str = "1M"):
     results = {}
     for ticker in ticker_list:
         try:
-            data = get_chart_data(ticker, interval, indicators="")
+            data = get_chart_data(request, ticker, interval, indicators="")
             results[ticker] = data
         except Exception as e:
-            results[ticker] = {"error": str(e)}
+            logger.error(f"Error comparing ticker {ticker}: {e}")
+            results[ticker] = {"error": "Failed to fetch data"}
 
     return results
 
@@ -584,7 +581,7 @@ def export_chart_data(request: Request, ticker: str, interval: str = "1M"):
         iter([output.getvalue()]),
         media_type="text/csv",
         headers={
-            "Content-Disposition": f"attachment; filename={ticker}_{interval}_chart_data.csv"
+            "Content-Disposition": f'attachment; filename="{ticker}_{interval}_chart_data.csv"'
         }
     )
 
@@ -633,7 +630,16 @@ def get_sp500_annualized(request: Request, start_date: str):
     start_date format: YYYY-MM-DD
     """
     try:
-        from datetime import datetime as dtmod
+        from datetime import datetime as dtmod, date as datemod
+        # Validate start_date format and range
+        try:
+            parsed_date = datemod.fromisoformat(start_date)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
+        if parsed_date > datemod.today():
+            raise HTTPException(status_code=400, detail="start_date cannot be in the future")
+        if parsed_date.year < 1950:
+            raise HTTPException(status_code=400, detail="start_date too far in the past")
         start = dtmod.strptime(start_date, "%Y-%m-%d")
         sp = yf.Ticker("^GSPC")
         hist = sp.history(start=start.strftime("%Y-%m-%d"))
@@ -668,7 +674,7 @@ def get_sp500_annualized(request: Request, start_date: str):
         }
     except Exception as e:
         logger.error(f"Error calculating S&P 500 annualized return: {e}")
-        return {"annualizedReturn": None, "totalReturn": None, "error": str(e)}
+        return {"annualizedReturn": None, "totalReturn": None, "error": "Failed to calculate"}
 
 
 @app.get("/forex")
@@ -915,9 +921,7 @@ def get_news(request: Request, ticker: str):
 
         return results
     except Exception as e:
-        print(f"Error fetching news for {ticker}: {e}")
-        import traceback
-        traceback.print_exc()
+        logger.exception(f"Error fetching news for {ticker}: {e}")
         return []
 
 
@@ -965,9 +969,11 @@ async def get_cik_from_ticker(request: Request, ticker: str):
             raise HTTPException(status_code=404, detail=f"CIK not found for ticker {ticker}")
 
     except httpx.HTTPError as e:
-        raise HTTPException(status_code=503, detail=f"SEC API error: {str(e)}")
+        logger.error(f"SEC API error: {e}")
+        raise HTTPException(status_code=503, detail="SEC API temporarily unavailable")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error fetching CIK: {str(e)}")
+        logger.error(f"Error fetching CIK: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @app.get("/sec/company-facts/{ticker}")
@@ -1000,12 +1006,12 @@ async def get_company_facts(request: Request, ticker: str):
     except HTTPException:
         raise
     except httpx.HTTPError as e:
-        raise HTTPException(status_code=503, detail=f"SEC API error: {str(e)}")
+        logger.error(f"SEC API error: {e}")
+        raise HTTPException(status_code=503, detail="SEC API temporarily unavailable")
     except Exception as e:
-        print(f"Error fetching company facts for {ticker}: {e}")
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Error fetching company facts: {str(e)}")
+        logger.exception(f"Error fetching company facts for {ticker}: {e}")
+        logger.error(f"Error fetching company facts: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @app.get("/sec/fundamentals/{ticker}")
@@ -1129,10 +1135,9 @@ async def get_fundamentals(request: Request, ticker: str):
     except HTTPException:
         raise
     except Exception as e:
-        print(f"Error processing fundamentals for {ticker}: {e}")
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Error processing fundamentals: {str(e)}")
+        logger.exception(f"Error processing fundamentals for {ticker}: {e}")
+        logger.error(f"Error processing fundamentals: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @app.get("/sec/submissions/{ticker}")
@@ -1193,12 +1198,12 @@ async def get_company_submissions(request: Request, ticker: str):
     except HTTPException:
         raise
     except httpx.HTTPError as e:
-        raise HTTPException(status_code=503, detail=f"SEC API error: {str(e)}")
+        logger.error(f"SEC API error: {e}")
+        raise HTTPException(status_code=503, detail="SEC API temporarily unavailable")
     except Exception as e:
-        print(f"Error fetching submissions for {ticker}: {e}")
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Error fetching submissions: {str(e)}")
+        logger.exception(f"Error fetching submissions for {ticker}: {e}")
+        logger.error(f"Error fetching submissions: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @app.get("/history")
@@ -1421,15 +1426,14 @@ def get_correlation(request: Request, tickers: str, period: str = "1y"):
 async def evaluate_alerts(request: Request):
     """Evaluate alerts against current prices. Frontend handles Firestore updates."""
     body = await request.json()
-    alerts = body.get("alerts", [])
+    try:
+        validated = AlertEvaluateRequest(**body)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid request body")
+    alerts = [a.dict() for a in validated.alerts]
 
     if not alerts:
         return {"results": []}
-
-    # Limit alerts per request to prevent abuse (fetching arbitrary tickers via yfinance)
-    MAX_ALERTS = 50
-    if len(alerts) > MAX_ALERTS:
-        raise HTTPException(status_code=400, detail=f"Maximum {MAX_ALERTS} alerts per evaluation")
 
     # Get unique tickers
     tickers = list(set(a.get("ticker", "").upper() for a in alerts if a.get("ticker")))
@@ -1509,21 +1513,15 @@ async def evaluate_alerts(request: Request):
 async def ai_chat(request: Request):
     """AI chat endpoint. Mock mode generates portfolio analysis without LLM."""
     body = await request.json()
-    message = body.get("message", "").strip()
-    positions = body.get("positions", [])
+    try:
+        validated = AIChatRequest(**body)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid request body")
+    message = validated.message.strip()
+    positions = [p.dict() for p in validated.positions]
 
     if not message:
         raise HTTPException(status_code=400, detail="Message is required")
-
-    # Limit message length to prevent abuse
-    MAX_MESSAGE_LENGTH = 2000
-    if len(message) > MAX_MESSAGE_LENGTH:
-        raise HTTPException(status_code=400, detail=f"Message exceeds {MAX_MESSAGE_LENGTH} characters")
-
-    # Limit positions array to prevent excessive processing
-    MAX_POSITIONS = 200
-    if len(positions) > MAX_POSITIONS:
-        positions = positions[:MAX_POSITIONS]
 
     # Build portfolio context
     tickers = [p.get("ticker", "") for p in positions if p.get("ticker")]
