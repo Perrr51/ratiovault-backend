@@ -1426,6 +1426,11 @@ async def evaluate_alerts(request: Request):
     if not alerts:
         return {"results": []}
 
+    # Limit alerts per request to prevent abuse (fetching arbitrary tickers via yfinance)
+    MAX_ALERTS = 50
+    if len(alerts) > MAX_ALERTS:
+        raise HTTPException(status_code=400, detail=f"Maximum {MAX_ALERTS} alerts per evaluation")
+
     # Get unique tickers
     tickers = list(set(a.get("ticker", "").upper() for a in alerts if a.get("ticker")))
     if not tickers:
@@ -1451,6 +1456,7 @@ async def evaluate_alerts(request: Request):
         alert_id = alert.get("id")
         ticker = alert.get("ticker", "").upper()
         alert_type = alert.get("type")
+        operator = alert.get("operator", "")
         target_value = float(alert.get("targetValue", 0))
         last_triggered = alert.get("lastTriggeredAt", 0)
         cooldown_hours = alert.get("cooldownHours", 24)
@@ -1465,12 +1471,26 @@ async def evaluate_alerts(request: Request):
         change_pct = price_data.get("change_pct", 0)
 
         triggered = False
+        # Support legacy types (price_above, price_below, daily_change_pct)
         if alert_type == "price_above" and current_price > target_value:
             triggered = True
         elif alert_type == "price_below" and current_price < target_value and current_price > 0:
             triggered = True
         elif alert_type == "daily_change_pct" and abs(change_pct) > target_value:
             triggered = True
+        # Support type+operator schema from AlertForm
+        elif alert_type == "price" and current_price > 0:
+            if operator == "gt" and current_price > target_value:
+                triggered = True
+            elif operator == "gte" and current_price >= target_value:
+                triggered = True
+            elif operator == "lt" and current_price < target_value:
+                triggered = True
+            elif operator == "lte" and current_price <= target_value:
+                triggered = True
+        elif alert_type == "percent_change" and operator in ("gt", "gte"):
+            if abs(change_pct) > target_value:
+                triggered = True
 
         results.append({
             "alertId": alert_id,
@@ -1494,6 +1514,16 @@ async def ai_chat(request: Request):
 
     if not message:
         raise HTTPException(status_code=400, detail="Message is required")
+
+    # Limit message length to prevent abuse
+    MAX_MESSAGE_LENGTH = 2000
+    if len(message) > MAX_MESSAGE_LENGTH:
+        raise HTTPException(status_code=400, detail=f"Message exceeds {MAX_MESSAGE_LENGTH} characters")
+
+    # Limit positions array to prevent excessive processing
+    MAX_POSITIONS = 200
+    if len(positions) > MAX_POSITIONS:
+        positions = positions[:MAX_POSITIONS]
 
     # Build portfolio context
     tickers = [p.get("ticker", "") for p in positions if p.get("ticker")]
