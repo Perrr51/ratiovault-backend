@@ -1211,11 +1211,11 @@ def get_history(request: Request, tickers: str, start: str, end: str):
         if data.empty:
             return {"dates": [], "prices": {}, "forex": {}}
 
-        # Extract Close prices
-        if len(ticker_list) == 1:
-            closes = data[['Close']].rename(columns={'Close': ticker_list[0]})
-        else:
-            closes = data['Close']
+        # Extract Close prices (yfinance always returns MultiIndex columns)
+        closes = data['Close']
+        # If single ticker, closes may be a Series — convert to DataFrame
+        if isinstance(closes, pd.Series):
+            closes = closes.to_frame(name=ticker_list[0])
 
         # Forward-fill NaN values (weekends, holidays)
         closes = closes.ffill()
@@ -1237,10 +1237,9 @@ def get_history(request: Request, tickers: str, start: str, end: str):
         try:
             fx_data = yf.download(forex_pairs, start=validated.start, end=validated.end, progress=False, auto_adjust=True)
             if not fx_data.empty:
-                if len(forex_pairs) == 1:
-                    fx_closes = fx_data[['Close']].rename(columns={'Close': forex_pairs[0]})
-                else:
-                    fx_closes = fx_data['Close']
+                fx_closes = fx_data['Close']
+                if isinstance(fx_closes, pd.Series):
+                    fx_closes = fx_closes.to_frame(name=forex_pairs[0])
                 fx_closes = fx_closes.ffill().reindex(closes.index, method='ffill')
 
                 for pair in forex_pairs:
