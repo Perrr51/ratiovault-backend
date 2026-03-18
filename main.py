@@ -1410,3 +1410,171 @@ def get_correlation(request: Request, tickers: str, period: str = "1y"):
     except Exception as e:
         logger.error(f"Error computing correlation: {e}")
         raise HTTPException(status_code=500, detail="Failed to compute correlation matrix")
+
+
+# ============================================================================
+# ALERTS EVALUATION ENDPOINT
+# ============================================================================
+
+@app.post("/alerts/evaluate")
+@limiter.limit("10/minute")
+async def evaluate_alerts(request: Request):
+    """Evaluate alerts against current prices. Frontend handles Firestore updates."""
+    body = await request.json()
+    alerts = body.get("alerts", [])
+
+    if not alerts:
+        return {"results": []}
+
+    # Get unique tickers
+    tickers = list(set(a.get("ticker", "").upper() for a in alerts if a.get("ticker")))
+    if not tickers:
+        return {"results": []}
+
+    # Fetch current prices
+    prices = {}
+    for ticker in tickers:
+        try:
+            t = yf.Ticker(ticker)
+            info = t.info or {}
+            prices[ticker] = {
+                "price": _safe_float(info.get("currentPrice") or info.get("regularMarketPrice")),
+                "change_pct": _safe_float(info.get("regularMarketChangePercent")),
+            }
+        except Exception:
+            prices[ticker] = {"price": 0, "change_pct": 0}
+
+    # Evaluate each alert
+    results = []
+    now = time.time()
+    for alert in alerts:
+        alert_id = alert.get("id")
+        ticker = alert.get("ticker", "").upper()
+        alert_type = alert.get("type")
+        target_value = float(alert.get("targetValue", 0))
+        last_triggered = alert.get("lastTriggeredAt", 0)
+        cooldown_hours = alert.get("cooldownHours", 24)
+
+        # Skip if in cooldown
+        if last_triggered and (now - last_triggered) < cooldown_hours * 3600:
+            results.append({"alertId": alert_id, "triggered": False, "reason": "cooldown"})
+            continue
+
+        price_data = prices.get(ticker, {})
+        current_price = price_data.get("price", 0)
+        change_pct = price_data.get("change_pct", 0)
+
+        triggered = False
+        if alert_type == "price_above" and current_price > target_value:
+            triggered = True
+        elif alert_type == "price_below" and current_price < target_value and current_price > 0:
+            triggered = True
+        elif alert_type == "daily_change_pct" and abs(change_pct) > target_value:
+            triggered = True
+
+        results.append({
+            "alertId": alert_id,
+            "triggered": triggered,
+            "currentPrice": current_price,
+            "changePct": change_pct,
+        })
+
+    return {"results": results}
+
+
+# ─── AI Chat (Mock Mode) ────────────────────────────────────────────────────────
+
+@app.post("/ai/chat")
+@limiter.limit("20/minute")
+async def ai_chat(request: Request):
+    """AI chat endpoint. Mock mode generates portfolio analysis without LLM."""
+    body = await request.json()
+    message = body.get("message", "").strip()
+    positions = body.get("positions", [])
+
+    if not message:
+        raise HTTPException(status_code=400, detail="Message is required")
+
+    # Build portfolio context
+    tickers = [p.get("ticker", "") for p in positions if p.get("ticker")]
+    total_value = sum(p.get("value", 0) for p in positions)
+    total_cost = sum(p.get("cost", 0) for p in positions)
+    pnl = total_value - total_cost
+    pnl_pct = (pnl / total_cost * 100) if total_cost > 0 else 0
+    position_count = len(positions)
+
+    # Sort by value for top holdings
+    sorted_positions = sorted(positions, key=lambda p: p.get("value", 0), reverse=True)
+    top_5 = sorted_positions[:5]
+
+    # Group by sector if available
+    sectors = {}
+    for p in positions:
+        sector = p.get("sector", "Sin sector")
+        sectors[sector] = sectors.get(sector, 0) + p.get("value", 0)
+
+    # Generate mock analysis based on message keywords
+    msg_lower = message.lower()
+
+    sections = []
+
+    # Always include portfolio summary
+    sections.append(
+        f"📊 **Resumen del Portfolio**\n"
+        f"- Total invertido: ${total_cost:,.2f}\n"
+        f"- Valor actual: ${total_value:,.2f}\n"
+        f"- P&L: {'+'if pnl>=0 else ''}{pnl:,.2f} ({pnl_pct:+.1f}%)\n"
+        f"- Posiciones: {position_count}"
+    )
+
+    # Top holdings
+    if top_5:
+        holdings_text = "\n".join(
+            f"  {i+1}. **{p.get('ticker', '?')}** — ${p.get('value', 0):,.0f} ({p.get('value', 0)/total_value*100:.1f}%)"
+            for i, p in enumerate(top_5) if total_value > 0
+        )
+        sections.append(f"🏆 **Top Holdings**\n{holdings_text}")
+
+    # Sector distribution
+    if sectors and len(sectors) > 1:
+        sector_text = "\n".join(
+            f"  - {s}: ${v:,.0f} ({v/total_value*100:.1f}%)"
+            for s, v in sorted(sectors.items(), key=lambda x: x[1], reverse=True)[:6]
+            if total_value > 0
+        )
+        sections.append(f"📈 **Distribución Sectorial**\n{sector_text}")
+
+    # Context-specific analysis based on keywords
+    if any(w in msg_lower for w in ["diversif", "riesgo", "concentr"]):
+        if len(positions) < 5:
+            sections.append("⚠️ **Observación sobre Diversificación**\nTu portfolio tiene pocas posiciones. Considera diversificar en más sectores o geografías para reducir el riesgo específico.")
+        elif top_5 and total_value > 0 and (top_5[0].get("value", 0) / total_value) > 0.3:
+            sections.append(f"⚠️ **Concentración Detectada**\n{top_5[0].get('ticker')} representa más del 30% de tu portfolio. Una caída significativa tendría un impacto desproporcionado.")
+        else:
+            sections.append("✅ **Diversificación**\nTu portfolio muestra una distribución razonable entre posiciones.")
+
+    if any(w in msg_lower for w in ["rendimiento", "performance", "retorno", "ganancia"]):
+        if pnl > 0:
+            sections.append(f"📈 **Rendimiento**\nTu portfolio está en positivo con un retorno del {pnl_pct:.1f}%. Las posiciones con mejor rendimiento son las de mayor valor actual.")
+        else:
+            sections.append(f"📉 **Rendimiento**\nTu portfolio muestra una pérdida del {pnl_pct:.1f}%. Considera revisar las posiciones con peor rendimiento.")
+
+    if any(w in msg_lower for w in ["qué opinas", "analiz", "general", "resumen", "hola", "ayuda"]):
+        sections.append(
+            "💡 **Sugerencias**\n"
+            "- Revisa periódicamente tu asignación de activos\n"
+            "- Considera el impacto fiscal antes de vender\n"
+            "- Mantén un fondo de emergencia fuera del portfolio\n"
+            "- La diversificación geográfica puede reducir el riesgo"
+        )
+
+    sections.append("\n⚠️ *Este análisis es orientativo y no constituye asesoramiento financiero. Consulta con un profesional antes de tomar decisiones de inversión.*")
+
+    response_text = "\n\n".join(sections)
+
+    return {
+        "role": "assistant",
+        "content": response_text,
+        "mode": "mock",
+        "timestamp": time.time(),
+    }
