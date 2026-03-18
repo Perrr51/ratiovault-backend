@@ -4,6 +4,7 @@ Ensures all user inputs are validated before processing.
 """
 
 import re
+from datetime import date
 from typing import List, Literal, Optional
 from pydantic import BaseModel, validator, Field
 
@@ -208,3 +209,23 @@ def validate_query_params(params: dict, validator_class: BaseModel) -> BaseModel
     except ValueError as e:
         from fastapi import HTTPException
         raise HTTPException(status_code=400, detail=str(e))
+
+
+class HistoryRequest(BaseModel):
+    """Validation for /history endpoint"""
+    tickers: str = Field(..., description="Comma-separated list of ticker symbols")
+    start: str = Field(..., description="Start date YYYY-MM-DD")
+    end: str = Field(..., description="End date YYYY-MM-DD")
+
+    @validator('tickers')
+    def validate_tickers(cls, v):
+        ticker_list = TickerValidator.validate_ticker_list(v, max_count=50)
+        return ",".join(ticker_list)
+
+    @validator('start', 'end')
+    def validate_date(cls, v):
+        try:
+            date.fromisoformat(v)
+        except ValueError:
+            raise ValueError(f"Invalid date format: {v}. Use YYYY-MM-DD")
+        return v

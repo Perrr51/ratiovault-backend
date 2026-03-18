@@ -16,6 +16,7 @@ import pandas as pd
 from functools import lru_cache
 import io
 import logging
+import math
 
 # Import configuration and validators
 from config import settings, validate_settings
@@ -27,6 +28,7 @@ from validators import (
     ChartExportRequest,
     NewsRequest,
     SECTickerRequest,
+    HistoryRequest,
 )
 
 # Configure logging
@@ -76,6 +78,16 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT", "DELETE"],  # Specific methods only
     allow_headers=["Content-Type", "Authorization"],  # Specific headers only
 )
+
+def _safe_float(v, default=0.0):
+    """Convert to float, replacing NaN/Inf with default."""
+    if v is None:
+        return default
+    try:
+        f = float(v)
+        return default if (math.isnan(f) or math.isinf(f)) else f
+    except (ValueError, TypeError):
+        return default
 
 @app.get("/quotes")
 @limiter.limit("60/minute")  # ✅ 60 requests per minute
@@ -1183,3 +1195,69 @@ async def get_company_submissions(request: Request, ticker: str):
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error fetching submissions: {str(e)}")
+
+
+@app.get("/history")
+@limiter.limit("10/minute")
+def get_history(request: Request, tickers: str, start: str, end: str):
+    """Get historical daily close prices for portfolio evolution chart."""
+    validated = HistoryRequest(tickers=tickers, start=start, end=end)
+    ticker_list = validated.tickers.split(",")
+
+    try:
+        # Download historical prices
+        data = yf.download(ticker_list, start=validated.start, end=validated.end, progress=False, auto_adjust=True)
+
+        if data.empty:
+            return {"dates": [], "prices": {}, "forex": {}}
+
+        # Extract Close prices
+        if len(ticker_list) == 1:
+            closes = data[['Close']].rename(columns={'Close': ticker_list[0]})
+        else:
+            closes = data['Close']
+
+        # Forward-fill NaN values (weekends, holidays)
+        closes = closes.ffill()
+
+        # Convert dates to strings
+        dates = [d.strftime('%Y-%m-%d') for d in closes.index]
+
+        # Build prices dict
+        prices = {}
+        for ticker in ticker_list:
+            if ticker in closes.columns:
+                prices[ticker] = [_safe_float(v) for v in closes[ticker].tolist()]
+            else:
+                prices[ticker] = [0.0] * len(dates)
+
+        # Download forex rates for the same period
+        forex_pairs = ['EURUSD=X', 'CHFUSD=X', 'GBPUSD=X']
+        forex = {}
+        try:
+            fx_data = yf.download(forex_pairs, start=validated.start, end=validated.end, progress=False, auto_adjust=True)
+            if not fx_data.empty:
+                if len(forex_pairs) == 1:
+                    fx_closes = fx_data[['Close']].rename(columns={'Close': forex_pairs[0]})
+                else:
+                    fx_closes = fx_data['Close']
+                fx_closes = fx_closes.ffill().reindex(closes.index, method='ffill')
+
+                for pair in forex_pairs:
+                    if pair in fx_closes.columns:
+                        pair_name = pair.replace('=X', '')
+                        values = fx_closes[pair].tolist()
+                        if 'EUR' in pair_name:
+                            forex['USDEUR'] = [_safe_float(1/v) if v and v != 0 else 0.0 for v in values]
+                        elif 'CHF' in pair_name:
+                            forex['USDCHF'] = [_safe_float(1/v) if v and v != 0 else 0.0 for v in values]
+                        elif 'GBP' in pair_name:
+                            forex['USDGBP'] = [_safe_float(1/v) if v and v != 0 else 0.0 for v in values]
+        except Exception as e:
+            logger.warning(f"Failed to fetch forex history: {e}")
+
+        return {"dates": dates, "prices": prices, "forex": forex}
+
+    except Exception as e:
+        logger.error(f"Error fetching history: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch historical data: {str(e)}")
