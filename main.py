@@ -55,6 +55,19 @@ chart_cache: Dict[str, Dict[str, Any]] = {}
 CHART_CACHE_TTL = settings.chart_cache_ttl
 CHART_CACHE_MAX_SIZE = settings.chart_cache_max_size
 
+def _cleanup_chart_cache():
+    """Remove expired entries and evict oldest if cache exceeds max size."""
+    now = time.time()
+    # Remove expired entries
+    expired_keys = [k for k, v in chart_cache.items() if now - v["cached_at"] >= CHART_CACHE_TTL]
+    for k in expired_keys:
+        del chart_cache[k]
+    # If still over max size, evict oldest entries
+    if len(chart_cache) > CHART_CACHE_MAX_SIZE:
+        sorted_keys = sorted(chart_cache, key=lambda k: chart_cache[k]["cached_at"])
+        for k in sorted_keys[:len(chart_cache) - CHART_CACHE_MAX_SIZE]:
+            del chart_cache[k]
+
 # ✅ CORS configuration from environment
 app.add_middleware(
     CORSMiddleware,
@@ -70,6 +83,8 @@ def get_quotes(request: Request, tickers: str):
     # ✅ Validate input
     validated = QuotesRequest(tickers=tickers)
     ticker_list = validated.tickers.split(",")
+    if len(ticker_list) > 30:
+        raise HTTPException(status_code=400, detail="Maximum 30 tickers per request")
     result = {}
 
     import math
@@ -437,7 +452,8 @@ def get_chart_data(request: Request, ticker: str, interval: str = "1M", indicato
             if "bb" in indicator_list or "bollinger" in indicator_list:
                 result["indicators"]["bollingerBands"] = calculate_bollinger_bands(prices)
 
-        # Cache the result
+        # Cache the result (clean up expired/oversized entries first)
+        _cleanup_chart_cache()
         chart_cache[cache_key] = {
             "data": result,
             "cached_at": time.time()
