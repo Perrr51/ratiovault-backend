@@ -252,5 +252,36 @@ class DividendsRequest(BaseModel):
 
     @validator('tickers')
     def validate_tickers(cls, v):
+        ticker_list = TickerValidator.validate_ticker_list(v, max_count=15)
+        return ",".join(ticker_list)
+
+
+class TERRequest(BaseModel):
+    """Validation for /ter/batch endpoint"""
+    tickers: str = Field(..., description="Comma-separated list of ticker symbols")
+
+    @validator('tickers')
+    def validate_tickers(cls, v):
         ticker_list = TickerValidator.validate_ticker_list(v, max_count=30)
         return ",".join(ticker_list)
+
+
+class BenchmarkHistoryRequest(BaseModel):
+    """Validation for /benchmark-history endpoint"""
+    symbol: str = Field(..., description="Benchmark symbol (e.g., ^GSPC)")
+    start: str = Field(..., description="Start date YYYY-MM-DD")
+    end: str = Field(..., description="End date YYYY-MM-DD")
+
+    @validator('symbol')
+    def validate_symbol(cls, v):
+        return TickerValidator.validate_ticker(v)
+
+    @validator('start', 'end')
+    def validate_date(cls, v):
+        try:
+            parsed = date.fromisoformat(v)
+        except ValueError:
+            raise ValueError(f"Invalid date format: {v}. Use YYYY-MM-DD")
+        if parsed > date.today():
+            raise ValueError(f"Date cannot be in the future: {v}")
+        return v

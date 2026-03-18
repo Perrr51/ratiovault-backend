@@ -30,6 +30,8 @@ from validators import (
     SECTickerRequest,
     HistoryRequest,
     DividendsRequest,
+    TERRequest,
+    BenchmarkHistoryRequest,
 )
 
 # Configure logging
@@ -1322,3 +1324,43 @@ def get_dividends(request: Request, tickers: str):
             }
 
     return result
+
+
+@app.get("/ter/batch")
+@limiter.limit("10/minute")
+def get_ter_batch(request: Request, tickers: str):
+    """Get TER (Total Expense Ratio) for ETFs/funds."""
+    validated = TERRequest(tickers=tickers)
+    ticker_list = validated.tickers.split(",")
+    result = {}
+    for ticker in ticker_list:
+        try:
+            t = yf.Ticker(ticker)
+            info = t.info or {}
+            result[ticker] = {
+                "ter": _safe_float(info.get("annualReportExpenseRatio")),
+                "name": info.get("shortName", ticker),
+                "type": info.get("quoteType", "UNKNOWN"),
+            }
+        except Exception as e:
+            logger.warning(f"Failed to get TER for {ticker}: {e}")
+            result[ticker] = {"ter": 0, "name": ticker, "type": "UNKNOWN"}
+    return result
+
+
+@app.get("/benchmark-history")
+@limiter.limit("10/minute")
+def get_benchmark_history(request: Request, symbol: str, start: str, end: str):
+    """Get historical daily closes for a benchmark index."""
+    validated = BenchmarkHistoryRequest(symbol=symbol, start=start, end=end)
+    try:
+        t = yf.Ticker(validated.symbol)
+        hist = t.history(start=validated.start, end=validated.end, auto_adjust=True)
+        if hist.empty:
+            return {"dates": [], "closes": []}
+        dates = [d.strftime('%Y-%m-%d') for d in hist.index]
+        closes = [_safe_float(v) for v in hist['Close'].tolist()]
+        return {"dates": dates, "closes": closes}
+    except Exception as e:
+        logger.error(f"Error fetching benchmark history for {validated.symbol}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch benchmark data")
