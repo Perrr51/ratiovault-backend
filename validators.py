@@ -219,7 +219,7 @@ class HistoryRequest(BaseModel):
 
     @validator('tickers')
     def validate_tickers(cls, v):
-        ticker_list = TickerValidator.validate_ticker_list(v, max_count=50)
+        ticker_list = TickerValidator.validate_ticker_list(v, max_count=200)
         return ",".join(ticker_list)
 
     @validator('start', 'end')
