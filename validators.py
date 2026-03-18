@@ -219,13 +219,28 @@ class HistoryRequest(BaseModel):
 
     @validator('tickers')
     def validate_tickers(cls, v):
-        ticker_list = TickerValidator.validate_ticker_list(v, max_count=200)
+        ticker_list = TickerValidator.validate_ticker_list(v, max_count=50)
         return ",".join(ticker_list)
 
     @validator('start', 'end')
     def validate_date(cls, v):
         try:
-            date.fromisoformat(v)
+            parsed = date.fromisoformat(v)
         except ValueError:
             raise ValueError(f"Invalid date format: {v}. Use YYYY-MM-DD")
+        # Prevent future dates
+        if parsed > date.today():
+            raise ValueError(f"Date cannot be in the future: {v}")
+        return v
+
+    @validator('end')
+    def validate_date_range(cls, v, values):
+        if 'start' in values:
+            start = date.fromisoformat(values['start'])
+            end = date.fromisoformat(v)
+            max_days = 365 * 10  # 10 years max
+            if (end - start).days > max_days:
+                raise ValueError(f"Date range too large. Maximum {max_days} days (10 years)")
+            if end < start:
+                raise ValueError("End date must be after start date")
         return v
