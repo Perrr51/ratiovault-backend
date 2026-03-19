@@ -544,7 +544,7 @@ def export_chart_data(request: Request, ticker: str, interval: str = "1M"):
     Returns:
         CSV file download
     """
-    data = get_chart_data(ticker, interval, indicators="sma20,sma50,rsi")
+    data = get_chart_data(request, ticker, interval, indicators="sma20,sma50,rsi")
 
     if data.get("error") or len(data.get("timestamps", [])) == 0:
         raise HTTPException(status_code=404, detail="No data available")
@@ -1241,7 +1241,7 @@ def get_history(request: Request, tickers: str, start: str, end: str):
                 prices[ticker] = [0.0] * len(dates)
 
         # Download forex rates for the same period
-        forex_pairs = ['EURUSD=X', 'CHFUSD=X', 'GBPUSD=X']
+        forex_pairs = ['EURUSD=X', 'USDCHF=X', 'GBPUSD=X']
         forex = {}
         try:
             fx_data = yf.download(forex_pairs, start=validated.start, end=validated.end, progress=False, auto_adjust=True)
@@ -1255,11 +1255,11 @@ def get_history(request: Request, tickers: str, start: str, end: str):
                     if pair in fx_closes.columns:
                         pair_name = pair.replace('=X', '')
                         values = fx_closes[pair].tolist()
-                        if 'EUR' in pair_name:
+                        if pair == 'EURUSD=X':
                             forex['USDEUR'] = [_safe_float(1/v) if v and v != 0 else 0.0 for v in values]
-                        elif 'CHF' in pair_name:
-                            forex['USDCHF'] = [_safe_float(1/v) if v and v != 0 else 0.0 for v in values]
-                        elif 'GBP' in pair_name:
+                        elif pair == 'USDCHF=X':
+                            forex['USDCHF'] = [_safe_float(v) for v in values]
+                        elif pair == 'GBPUSD=X':
                             forex['USDGBP'] = [_safe_float(1/v) if v and v != 0 else 0.0 for v in values]
         except Exception as e:
             logger.warning(f"Failed to fetch forex history: {e}")
