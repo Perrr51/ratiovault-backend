@@ -739,7 +739,7 @@ def get_forex_rates(request: Request):
         return result
     except Exception as e:
         logger.error(f"Error fetching forex rates: {e}")
-        return {"USDEUR": 0.92, "USDCHF": 0.88, "fallback": True}
+        return {"USDEUR": 0.92, "USDCHF": 0.88, "USDGBP": 0.79, "USDJPY": 150, "fallback": True}
 
 
 def _infer_asset_type(ticker: str) -> dict:
