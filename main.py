@@ -775,9 +775,19 @@ def _infer_asset_type(ticker: str) -> dict:
     if "=X" in t:
         return {"quoteType": "CURRENCY", "sector": None, "industry": "Forex", "name": t}
 
+    # Futures
+    if t.endswith("=F"):
+        return {"quoteType": "FUTURE", "sector": "Futures", "industry": "Futures", "name": t}
+
     # Index
     if t.startswith("^"):
         return {"quoteType": "INDEX", "sector": None, "industry": "Index", "name": t}
+
+    # Cash / Unlisted
+    if "=CASH" in t:
+        return {"quoteType": "CASH", "sector": None, "industry": None, "name": t.replace("=CASH", " Cash")}
+    if "=UNLISTED" in t:
+        return {"quoteType": "UNLISTED", "sector": None, "industry": None, "name": t.replace("=UNLISTED", "")}
 
     return {"quoteType": "UNKNOWN", "sector": None, "industry": None, "name": t}
 
