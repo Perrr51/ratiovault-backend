@@ -134,6 +134,14 @@ def get_quotes(request: Request, tickers: str):
                 # Try to get currency from fast_info
                 quote_currency = fi.get("currency", None)
                 if price and price > 0:
+                    # If fast_info didn't return currency, fetch it from info dict
+                    # This is critical for cross-currency positions (e.g., XAG bought in CHF, quoted in USD)
+                    if not quote_currency:
+                        try:
+                            info_currency = stock.info
+                            quote_currency = info_currency.get("currency") or info_currency.get("financialCurrency") or None
+                        except Exception:
+                            pass
                     return {
                         "price": float(price),
                         "previousClose": float(prev_close),
