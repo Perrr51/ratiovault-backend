@@ -794,17 +794,27 @@ def get_asset_info(request: Request, tickers: str):
             industry = info.get("industry") or None
             name = info.get("shortName") or info.get("longName") or None
 
-            # Always check pattern-based override first (yfinance often misclassifies commodities as crypto)
+            # Pattern-based override only when yfinance has no data or misclassifies known cases
             override = _infer_asset_type(t)
-            if override["quoteType"] not in ("UNKNOWN",):
-                # Pattern matched — trust our classification over yfinance
+            if not quote_type or quote_type == "NONE":
+                # yfinance returned nothing — use pattern fallback
+                if override["quoteType"] != "UNKNOWN":
+                    quote_type = override["quoteType"]
+                    sector = override["sector"] or sector
+                    industry = override["industry"] or industry
+                    name = name or override["name"]
+                else:
+                    quote_type = "UNKNOWN"
+            elif override["quoteType"] == "COMMODITY" and quote_type == "CRYPTOCURRENCY":
+                # Known misclassification: yfinance labels commodities (XAG, XAU) as crypto
                 quote_type = override["quoteType"]
                 sector = override["sector"] or sector
                 industry = override["industry"] or industry
-                name = name or override["name"]
-            elif not quote_type or quote_type == "NONE":
-                # yfinance returned nothing useful and no pattern match
-                quote_type = "UNKNOWN"
+            elif override["quoteType"] in ("INDEX", "CURRENCY"):
+                # Indices (^) and forex (=X) patterns are always reliable
+                quote_type = override["quoteType"]
+                sector = override["sector"] or sector
+                industry = override["industry"] or industry
 
             result[t] = {
                 "quoteType": quote_type,
@@ -1504,6 +1514,58 @@ async def evaluate_alerts(request: Request):
         })
 
     return {"results": results}
+
+
+# ─── justETF endpoints ─────────────────────────────────────────────────────────
+
+@app.get("/etf/profile/{isin}")
+@limiter.limit("30/minute")
+async def etf_profile(request: Request, isin: str):
+    """Get detailed ETF profile from justETF by ISIN."""
+    isin = isin.strip().upper()
+    if not re.match(r'^[A-Z]{2}[A-Z0-9]{10}$', isin):
+        raise HTTPException(status_code=400, detail="Invalid ISIN format")
+
+    from justetf import get_scraper
+    scraper = get_scraper()
+    profile = scraper.get_etf_profile(isin)
+
+    if not profile:
+        raise HTTPException(status_code=404, detail="ETF not found on justETF")
+
+    return profile
+
+
+@app.get("/etf/similar/{isin}")
+@limiter.limit("20/minute")
+async def etf_similar(request: Request, isin: str):
+    """Find similar ETFs tracking the same index."""
+    isin = isin.strip().upper()
+    if not re.match(r'^[A-Z]{2}[A-Z0-9]{10}$', isin):
+        raise HTTPException(status_code=400, detail="Invalid ISIN format")
+
+    from justetf import get_scraper
+    scraper = get_scraper()
+    similar = scraper.find_similar_etfs(isin)
+
+    return {"isin": isin, "similar": similar}
+
+
+@app.get("/etf/search")
+@limiter.limit("30/minute")
+async def etf_search(request: Request, q: str = ""):
+    """Search ETFs on justETF."""
+    q = q.strip()
+    if len(q) < 2:
+        raise HTTPException(status_code=400, detail="Query must be at least 2 characters")
+    if len(q) > 100:
+        raise HTTPException(status_code=400, detail="Query too long")
+
+    from justetf import get_scraper
+    scraper = get_scraper()
+    results = scraper.search_etfs(q)
+
+    return {"query": q, "results": results}
 
 
 # ─── AI Chat (Mock Mode) ────────────────────────────────────────────────────────

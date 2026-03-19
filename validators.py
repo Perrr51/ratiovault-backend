@@ -310,6 +310,47 @@ class CorrelationRequest(BaseModel):
         return ",".join(ticker_list)
 
 
+# Regex pattern for valid ISIN codes (2 letter country + 10 alphanumeric)
+ISIN_PATTERN = re.compile(r'^[A-Z]{2}[A-Z0-9]{10}$')
+
+
+class ISINValidator(BaseModel):
+    """Base validator for ISIN codes"""
+
+    @staticmethod
+    def validate_isin(isin: str) -> str:
+        """Validate and normalize a single ISIN code"""
+        isin = isin.strip().upper()
+
+        if not isin:
+            raise ValueError("ISIN code cannot be empty")
+
+        if len(isin) != 12:
+            raise ValueError(f"ISIN must be exactly 12 characters: {isin}")
+
+        if not ISIN_PATTERN.match(isin):
+            raise ValueError(
+                f"Invalid ISIN format: {isin}. "
+                "Must be 2 uppercase letters followed by 10 alphanumeric characters."
+            )
+
+        return isin
+
+
+class ETFSearchRequest(BaseModel):
+    """Validation for /etf/search endpoint"""
+    q: str = Field(..., min_length=2, max_length=100, description="Search query")
+
+    @validator('q')
+    def validate_query(cls, v):
+        v = v.strip()
+        if len(v) < 2:
+            raise ValueError("Search query too short (minimum 2 characters)")
+        if len(v) > 100:
+            raise ValueError("Search query too long (maximum 100 characters)")
+        return v
+
+
 class AlertItem(BaseModel):
     """Validation for a single alert in /alerts/evaluate"""
     ticker: str = Field(..., max_length=20)
