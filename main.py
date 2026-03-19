@@ -834,17 +834,31 @@ def get_asset_info(request: Request, tickers: str):
                 sector = override["sector"] or sector
                 industry = override["industry"] or industry
 
+            # Extract website domain for logo resolution
+            website = info.get("website") or ""
+            logo_domain = ""
+            if website:
+                # "https://www.apple.com" → "apple.com"
+                try:
+                    from urllib.parse import urlparse
+                    parsed = urlparse(website)
+                    host = parsed.hostname or ""
+                    logo_domain = host.removeprefix("www.")
+                except Exception:
+                    pass
+
             result[t] = {
                 "quoteType": quote_type,
                 "sector": sector,
                 "industry": industry,
                 "name": name or t,
+                "logoDomain": logo_domain,
             }
         except Exception as e:
             logger.warning(f"Failed to fetch asset info for {t}: {e}")
             # Use pattern-based fallback
             fallback = _infer_asset_type(t)
-            result[t] = {**fallback, "error": str(e)}
+            result[t] = {**fallback, "logoDomain": "", "error": str(e)}
     return result
 
 
