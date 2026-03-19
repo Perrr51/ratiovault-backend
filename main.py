@@ -793,7 +793,7 @@ def _infer_asset_type(ticker: str) -> dict:
 
 
 @app.get("/asset-info")
-@limiter.limit("30/minute")
+@limiter.limit("60/minute")
 def get_asset_info(request: Request, tickers: str):
     """
     Get asset type (EQUITY, ETF, COMMODITY, etc.) and sector for each ticker.
