@@ -1634,9 +1634,12 @@ def get_correlation(request: Request, tickers: str, period: str = "1y", method: 
       - method=simple (for ETFs): uses simple returns (P_t/P_{t-1} - 1)
         Simple returns on adjusted close prices are standard for ETFs since
         they directly reflect fund performance including dividends.
+      - method=mixed (for stocks+crypto): uses simple returns on ONLY
+        business days where all assets have data. Crypto trades 24/7 but
+        stocks only on weekdays — this aligns them on common trading days
+        before computing correlation, avoiding data misalignment artifacts.
 
-    Both methods use auto_adjust=True (Adj Close), which incorporates
-    dividends and splits — critical for ETFs with varying distribution schedules.
+    All methods use auto_adjust=True (Adj Close).
 
     Steps:
     1. Download adjusted close prices from yfinance
@@ -1647,7 +1650,7 @@ def get_correlation(request: Request, tickers: str, period: str = "1y", method: 
     """
     validated = CorrelationRequest(tickers=tickers, period=period)
     ticker_list = validated.tickers.split(",")
-    return_method = method if method in ("log", "simple") else "log"
+    return_method = method if method in ("log", "simple", "mixed") else "log"
 
     # Cache check (24h TTL)
     cache_key = f"corr_{'_'.join(sorted(ticker_list))}_{validated.period}_{return_method}"
@@ -1677,7 +1680,14 @@ def get_correlation(request: Request, tickers: str, period: str = "1y", method: 
         closes = closes[valid_cols]
 
         # Compute returns based on method
-        if return_method == "simple":
+        if return_method == "mixed":
+            # Mixed mode (stocks + crypto): use simple returns on ONLY rows
+            # where ALL tickers have data. Crypto trades 24/7 but stocks only
+            # on business days — dropna(how='any') keeps only common trading days.
+            returns = closes.pct_change()
+            returns = returns.iloc[1:]  # drop first NaN row from pct_change
+            returns = returns.dropna(how='any')  # strict: only days ALL assets traded
+        elif return_method == "simple":
             # Simple returns: r_t = P_t / P_{t-1} - 1
             # Standard for ETFs — directly comparable to fund performance reports
             returns = closes.pct_change().dropna(how='all')
