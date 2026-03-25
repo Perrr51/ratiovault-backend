@@ -1513,39 +1513,83 @@ def get_benchmark_history(request: Request, symbol: str, start: str, end: str):
 @app.get("/correlation")
 @limiter.limit("10/minute")
 def get_correlation(request: Request, tickers: str, period: str = "1y"):
-    """Get correlation matrix for given tickers."""
+    """
+    Pearson correlation matrix of daily log returns.
+
+    Method:
+    1. Download daily Close prices from yfinance for the requested period
+    2. Forward-fill missing prices (holidays, delisted days) to align all series
+    3. Drop columns with < 30 observations (insufficient data for reliable correlation)
+    4. Compute daily log returns: ln(P_t / P_{t-1})
+       - Log returns are preferred over simple returns because they are additive
+         across time and more normally distributed, which makes Pearson correlation
+         more statistically valid.
+    5. Compute Pearson correlation matrix on the log returns
+    6. Replace any NaN correlations with 0.0 (can happen with zero-variance series)
+    7. Return N×N matrix with observation count and period metadata
+    """
     validated = CorrelationRequest(tickers=tickers, period=period)
     ticker_list = validated.tickers.split(",")
 
-    # Cache check
+    # Cache check (24h TTL)
     cache_key = f"corr_{'_'.join(sorted(ticker_list))}_{validated.period}"
     if cache_key in chart_cache:
         entry = chart_cache[cache_key]
-        if time.time() - entry["cached_at"] < 86400:  # 24h
+        if time.time() - entry["cached_at"] < 86400:
             return entry["data"]
 
     try:
         data = yf.download(ticker_list, period=validated.period, progress=False, auto_adjust=True)
         if data.empty:
-            return {"tickers": ticker_list, "matrix": [], "period": validated.period}
+            return {"tickers": ticker_list, "matrix": [], "period": validated.period, "observations": 0}
 
+        # Extract close prices
         closes = data['Close']
         if isinstance(closes, pd.Series):
             closes = closes.to_frame(name=ticker_list[0])
 
-        returns = closes.pct_change().dropna()
-        corr_matrix = returns.corr()
+        # Forward-fill gaps (weekends, holidays) then drop leading NaNs
+        closes = closes.ffill().dropna(how='all')
 
-        # Build response with ordered tickers matching matrix
+        # Drop tickers with insufficient data (< 30 trading days)
+        MIN_OBSERVATIONS = 30
+        valid_cols = [c for c in closes.columns if closes[c].notna().sum() >= MIN_OBSERVATIONS]
+        if not valid_cols:
+            return {"tickers": [], "matrix": [], "period": validated.period, "observations": 0}
+        closes = closes[valid_cols]
+
+        # Compute log returns: ln(P_t / P_{t-1})
+        # Log returns are additive and more normally distributed than simple returns,
+        # making Pearson correlation more statistically reliable
+        log_returns = np.log(closes / closes.shift(1)).dropna(how='all')
+
+        # Drop any remaining all-NaN columns after log transform
+        log_returns = log_returns.dropna(axis=1, how='all')
+
+        if log_returns.empty or len(log_returns) < MIN_OBSERVATIONS:
+            return {"tickers": list(log_returns.columns), "matrix": [], "period": validated.period, "observations": len(log_returns)}
+
+        # Pearson correlation on log returns
+        corr_matrix = log_returns.corr()
+
+        # Replace NaN with 0 (zero-variance tickers produce NaN correlation)
+        corr_matrix = corr_matrix.fillna(0.0)
+
+        # Build response preserving requested ticker order
         ordered_tickers = [t for t in ticker_list if t in corr_matrix.columns]
         matrix = []
         for t1 in ordered_tickers:
-            row = [_safe_float(corr_matrix.loc[t1, t2]) for t2 in ordered_tickers]
+            row = [round(_safe_float(corr_matrix.loc[t1, t2]), 4) for t2 in ordered_tickers]
             matrix.append(row)
 
-        result = {"tickers": ordered_tickers, "matrix": matrix, "period": validated.period}
+        result = {
+            "tickers": ordered_tickers,
+            "matrix": matrix,
+            "period": validated.period,
+            "observations": int(len(log_returns)),
+        }
 
-        # Cache
+        # Cache result
         chart_cache[cache_key] = {"data": result, "cached_at": time.time()}
         _cleanup_chart_cache()
 
