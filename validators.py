@@ -306,7 +306,7 @@ class CorrelationRequest(BaseModel):
 
     @validator('tickers')
     def validate_tickers(cls, v):
-        ticker_list = TickerValidator.validate_ticker_list(v, max_count=10)
+        ticker_list = TickerValidator.validate_ticker_list(v, max_count=20)
         return ",".join(ticker_list)
 
 
