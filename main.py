@@ -932,7 +932,7 @@ def get_asset_info(request: Request, tickers: str):
                 # Range & price
                 'fiftyTwoWeekHigh', 'fiftyTwoWeekLow',
                 'beta', 'trailingPE', 'dividendYield', 'trailingEps', 'forwardEps',
-                'sharesOutstanding',
+                'sharesOutstanding', 'averageVolume',
             )
             for key in _FLOAT_KEYS:
                 val = info.get(key)
