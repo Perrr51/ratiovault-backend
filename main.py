@@ -20,6 +20,7 @@ import math
 
 # Import configuration and validators
 from config import settings, validate_settings
+from stooq import should_try_stooq, fetch_stooq_quote_cached
 from validators import (
     QuotesRequest,
     SearchRequest,
@@ -164,6 +165,21 @@ def get_quotes(request: Request, tickers: str):
                 # Try history as last resort
                 hist = stock.history(period="5d")
                 if hist.empty:
+                    # Try Stooq fallback for metals, crypto crosses, forex
+                    if should_try_stooq(t):
+                        stooq_data = fetch_stooq_quote_cached(t)
+                        if stooq_data:
+                            return {
+                                "price": stooq_data['price'],
+                                "previousClose": stooq_data['previousClose'],
+                                "open": stooq_data['open'],
+                                "high": stooq_data['high'],
+                                "low": stooq_data['low'],
+                                "trailingPE": None,
+                                "dividendYield": None,
+                                "currency": stooq_data['currency'],
+                                "source": "stooq",
+                            }
                     return {
                         "price": 0.0, "previousClose": 0.0, "open": 0.0,
                         "high": 0.0, "low": 0.0, "trailingPE": None,
@@ -184,6 +200,21 @@ def get_quotes(request: Request, tickers: str):
                 }
 
             price = info.get("currentPrice") or info.get("regularMarketPrice") or info.get("navPrice") or 0.0
+            # If yfinance returned price=0, try Stooq fallback
+            if not price and should_try_stooq(t):
+                stooq_data = fetch_stooq_quote_cached(t)
+                if stooq_data:
+                    return {
+                        "price": stooq_data['price'],
+                        "previousClose": stooq_data['previousClose'],
+                        "open": stooq_data['open'],
+                        "high": stooq_data['high'],
+                        "low": stooq_data['low'],
+                        "trailingPE": None,
+                        "dividendYield": None,
+                        "currency": stooq_data['currency'],
+                        "source": "stooq",
+                    }
             prev_close = info.get("previousClose") or info.get("regularMarketPreviousClose") or price
             return {
                 "price": float(price),
@@ -197,6 +228,21 @@ def get_quotes(request: Request, tickers: str):
             }
         except Exception as e:
             logger.warning(f"Failed to fetch quote for {t}: {e}")
+            # Try Stooq fallback for metals, crypto crosses, forex
+            if should_try_stooq(t):
+                stooq_data = fetch_stooq_quote_cached(t)
+                if stooq_data:
+                    return {
+                        "price": stooq_data['price'],
+                        "previousClose": stooq_data['previousClose'],
+                        "open": stooq_data['open'],
+                        "high": stooq_data['high'],
+                        "low": stooq_data['low'],
+                        "trailingPE": None,
+                        "dividendYield": None,
+                        "currency": stooq_data['currency'],
+                        "source": "stooq",
+                    }
             return {
                 "price": 0.0, "previousClose": 0.0, "open": 0.0,
                 "high": 0.0, "low": 0.0, "trailingPE": None,
@@ -719,18 +765,33 @@ def get_forex_rates(request: Request):
         for yf_ticker, key in invert_pairs.items():
             try:
                 info = pairs.tickers[yf_ticker].info
-                rate = info.get("regularMarketPrice") or info.get("previousClose") or 1
-                result[key] = round(1 / rate, 6) if rate else 1
+                rate = info.get("regularMarketPrice") or info.get("previousClose") or 0
+                if rate and rate > 0:
+                    result[key] = round(1 / rate, 6)
             except Exception:
                 pass
 
         for yf_ticker, key in direct_pairs.items():
             try:
                 info = pairs.tickers[yf_ticker].info
-                rate = info.get("regularMarketPrice") or info.get("previousClose") or 1
-                result[key] = round(rate, 6)
+                rate = info.get("regularMarketPrice") or info.get("previousClose") or 0
+                if rate and rate > 0:
+                    result[key] = round(rate, 6)
             except Exception:
                 pass
+
+        # Stooq fallback for any forex pairs that yfinance failed to return
+        all_pairs = {**invert_pairs, **direct_pairs}
+        for yf_ticker, key in all_pairs.items():
+            if key not in result:
+                stooq_data = fetch_stooq_quote_cached(yf_ticker)
+                if stooq_data and stooq_data['price'] > 0:
+                    rate = stooq_data['price']
+                    if yf_ticker in invert_pairs:
+                        result[key] = round(1 / rate, 6)
+                    else:
+                        result[key] = round(rate, 6)
+                    logger.info(f"Forex fallback: {yf_ticker} -> {key} = {result[key]} (stooq)")
 
         # GBX (pence) = GBP / 100
         if "USDGBP" in result:
