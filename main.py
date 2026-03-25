@@ -908,12 +908,62 @@ def get_asset_info(request: Request, tickers: str):
                 except Exception:
                     pass
 
+            # Extended fundamental data from yfinance info dict
+            fundamentals = {}
+            _FLOAT_KEYS = (
+                # Valuation
+                'forwardPE', 'pegRatio', 'priceToSalesTrailing12Months',
+                'priceToBook', 'enterpriseToEbitda', 'enterpriseToRevenue',
+                'marketCap', 'bookValue', 'enterpriseValue',
+                # Profitability
+                'grossMargins', 'operatingMargins', 'profitMargins',
+                'returnOnAssets', 'returnOnEquity',
+                # Growth
+                'revenueGrowth', 'earningsGrowth', 'earningsQuarterlyGrowth',
+                # Strength
+                'currentRatio', 'quickRatio', 'debtToEquity',
+                # Cash flow
+                'freeCashflow', 'operatingCashflow', 'totalCash', 'totalDebt', 'totalRevenue',
+                # Analysts
+                'targetMeanPrice', 'targetHighPrice', 'targetLowPrice',
+                'numberOfAnalystOpinions', 'recommendationMean',
+                # Ownership
+                'heldPercentInsiders', 'heldPercentInstitutions', 'shortPercentOfFloat',
+                # Range & price
+                'fiftyTwoWeekHigh', 'fiftyTwoWeekLow',
+                'beta', 'trailingPE', 'dividendYield', 'trailingEps', 'forwardEps',
+                'sharesOutstanding',
+            )
+            for key in _FLOAT_KEYS:
+                val = info.get(key)
+                if val is not None:
+                    safe = _safe_float(val, default=None)
+                    if safe is not None:
+                        fundamentals[key] = safe
+
+            # String/int fields
+            rec_key = info.get("recommendationKey")
+            if rec_key:
+                fundamentals["recommendationKey"] = str(rec_key)
+            employees = info.get("fullTimeEmployees")
+            if employees is not None:
+                try:
+                    fundamentals["fullTimeEmployees"] = int(employees)
+                except (ValueError, TypeError):
+                    pass
+
             result[t] = {
                 "quoteType": quote_type,
                 "sector": sector,
                 "industry": industry,
                 "name": name or t,
                 "logoDomain": logo_domain,
+                "website": website,
+                "exchange": info.get("exchange") or "",
+                "country": info.get("country") or "",
+                "currency": info.get("currency") or "",
+                "isin": info.get("isin") or "",
+                **fundamentals,
             }
         except Exception as e:
             logger.warning(f"Failed to fetch asset info for {t}: {e}")
