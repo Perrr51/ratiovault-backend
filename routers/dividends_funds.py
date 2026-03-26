@@ -82,8 +82,19 @@ def get_ter_batch(request: Request, tickers: str):
         try:
             t = yf.Ticker(ticker)
             info = t.info or {}
+            ter_raw = (
+                info.get("annualReportExpenseRatio")
+                or info.get("netExpenseRatio")
+                or info.get("totalExpenseRatio")
+            )
+            ter_val = _safe_float(ter_raw)
+            # yfinance returns expense ratios as percentages (e.g. 0.0945 = 9.45bp)
+            # but sometimes as decimals (e.g. 0.0022 = 0.22%). Normalize: values > 1 are already in % form.
+            # Our frontend expects a decimal (0.0022 = 0.22%), so convert if needed.
+            if ter_val and ter_val > 0.05:
+                ter_val = ter_val / 100
             result[ticker] = {
-                "ter": _safe_float(info.get("annualReportExpenseRatio")),
+                "ter": ter_val,
                 "name": info.get("shortName", ticker),
                 "type": info.get("quoteType", "UNKNOWN"),
             }
