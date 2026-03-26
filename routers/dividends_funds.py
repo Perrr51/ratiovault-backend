@@ -1,11 +1,15 @@
 """Dividend data, TER batch, and ETF holdings endpoints."""
 
+import re
 import yfinance as yf
 from fastapi import APIRouter, HTTPException, Request
 
 from deps import limiter, logger
 from validators import DividendsRequest, TERRequest
 from utils import _safe_float
+from justetf import get_scraper
+
+_ISIN_RE = re.compile(r'^[A-Z]{2}[A-Z0-9]{10}$')
 
 router = APIRouter(tags=["Dividends & Funds"])
 
@@ -71,10 +75,42 @@ def get_dividends(request: Request, tickers: str):
     return result
 
 
+def _normalize_ter(ter_val: float, source: str = "yfinance") -> float:
+    """Normalize TER to decimal form where 0.0022 = 0.22%.
+    - yfinance netExpenseRatio: always percentage (0.03 = 0.03%, 0.0945 = 0.0945%)
+    - justETF: always percentage (0.20 = 0.20%)
+    Both need /100 to become decimal for our frontend (frontend does *100 for display)."""
+    if not ter_val:
+        return 0.0
+    return ter_val / 100
+
+
+def _get_ter_from_justetf(ticker: str, isin: str | None) -> float | None:
+    """Try to get TER from justETF by ISIN. Returns decimal or None."""
+    # If ticker itself looks like an ISIN, use it directly
+    candidate_isin = isin
+    if not candidate_isin and _ISIN_RE.match(ticker):
+        candidate_isin = ticker
+
+    if not candidate_isin:
+        return None
+
+    try:
+        scraper = get_scraper()
+        profile = scraper.get_etf_profile(candidate_isin)
+        if profile and profile.get("ter"):
+            return _normalize_ter(profile["ter"])
+    except Exception as e:
+        logger.debug(f"justETF TER lookup failed for {candidate_isin}: {e}")
+
+    return None
+
+
 @router.get("/ter/batch")
 @limiter.limit("10/minute")
 def get_ter_batch(request: Request, tickers: str):
-    """Get TER (Total Expense Ratio) for ETFs/funds."""
+    """Get TER (Total Expense Ratio) for ETFs/funds.
+    Fallback chain: yfinance netExpenseRatio → justETF profile (by ISIN)."""
     validated = TERRequest(tickers=tickers)
     ticker_list = validated.tickers.split(",")
     result = {}
@@ -82,21 +118,30 @@ def get_ter_batch(request: Request, tickers: str):
         try:
             t = yf.Ticker(ticker)
             info = t.info or {}
+            quote_type = info.get("quoteType", "UNKNOWN")
+            name = info.get("shortName", ticker)
+
+            # 1. Try yfinance expense ratio fields
             ter_raw = (
                 info.get("annualReportExpenseRatio")
                 or info.get("netExpenseRatio")
                 or info.get("totalExpenseRatio")
             )
             ter_val = _safe_float(ter_raw)
-            # yfinance returns expense ratios as percentages (e.g. 0.0945 = 9.45bp)
-            # but sometimes as decimals (e.g. 0.0022 = 0.22%). Normalize: values > 1 are already in % form.
-            # Our frontend expects a decimal (0.0022 = 0.22%), so convert if needed.
-            if ter_val and ter_val > 0.05:
-                ter_val = ter_val / 100
+            if ter_val:
+                ter_val = _normalize_ter(ter_val)
+
+            # 2. If no TER from yfinance and it's an ETF, try justETF
+            if not ter_val and quote_type == "ETF":
+                isin = info.get("isin") if info.get("isin") not in (None, "-", "") else None
+                justetf_ter = _get_ter_from_justetf(ticker, isin)
+                if justetf_ter:
+                    ter_val = justetf_ter
+
             result[ticker] = {
                 "ter": ter_val,
-                "name": info.get("shortName", ticker),
-                "type": info.get("quoteType", "UNKNOWN"),
+                "name": name,
+                "type": quote_type,
             }
         except Exception as e:
             logger.warning(f"Failed to get TER for {ticker}: {e}")
