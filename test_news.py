@@ -3,7 +3,7 @@
 Script de prueba para verificar que el endpoint /news funciona correctamente
 """
 
-from main import get_news
+from routers.asset_info import get_news
 
 # Probar con varios tickers
 test_tickers = ["AAPL", "MSFT", "GOOGL"]
