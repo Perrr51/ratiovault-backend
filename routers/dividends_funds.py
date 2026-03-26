@@ -28,7 +28,7 @@ def get_dividends(request: Request, tickers: str):
                 divs = t.dividends
                 history = []
                 if divs is not None and not divs.empty:
-                    for date_idx, amount in divs.tail(20).items():
+                    for date_idx, amount in divs.tail(100).items():
                         history.append({
                             "date": date_idx.strftime('%Y-%m-%d'),
                             "amount": _safe_float(amount)

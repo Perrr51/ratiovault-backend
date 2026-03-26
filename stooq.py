@@ -89,6 +89,89 @@ def yahoo_to_stooq_ticker(yahoo_ticker: str) -> str:
     return yahoo_ticker.replace('=X', '').replace('-', '').lower()
 
 
+def fetch_stooq_history(yahoo_ticker: str, start: str, end: str) -> Optional[dict]:
+    """
+    Fetch historical daily close prices from Stooq.pl.
+
+    Args:
+        yahoo_ticker: Yahoo-format ticker (e.g., 'XAUCHF=X')
+        start: Start date YYYY-MM-DD
+        end: End date YYYY-MM-DD
+
+    Returns:
+        dict with {dates: list[str], closes: list[float]} or None if unavailable.
+    """
+    stooq_ticker = yahoo_to_stooq_ticker(yahoo_ticker)
+    d1 = start.replace('-', '')
+    d2 = end.replace('-', '')
+    url = f"https://stooq.com/q/d/l/?s={stooq_ticker}&d1={d1}&d2={d2}&i=d"
+
+    try:
+        with httpx.Client(timeout=15.0) as client:
+            resp = client.get(url, headers={
+                'User-Agent': 'Mozilla/5.0 (compatible; RatioVault/1.0)'
+            })
+            resp.raise_for_status()
+
+            text = resp.text.strip()
+            if not text or 'No data' in text or 'Exceeded' in text:
+                logger.debug(f"Stooq history: no data for {stooq_ticker}")
+                return None
+
+            lines = text.split('\n')
+            if len(lines) < 2:
+                return None
+
+            # Parse CSV header
+            header = [h.strip().lower() for h in lines[0].split(',')]
+            date_col = header.index('date') if 'date' in header else 0
+            close_col = header.index('close') if 'close' in header else -1
+            if close_col < 0:
+                return None
+
+            dates = []
+            closes = []
+
+            for line in lines[1:]:
+                if not line.strip():
+                    continue
+                parts = line.split(',')
+                if len(parts) <= max(date_col, close_col):
+                    continue
+
+                date_str = parts[date_col].strip()
+                close_str = parts[close_col].strip()
+                if not date_str or not close_str or close_str == 'N/D':
+                    continue
+
+                try:
+                    close_val = float(close_str)
+                    if close_val <= 0:
+                        continue
+                    # Normalize date to YYYY-MM-DD
+                    if len(date_str) == 8:
+                        date_str = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}"
+                    dates.append(date_str)
+                    closes.append(close_val)
+                except (ValueError, TypeError):
+                    continue
+
+            if not dates:
+                return None
+
+            # Stooq may return newest-first — ensure oldest-first
+            if len(dates) > 1 and dates[0] > dates[-1]:
+                dates.reverse()
+                closes.reverse()
+
+            logger.info(f"Stooq history: {yahoo_ticker} -> {stooq_ticker}, {len(dates)} data points")
+            return {'dates': dates, 'closes': closes}
+
+    except Exception as e:
+        logger.warning(f"Stooq history fetch failed for {stooq_ticker}: {e}")
+        return None
+
+
 def fetch_stooq_quote(yahoo_ticker: str) -> Optional[dict]:
     """
     Fetch a quote from Stooq.pl for the given Yahoo-format ticker.

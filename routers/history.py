@@ -7,6 +7,7 @@ from fastapi import APIRouter, HTTPException, Request
 from deps import limiter, logger
 from validators import HistoryRequest
 from utils import _safe_float
+from stooq import should_try_stooq, fetch_stooq_history
 
 router = APIRouter(tags=["History"])
 
@@ -37,13 +38,43 @@ def get_history(request: Request, tickers: str, start: str, end: str):
         # Convert dates to strings
         dates = [d.strftime('%Y-%m-%d') for d in closes.index]
 
-        # Build prices dict
+        # Build prices dict and detect failed tickers
         prices = {}
+        failed_tickers = []
         for ticker in ticker_list:
             if ticker in closes.columns:
-                prices[ticker] = [_safe_float(v) for v in closes[ticker].tolist()]
+                vals = [_safe_float(v) for v in closes[ticker].tolist()]
+                prices[ticker] = vals
+                if all(v == 0.0 for v in vals):
+                    failed_tickers.append(ticker)
             else:
                 prices[ticker] = [0.0] * len(dates)
+                failed_tickers.append(ticker)
+
+        # Stooq fallback for tickers that yfinance couldn't resolve
+        if failed_tickers:
+            for ticker in failed_tickers:
+                if not should_try_stooq(ticker):
+                    continue
+                stooq_hist = fetch_stooq_history(ticker, validated.start, validated.end)
+                if not stooq_hist or not stooq_hist.get('dates'):
+                    continue
+                # Align Stooq data to our date axis with forward-fill
+                stooq_lookup = dict(zip(stooq_hist['dates'], stooq_hist['closes']))
+                aligned = []
+                last_val = 0.0
+                for d in dates:
+                    if d in stooq_lookup:
+                        last_val = stooq_lookup[d]
+                    aligned.append(last_val if last_val > 0 else 0.0)
+                # Back-fill leading zeros with first available value
+                first_val = next((v for v in aligned if v > 0), 0.0)
+                for i in range(len(aligned)):
+                    if aligned[i] > 0:
+                        break
+                    aligned[i] = first_val
+                prices[ticker] = aligned
+                logger.info(f"History fallback: {ticker} resolved via Stooq ({len(stooq_hist['dates'])} points)")
 
         # Download forex rates for the same period
         forex_pairs = ['EURUSD=X', 'USDCHF=X', 'GBPUSD=X']
