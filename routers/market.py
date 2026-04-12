@@ -122,6 +122,13 @@ def get_quotes(request: Request, tickers: str):
                         "currency": stooq_data['currency'],
                         "source": "stooq",
                     }
+            if not price or price <= 0:
+                return {
+                    "price": 0.0, "previousClose": 0.0, "open": 0.0,
+                    "high": 0.0, "low": 0.0, "trailingPE": None,
+                    "dividendYield": None, "currency": quote_currency,
+                    "error": f"yfinance returned no price for {t}"
+                }
             prev_close = info.get("previousClose") or info.get("regularMarketPreviousClose") or price
             return {
                 "price": float(price),
@@ -195,8 +202,9 @@ async def search_symbol(request: Request, q: str):
 def get_forex_rates(request: Request):
     """
     Get current USD-based exchange rates for EUR, CHF, GBP, GBX, JPY, CAD, AUD, SEK, NOK, DKK.
-    Uses yfinance forex tickers.
+    Uses yfinance forex tickers with fast_info (lightweight endpoint).
     Returns: { "USDEUR": rate, "USDCHF": rate, "USDGBP": rate, ... }
+    Returns HTTP 503 if no rates could be resolved.
     """
     try:
         # Pairs where ticker gives "how many USD per 1 unit" (e.g. EURUSD=X -> 1 EUR = X USD)
@@ -223,8 +231,8 @@ def get_forex_rates(request: Request):
 
         for yf_ticker, key in invert_pairs.items():
             try:
-                info = pairs.tickers[yf_ticker].info
-                rate = info.get("regularMarketPrice") or info.get("previousClose") or 0
+                fi = pairs.tickers[yf_ticker].fast_info
+                rate = fi.get("lastPrice", 0) or fi.get("previousClose", 0) or 0
                 if rate and rate > 0:
                     result[key] = round(1 / rate, 6)
             except Exception:
@@ -232,8 +240,8 @@ def get_forex_rates(request: Request):
 
         for yf_ticker, key in direct_pairs.items():
             try:
-                info = pairs.tickers[yf_ticker].info
-                rate = info.get("regularMarketPrice") or info.get("previousClose") or 0
+                fi = pairs.tickers[yf_ticker].fast_info
+                rate = fi.get("lastPrice", 0) or fi.get("previousClose", 0) or 0
                 if rate and rate > 0:
                     result[key] = round(rate, 6)
             except Exception:
@@ -256,7 +264,12 @@ def get_forex_rates(request: Request):
         if "USDGBP" in result:
             result["USDGBX"] = round(result["USDGBP"] * 100, 6)
 
+        if not result:
+            raise HTTPException(status_code=503, detail="No forex rates could be resolved")
+
         return result
+    except HTTPException:
+        raise  # Re-raise 503
     except Exception as e:
         logger.error(f"Error fetching forex rates: {e}")
-        return {"USDEUR": 0.92, "USDCHF": 0.88, "USDGBP": 0.79, "USDJPY": 150, "fallback": True}
+        raise HTTPException(status_code=503, detail="Forex service temporarily unavailable")
