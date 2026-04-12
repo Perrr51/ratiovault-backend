@@ -10,6 +10,29 @@ from stooq import should_try_stooq, fetch_stooq_quote_cached
 
 router = APIRouter(tags=["Market"])
 
+# Exchange suffix → quote currency (last-resort fallback when yfinance returns null)
+# Only includes unambiguous exchanges. Excludes .L (GBX vs GBP ambiguity).
+_EXCHANGE_CURRENCY = {
+    ".DE": "EUR", ".F": "EUR", ".PA": "EUR", ".AS": "EUR",
+    ".MI": "EUR", ".MC": "EUR", ".BR": "EUR", ".LS": "EUR",
+    ".HE": "EUR", ".VI": "EUR", ".IR": "EUR",
+    ".SW": "CHF",
+    ".TO": "CAD",
+    ".AX": "AUD",
+    ".T": "JPY",
+    ".ST": "SEK",
+    ".OL": "NOK",
+    ".CO": "DKK",
+}
+
+def _infer_currency_from_suffix(ticker: str) -> str | None:
+    """Infer quote currency from exchange suffix when yfinance fails."""
+    dot = ticker.rfind(".")
+    if dot < 0:
+        return None
+    suffix = ticker[dot:]
+    return _EXCHANGE_CURRENCY.get(suffix)
+
 
 @router.get("/quotes")
 @limiter.limit("60/minute")  # 60 requests per minute
@@ -50,6 +73,8 @@ def get_quotes(request: Request, tickers: str):
                             quote_currency = info_currency.get("currency") or info_currency.get("financialCurrency") or None
                         except Exception:
                             pass
+                    if not quote_currency:
+                        quote_currency = _infer_currency_from_suffix(t)
                     return {
                         "price": float(price),
                         "previousClose": float(prev_close),
@@ -66,6 +91,8 @@ def get_quotes(request: Request, tickers: str):
             # Fallback: full info dict (slower but has currency)
             info = stock.info
             quote_currency = info.get("currency") or info.get("financialCurrency") or None
+            if not quote_currency:
+                quote_currency = _infer_currency_from_suffix(t)
 
             if not info or info.get("trailingPegRatio") is None and info.get("regularMarketPrice") is None and info.get("currentPrice") is None:
                 # Likely an invalid ticker — yfinance returns near-empty dict
