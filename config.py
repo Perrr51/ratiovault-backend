@@ -12,7 +12,7 @@ class Settings(BaseSettings):
     """Application settings loaded from environment variables"""
 
     # CORS Configuration
-    cors_origins: str = "http://localhost:5173,http://localhost:3000"
+    cors_origins: str = "http://localhost:5173,http://localhost:5174,http://localhost:3000"
 
     # SEC API Configuration
     sec_user_agent: str = "ThinkInvest contact@thinkinvest.com"
