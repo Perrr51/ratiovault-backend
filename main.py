@@ -33,6 +33,13 @@ validate_settings()
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
+# ── Health check (for Coolify/Docker healthcheck and uptime monitoring) ─────
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
 # ── CORS ─────────────────────────────────────────────────────────────────────
 
 app.add_middleware(
