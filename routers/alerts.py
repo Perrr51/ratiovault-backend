@@ -13,7 +13,7 @@ router = APIRouter(tags=["Alerts"])
 @router.post("/alerts/evaluate")
 @limiter.limit("10/minute")
 async def evaluate_alerts(request: Request):
-    """Evaluate alerts against current prices. Frontend handles Firestore updates."""
+    """Evaluate alerts against current prices. Frontend persists the outcome in Supabase (table `alerts`: trigger_count, last_triggered_at, trigger_history)."""
     body = await request.json()
     try:
         validated = AlertEvaluateRequest(**body)
