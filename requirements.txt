@@ -12,3 +12,4 @@ slowapi==0.1.9
 beautifulsoup4==4.13.4
 supabase==2.17.0
 psycopg[binary]==3.2.10
+PyJWT==2.9.0
