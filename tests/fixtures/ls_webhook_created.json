@@ -1,0 +1,58 @@
+{
+  "meta": {
+    "event_name": "subscription_created",
+    "custom_data": {
+      "uid": "a3f1c2de-4b5a-4c9d-8e1f-2a7b9c0d1e2f",
+      "email": "user@example.com"
+    }
+  },
+  "data": {
+    "type": "subscriptions",
+    "id": "849321",
+    "attributes": {
+      "store_id": 71234,
+      "order_id": 5012345,
+      "customer_id": 3012456,
+      "order_item_id": 6012789,
+      "product_id": 412987,
+      "variant_id": 512876,
+      "product_name": "RatioVault Pro",
+      "variant_name": "Pro Monthly",
+      "user_name": "Test User",
+      "user_email": "user@example.com",
+      "status": "active",
+      "status_formatted": "Active",
+      "card_brand": "visa",
+      "card_last_four": "4242",
+      "pause": null,
+      "cancelled": false,
+      "trial_ends_at": null,
+      "billing_anchor": 20,
+      "first_subscription_item": {
+        "id": 78901,
+        "subscription_id": 849321,
+        "price_id": 912345,
+        "quantity": 1,
+        "created_at": "2026-04-20T10:15:30.000000Z",
+        "updated_at": "2026-04-20T10:15:30.000000Z"
+      },
+      "urls": {
+        "update_payment_method": "https://example.lemonsqueezy.com/subscription/849321/payment-details?expires=1745000000&signature=abc",
+        "customer_portal": "https://example.lemonsqueezy.com/billing?expires=1745000000&signature=def"
+      },
+      "renews_at": "2026-05-20T10:15:30.000000Z",
+      "ends_at": null,
+      "created_at": "2026-04-20T10:15:30.000000Z",
+      "updated_at": "2026-04-20T10:15:30.000000Z",
+      "test_mode": false
+    },
+    "relationships": {
+      "store": {"links": {"related": "https://api.lemonsqueezy.com/v1/subscriptions/849321/store"}},
+      "customer": {"links": {"related": "https://api.lemonsqueezy.com/v1/subscriptions/849321/customer"}},
+      "order": {"links": {"related": "https://api.lemonsqueezy.com/v1/subscriptions/849321/order"}},
+      "product": {"links": {"related": "https://api.lemonsqueezy.com/v1/subscriptions/849321/product"}},
+      "variant": {"links": {"related": "https://api.lemonsqueezy.com/v1/subscriptions/849321/variant"}}
+    },
+    "links": {"self": "https://api.lemonsqueezy.com/v1/subscriptions/849321"}
+  }
+}
