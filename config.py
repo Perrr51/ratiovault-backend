@@ -28,6 +28,10 @@ class Settings(BaseSettings):
     port: int = 8000
     host: str = "0.0.0.0"
 
+    # Supabase Configuration (Task 1: minimal fields; full set added in Task 7)
+    supabase_url: str = ""
+    supabase_service_role_key: str = ""
+
     class Config:
         env_file = ".env"
         case_sensitive = False
