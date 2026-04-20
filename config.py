@@ -32,6 +32,9 @@ class Settings(BaseSettings):
     supabase_url: str = ""
     supabase_service_role_key: str = ""
 
+    # Internal cron token (Task 5: retention endpoint auth — fail-closed if empty)
+    internal_cron_token: str = ""
+
     class Config:
         env_file = ".env"
         case_sensitive = False
