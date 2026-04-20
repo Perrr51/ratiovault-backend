@@ -16,15 +16,6 @@ We query the catalog directly via psycopg against the local Postgres
 from __future__ import annotations
 
 import psycopg
-import pytest
-
-LOCAL_DB_DSN = "postgresql://postgres:postgres@127.0.0.1:54322/postgres"
-
-
-@pytest.fixture(scope="module")
-def pg_conn(supabase_local):  # noqa: ARG001 — fixture ensures DB reset has run
-    with psycopg.connect(LOCAL_DB_DSN, autocommit=True) as conn:
-        yield conn
 
 
 def test_subscriptions_table_exists(pg_conn: psycopg.Connection) -> None:

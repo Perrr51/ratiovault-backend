@@ -21,7 +21,10 @@ import re
 import subprocess
 from pathlib import Path
 
+import psycopg
 import pytest
+
+LOCAL_DB_DSN = "postgresql://postgres:postgres@127.0.0.1:54322/postgres"
 
 # portfolio-tracker root (one level above `api/`) — where `supabase/config.toml` lives.
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -138,3 +141,14 @@ def supabase_local():
 
     if started_by_us:
         _run(["npx", "--yes", "supabase", "stop"], check=False, timeout=120)
+
+
+@pytest.fixture(scope="module")
+def pg_conn(supabase_local):  # noqa: ARG001 — fixture ensures DB reset has run
+    """Direct psycopg connection to the local Supabase Postgres.
+
+    Shared across migration tests. Autocommit so catalog queries see
+    committed state immediately.
+    """
+    with psycopg.connect(LOCAL_DB_DSN, autocommit=True) as conn:
+        yield conn
