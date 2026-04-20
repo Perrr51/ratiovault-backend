@@ -25,6 +25,8 @@ def client(monkeypatch):
     )
     monkeypatch.setattr(settings, "lemon_squeezy_monthly_variant_id", "VAR_MONTH")
     monkeypatch.setattr(settings, "lemon_squeezy_yearly_variant_id", "VAR_YEAR")
+    monkeypatch.setattr(settings, "lemon_squeezy_quarterly_variant_id", "VAR_Q")
+    monkeypatch.setattr(settings, "lemon_squeezy_semiannual_variant_id", "VAR_S")
 
     from main import app
 
@@ -85,6 +87,36 @@ def test_valid_jwt_yearly_returns_checkout_url(client):
     )
     assert r.status_code == 200
     assert "VAR_YEAR" in r.json()["checkoutUrl"]
+
+
+def test_valid_jwt_quarterly_returns_checkout_url(client):
+    r = client.post(
+        "/subscription/checkout",
+        json={"interval": "quarterly"},
+        headers={"Authorization": f"Bearer {_token()}"},
+    )
+    assert r.status_code == 200
+    assert "VAR_Q" in r.json()["checkoutUrl"]
+
+
+def test_valid_jwt_semiannual_returns_checkout_url(client):
+    r = client.post(
+        "/subscription/checkout",
+        json={"interval": "semiannual"},
+        headers={"Authorization": f"Bearer {_token()}"},
+    )
+    assert r.status_code == 200
+    assert "VAR_S" in r.json()["checkoutUrl"]
+
+
+def test_unknown_interval_returns_400(client):
+    r = client.post(
+        "/subscription/checkout",
+        json={"interval": "weekly"},
+        headers={"Authorization": f"Bearer {_token()}"},
+    )
+    assert r.status_code == 400
+    assert "Unknown interval" in r.json()["detail"]
 
 
 def test_default_interval_is_monthly(client):

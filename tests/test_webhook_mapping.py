@@ -36,6 +36,30 @@ def test_determine_interval_annual_english():
     assert _determine_interval("Annual Plan") == "yearly"
 
 
+def test_determine_interval_pro_mensual():
+    assert _determine_interval("Pro Mensual") == "monthly"
+
+
+def test_determine_interval_pro_3_meses():
+    assert _determine_interval("Pro 3 meses") == "quarterly"
+
+
+def test_determine_interval_pro_6_meses():
+    assert _determine_interval("Pro 6 meses") == "semiannual"
+
+
+def test_determine_interval_pro_1_ano():
+    assert _determine_interval("Pro 1 año") == "yearly"
+
+
+def test_determine_interval_quarterly_english():
+    assert _determine_interval("Pro Quarterly") == "quarterly"
+
+
+def test_determine_interval_semiannual_english():
+    assert _determine_interval("Pro Semiannual") == "semiannual"
+
+
 # ---------- _parse_timestamp ----------
 
 def test_parse_timestamp_none_returns_none():

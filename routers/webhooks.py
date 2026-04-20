@@ -40,13 +40,23 @@ def _parse_timestamp(iso_string: Optional[str]) -> Optional[datetime]:
 
 
 def _determine_interval(variant_name: Optional[str]) -> str:
-    """Infer 'monthly' | 'yearly' from variant name. Defaults to 'monthly'."""
+    """Infer plan_interval from variant name. Patterns checked in order.
+
+    Supports 4 intervals: monthly | quarterly | semiannual | yearly.
+    Order matters: more specific patterns (3 mes, 6 mes, semiannual) must
+    be checked before generic ones (year/annual, mensual) to avoid false
+    positives (e.g. "semiannual" contains "annual").
+    """
     if not variant_name:
         return "monthly"
     lower = variant_name.lower()
-    if any(tok in lower for tok in ("year", "annual", "anual")):
+    if any(tok in lower for tok in ("3 mes", "3 month", "quarter", "trimestr")):
+        return "quarterly"
+    if any(tok in lower for tok in ("6 mes", "6 month", "semestr", "semiannual", "semi-annual")):
+        return "semiannual"
+    if any(tok in lower for tok in ("year", "annual", "anual", "1 año", "1 ano")):
         return "yearly"
-    return "monthly"
+    return "monthly"  # default includes "mensual", "monthly", "mes"
 
 
 def _compute_event_id(event_name: str, data: dict) -> str:

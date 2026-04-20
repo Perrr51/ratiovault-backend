@@ -43,6 +43,8 @@ class Settings(BaseSettings):
     lemon_squeezy_store_id: str = ""
     lemon_squeezy_checkout_base: str = ""
     lemon_squeezy_monthly_variant_id: str = ""
+    lemon_squeezy_quarterly_variant_id: str = ""
+    lemon_squeezy_semiannual_variant_id: str = ""
     lemon_squeezy_yearly_variant_id: str = ""
     lemon_squeezy_api_key: str = ""
 
@@ -107,6 +109,8 @@ def validate_settings():
             ("LEMON_SQUEEZY_STORE_ID", settings.lemon_squeezy_store_id),
             ("LEMON_SQUEEZY_CHECKOUT_BASE", settings.lemon_squeezy_checkout_base),
             ("LEMON_SQUEEZY_MONTHLY_VARIANT_ID", settings.lemon_squeezy_monthly_variant_id),
+            ("LEMON_SQUEEZY_QUARTERLY_VARIANT_ID", settings.lemon_squeezy_quarterly_variant_id),
+            ("LEMON_SQUEEZY_SEMIANNUAL_VARIANT_ID", settings.lemon_squeezy_semiannual_variant_id),
             ("LEMON_SQUEEZY_YEARLY_VARIANT_ID", settings.lemon_squeezy_yearly_variant_id),
             ("LEMON_SQUEEZY_API_KEY", settings.lemon_squeezy_api_key),
         )

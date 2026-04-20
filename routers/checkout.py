@@ -13,6 +13,16 @@ from config import settings
 router = APIRouter(tags=["subscription"])
 
 
+# Accepted intervals → getter over settings. Each getter reads lazily so
+# monkeypatched settings in tests resolve correctly per-request.
+INTERVAL_TO_VARIANT = {
+    "monthly":    lambda s: s.lemon_squeezy_monthly_variant_id,
+    "quarterly":  lambda s: s.lemon_squeezy_quarterly_variant_id,
+    "semiannual": lambda s: s.lemon_squeezy_semiannual_variant_id,
+    "yearly":     lambda s: s.lemon_squeezy_yearly_variant_id,
+}
+
+
 class CheckoutRequest(BaseModel):
     interval: str = "monthly"
 
@@ -25,10 +35,10 @@ def create_checkout(request: CheckoutRequest, authorization: str = Header(None))
 
     claims = verify_supabase_jwt(token, settings.supabase_jwt_secret)
 
-    if request.interval == "yearly":
-        variant = settings.lemon_squeezy_yearly_variant_id
-    else:
-        variant = settings.lemon_squeezy_monthly_variant_id
+    getter = INTERVAL_TO_VARIANT.get(request.interval)
+    if getter is None:
+        raise HTTPException(status_code=400, detail=f"Unknown interval: {request.interval}")
+    variant = getter(settings)
 
     if not variant:
         raise HTTPException(status_code=500, detail="Checkout variant not configured")

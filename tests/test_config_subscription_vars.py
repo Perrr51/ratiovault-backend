@@ -46,3 +46,11 @@ def test_has_lemon_squeezy_yearly_variant_id():
 
 def test_has_lemon_squeezy_api_key():
     assert hasattr(settings, "lemon_squeezy_api_key")
+
+
+def test_has_lemon_squeezy_quarterly_variant_id():
+    assert hasattr(settings, "lemon_squeezy_quarterly_variant_id")
+
+
+def test_has_lemon_squeezy_semiannual_variant_id():
+    assert hasattr(settings, "lemon_squeezy_semiannual_variant_id")
