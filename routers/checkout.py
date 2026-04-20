@@ -1,0 +1,43 @@
+"""Server-side checkout URL generation for Lemon Squeezy.
+
+Verifies the Supabase JWT, extracts the verified uid+email, and constructs
+the LS checkout URL. The uid NEVER comes from the request body — this was
+the FIX-1 in the v3.0 audit (UID spoofing prevention).
+"""
+from fastapi import APIRouter, Header, HTTPException
+from pydantic import BaseModel
+
+from auth import verify_supabase_jwt
+from config import settings
+
+router = APIRouter(tags=["subscription"])
+
+
+class CheckoutRequest(BaseModel):
+    interval: str = "monthly"
+
+
+@router.post("/subscription/checkout")
+def create_checkout(request: CheckoutRequest, authorization: str = Header(None)):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or malformed Authorization header")
+    token = authorization.removeprefix("Bearer ").strip()
+
+    claims = verify_supabase_jwt(token, settings.supabase_jwt_secret)
+
+    if request.interval == "yearly":
+        variant = settings.lemon_squeezy_yearly_variant_id
+    else:
+        variant = settings.lemon_squeezy_monthly_variant_id
+
+    if not variant:
+        raise HTTPException(status_code=500, detail="Checkout variant not configured")
+    if not settings.lemon_squeezy_checkout_base:
+        raise HTTPException(status_code=500, detail="Checkout base URL not configured")
+
+    url = (
+        f"{settings.lemon_squeezy_checkout_base}/{variant}"
+        f"?checkout[custom][uid]={claims['uid']}"
+        f"&checkout[email]={claims['email']}"
+    )
+    return {"checkoutUrl": url}
