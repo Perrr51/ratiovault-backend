@@ -1,10 +1,18 @@
 """Lemon Squeezy webhook handler (HMAC-SHA256)."""
+import asyncio
 import hashlib
 import hmac
+import json
+import logging
 from datetime import datetime
 from typing import Optional
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException, Request
+
+from config import settings
+from supabase_client import get_supabase_service
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["webhooks"])
 
@@ -119,3 +127,98 @@ def _process_subscription_event(event_name: str, data: dict) -> dict:
         }
 
     return {}
+
+
+def _serialize_state_update(state_update: dict) -> dict:
+    """Serialize datetimes in state_update to ISO strings for JSONB round-trip.
+
+    Values that are `None` are preserved (they mean 'set to NULL' per the RPC
+    contract). Anything with an `isoformat()` method (datetime/date) becomes
+    a string. All other values pass through unchanged.
+    """
+    out = {}
+    for k, v in state_update.items():
+        if v is None:
+            out[k] = None
+        elif hasattr(v, "isoformat"):
+            out[k] = v.isoformat()
+        else:
+            out[k] = v
+    return out
+
+
+def _handle_webhook(body: bytes, signature: str) -> dict:
+    """Sync core of the webhook handler — runs in a threadpool.
+
+    Keeps the FastAPI async handler lightweight (just body reading) while the
+    blocking supabase-py RPC call runs off the event loop.
+    """
+    if not _verify_signature(body, signature, settings.lemon_squeezy_webhook_secret):
+        raise HTTPException(status_code=400, detail="Invalid signature")
+
+    try:
+        payload = json.loads(body)
+    except (ValueError, json.JSONDecodeError):
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Invalid payload")
+
+    meta = payload.get("meta") or {}
+    event_name = meta.get("event_name", "")
+    custom_data = meta.get("custom_data") or {}
+    uid = custom_data.get("uid")
+    if not uid:
+        raise HTTPException(status_code=400, detail="Missing uid in custom_data")
+
+    data = payload.get("data")
+    if not isinstance(data, dict) or not data.get("id") or not isinstance(data.get("attributes"), dict):
+        raise HTTPException(status_code=400, detail="Malformed data object")
+
+    # Optional store_id validation — skip when the env var is unset.
+    if settings.lemon_squeezy_store_id:
+        store_id = str(data["attributes"].get("store_id", ""))
+        if store_id != settings.lemon_squeezy_store_id:
+            raise HTTPException(status_code=400, detail="Store ID mismatch")
+
+    event_id = _compute_event_id(event_name, data)
+    state_update = _process_subscription_event(event_name, data)
+    serialized = _serialize_state_update(state_update)
+
+    client = get_supabase_service()
+    try:
+        resp = client.rpc(
+            "apply_subscription_event",
+            {
+                "p_lemon_event_id": event_id,
+                "p_user_id": uid,
+                "p_event_type": event_name,
+                "p_raw_payload": payload,
+                "p_state_update": serialized,
+            },
+        ).execute()
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001 — we want to catch every failure mode
+        logger.critical(
+            "Webhook RPC failed: event_id=%s uid=%s err=%s",
+            event_id,
+            uid,
+            exc,
+        )
+        raise HTTPException(status_code=500, detail="Apply failed")
+
+    return resp.data if resp.data is not None else {"applied": True}
+
+
+@router.post("/webhooks/lemonsqueezy")
+async def handle_lemonsqueezy_webhook(request: Request):
+    """Lemon Squeezy webhook entry point.
+
+    Reads the raw body (required for HMAC verification — we cannot use the
+    re-serialized JSON) and offloads the synchronous verification + RPC call
+    to a threadpool so the event loop stays responsive.
+    """
+    body = await request.body()
+    signature = request.headers.get("X-Signature", "")
+    return await asyncio.to_thread(_handle_webhook, body, signature)

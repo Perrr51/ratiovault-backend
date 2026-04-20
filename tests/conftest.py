@@ -124,7 +124,16 @@ def supabase_local():
         "127.0.0.1:54321/storage" in reset.stderr
         and "context deadline exceeded" in reset.stderr
     )
-    if reset.returncode != 0 and not (migrations_ok and benign_storage_probe):
+    # Container-restart phase sometimes returns 502 from the kong upstream
+    # while proxies re-attach after `Restarting containers...`. Migrations
+    # already succeeded at this point; we treat it as benign.
+    benign_restart_502 = (
+        "Restarting containers" in reset.stderr
+        and "Error status 502" in reset.stderr
+    )
+    if reset.returncode != 0 and not (
+        migrations_ok and (benign_storage_probe or benign_restart_502)
+    ):
         pytest.fail(
             "`npx supabase db reset --local` failed:\n"
             f"STDOUT:\n{reset.stdout}\n\nSTDERR:\n{reset.stderr}"
@@ -134,6 +143,28 @@ def supabase_local():
         from supabase import create_client
     except ImportError as e:
         pytest.fail(f"supabase-py not installed: {e}")
+
+    # After `db reset` the container restart phase briefly leaves the auth/rest
+    # services 502-ing while kong reconnects. Wait for /auth/v1/health to respond
+    # before yielding the client so first tests don't race the restart.
+    import time
+    import urllib.request
+    deadline = time.monotonic() + 60
+    last_err: Exception | None = None
+    while time.monotonic() < deadline:
+        try:
+            req = urllib.request.Request(
+                f"{api_url.rstrip('/')}/auth/v1/health",
+                headers={"apikey": service_key, "Authorization": f"Bearer {service_key}"},
+            )
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                if resp.status == 200:
+                    break
+        except Exception as e:  # noqa: BLE001 — probe, any error means keep waiting
+            last_err = e
+        time.sleep(1)
+    else:
+        pytest.fail(f"Supabase auth service did not become healthy within 60s: {last_err!r}")
 
     client = create_client(api_url, service_key)
 
