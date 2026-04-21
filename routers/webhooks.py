@@ -68,12 +68,25 @@ def _compute_event_id(event_name: str, data: dict) -> str:
     return f"{event_name}:{data['id']}:{data['attributes']['updated_at']}"
 
 
+def _is_founder_variant(variant_id) -> bool:
+    """True when the purchased variant matches the configured founder variant.
+
+    Compared as strings — LS sends numeric IDs, env var may be numeric or UUID.
+    Empty env var disables the flag (founder feature off).
+    """
+    configured = (settings.lemon_squeezy_founder_variant_id or "").strip()
+    if not configured:
+        return False
+    return str(variant_id) == configured
+
+
 def _process_subscription_event(event_name: str, data: dict) -> dict:
     """Map a LS webhook event's `data` object → subscriptions state_update dict.
 
     Semantics:
       - Keys ABSENT from the returned dict = 'no change' (RPC COALESCEs existing).
       - Keys present with value `None` = 'set to NULL' (overwrite).
+      - `is_founder: true` is additive in the RPC (once true, never reset).
     """
     attrs = data.get("attributes", {}) or {}
     subscription_id = str(data.get("id", ""))
@@ -86,7 +99,7 @@ def _process_subscription_event(event_name: str, data: dict) -> dict:
     status = attrs.get("status", "")
 
     if event_name == "subscription_created":
-        return {
+        result = {
             "plan": "pro",
             "status": "active",
             "cancel_at_period_end": False,
@@ -97,6 +110,9 @@ def _process_subscription_event(event_name: str, data: dict) -> dict:
             "provider_variant_id": str(variant_id) if variant_id is not None else None,
             "plan_interval": _determine_interval(variant_name),
         }
+        if _is_founder_variant(variant_id):
+            result["is_founder"] = True
+        return result
 
     if event_name == "subscription_updated":
         return {

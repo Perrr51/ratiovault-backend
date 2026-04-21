@@ -250,3 +250,52 @@ def test_unknown_event_returns_empty_dict():
     data = _make_data()
     assert _process_subscription_event("order_created", data) == {}
     assert _process_subscription_event("foo_bar", data) == {}
+
+
+# ---------- _is_founder_variant + is_founder flag ----------
+
+def test_subscription_created_on_regular_variant_has_no_is_founder(monkeypatch):
+    from config import settings
+    monkeypatch.setattr(settings, "lemon_squeezy_founder_variant_id", "992424")
+    data = _make_data(variant_id=1553102)  # regular Pro variant
+    result = _process_subscription_event("subscription_created", data)
+    assert "is_founder" not in result
+
+
+def test_subscription_created_on_founder_variant_sets_is_founder(monkeypatch):
+    from config import settings
+    monkeypatch.setattr(settings, "lemon_squeezy_founder_variant_id", "992424")
+    data = _make_data(variant_id=992424)
+    result = _process_subscription_event("subscription_created", data)
+    assert result["is_founder"] is True
+
+
+def test_founder_variant_comparison_as_string(monkeypatch):
+    """LS sends variant_id as int; env var is a string — compare as strings."""
+    from config import settings
+    monkeypatch.setattr(settings, "lemon_squeezy_founder_variant_id", "992424")
+    # numeric variant_id from LS matches
+    assert _process_subscription_event("subscription_created", _make_data(variant_id=992424)).get("is_founder") is True
+    # string variant_id also matches
+    assert _process_subscription_event("subscription_created", _make_data(variant_id="992424")).get("is_founder") is True
+
+
+def test_founder_variant_unset_never_sets_is_founder(monkeypatch):
+    """Empty env var disables the founder feature entirely — no flag set ever."""
+    from config import settings
+    monkeypatch.setattr(settings, "lemon_squeezy_founder_variant_id", "")
+    data = _make_data(variant_id=992424)  # user ID matches string but env empty
+    result = _process_subscription_event("subscription_created", data)
+    assert "is_founder" not in result
+
+
+def test_subscription_updated_on_founder_variant_does_not_set_is_founder(monkeypatch):
+    """is_founder only set on _created — _updated doesn't touch it (RPC keeps OR semantics).
+
+    This avoids spurious writes and keeps the additive-only invariant clear in code.
+    """
+    from config import settings
+    monkeypatch.setattr(settings, "lemon_squeezy_founder_variant_id", "992424")
+    data = _make_data(variant_id=992424)
+    result = _process_subscription_event("subscription_updated", data)
+    assert "is_founder" not in result

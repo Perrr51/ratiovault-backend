@@ -36,29 +36,29 @@ def create_checkout(request: CheckoutRequest, authorization: str = Header(None))
 
     claims = verify_supabase_jwt(token, settings.supabase_jwt_secret)
 
-    getter = INTERVAL_TO_VARIANT.get(request.interval)
-    if getter is None:
-        raise HTTPException(status_code=400, detail=f"Unknown interval: {request.interval}")
-    variant = getter(settings)
+    if request.plan not in ("pro", "founder"):
+        raise HTTPException(status_code=400, detail=f"Unknown plan: {request.plan}")
 
-    if not variant:
-        raise HTTPException(status_code=500, detail="Checkout variant not configured")
     if not settings.lemon_squeezy_checkout_base:
         raise HTTPException(status_code=500, detail="Checkout base URL not configured")
 
-    if request.plan not in ("pro", "founder"):
-        raise HTTPException(status_code=400, detail=f"Unknown plan: {request.plan}")
+    # Founder plan is a dedicated LS variant (yearly 35,52 €, capped at 100 sales).
+    # Interval is ignored — founders always use the single founder variant.
+    if request.plan == "founder":
+        variant = settings.lemon_squeezy_founder_variant_id
+        if not variant:
+            raise HTTPException(status_code=500, detail="Founder plan not available yet")
+    else:
+        getter = INTERVAL_TO_VARIANT.get(request.interval)
+        if getter is None:
+            raise HTTPException(status_code=400, detail=f"Unknown interval: {request.interval}")
+        variant = getter(settings)
+        if not variant:
+            raise HTTPException(status_code=500, detail="Checkout variant not configured")
 
     url = (
         f"{settings.lemon_squeezy_checkout_base}/{variant}"
         f"?checkout[custom][uid]={claims['uid']}"
         f"&checkout[email]={claims['email']}"
     )
-
-    if request.plan == "founder":
-        code = settings.lemon_founder_discount_code
-        if not code:
-            raise HTTPException(status_code=500, detail="Founder plan not available yet")
-        url += f"&checkout[discount_code]={code}"
-
     return {"checkoutUrl": url}
