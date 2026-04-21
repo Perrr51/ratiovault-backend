@@ -25,6 +25,7 @@ INTERVAL_TO_VARIANT = {
 
 class CheckoutRequest(BaseModel):
     interval: str = "monthly"
+    plan: str = "pro"  # "pro" | "founder"
 
 
 @router.post("/subscription/checkout")
@@ -45,9 +46,19 @@ def create_checkout(request: CheckoutRequest, authorization: str = Header(None))
     if not settings.lemon_squeezy_checkout_base:
         raise HTTPException(status_code=500, detail="Checkout base URL not configured")
 
+    if request.plan not in ("pro", "founder"):
+        raise HTTPException(status_code=400, detail=f"Unknown plan: {request.plan}")
+
     url = (
         f"{settings.lemon_squeezy_checkout_base}/{variant}"
         f"?checkout[custom][uid]={claims['uid']}"
         f"&checkout[email]={claims['email']}"
     )
+
+    if request.plan == "founder":
+        code = settings.lemon_founder_discount_code
+        if not code:
+            raise HTTPException(status_code=500, detail="Founder plan not available yet")
+        url += f"&checkout[discount_code]={code}"
+
     return {"checkoutUrl": url}

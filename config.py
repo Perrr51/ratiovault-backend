@@ -47,6 +47,7 @@ class Settings(BaseSettings):
     lemon_squeezy_semiannual_variant_id: str = ""
     lemon_squeezy_yearly_variant_id: str = ""
     lemon_squeezy_api_key: str = ""
+    lemon_founder_discount_code: str = ""
 
     class Config:
         env_file = ".env"
