@@ -50,9 +50,9 @@ def _determine_interval(variant_name: Optional[str]) -> str:
     if not variant_name:
         return "monthly"
     lower = variant_name.lower()
-    if any(tok in lower for tok in ("3 mes", "3 month", "quarter", "trimestr")):
+    if any(tok in lower for tok in ("3 mes", "3 month", "3month", "quarter", "trimestr")):
         return "quarterly"
-    if any(tok in lower for tok in ("6 mes", "6 month", "semestr", "semiannual", "semi-annual")):
+    if any(tok in lower for tok in ("6 mes", "6 month", "6month", "semestr", "semiannual", "semi-annual")):
         return "semiannual"
     if any(tok in lower for tok in ("year", "annual", "anual", "1 año", "1 ano")):
         return "yearly"

@@ -60,6 +60,23 @@ def test_determine_interval_semiannual_english():
     assert _determine_interval("Pro Semiannual") == "semiannual"
 
 
+# Variant names actually configured in Lemon Squeezy (production)
+def test_determine_interval_ls_variant_month():
+    assert _determine_interval("RatioVault Pro month") == "monthly"
+
+
+def test_determine_interval_ls_variant_3month():
+    assert _determine_interval("RatioVault Pro 3month") == "quarterly"
+
+
+def test_determine_interval_ls_variant_6month():
+    assert _determine_interval("RatioVault Pro 6month") == "semiannual"
+
+
+def test_determine_interval_ls_variant_1year():
+    assert _determine_interval("RatioVault Pro 1year") == "yearly"
+
+
 # ---------- _parse_timestamp ----------
 
 def test_parse_timestamp_none_returns_none():
