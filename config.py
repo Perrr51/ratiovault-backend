@@ -46,6 +46,7 @@ class Settings(BaseSettings):
     lemon_squeezy_quarterly_variant_id: str = ""
     lemon_squeezy_semiannual_variant_id: str = ""
     lemon_squeezy_yearly_variant_id: str = ""
+    lemon_squeezy_founder_variant_id: str = ""
     lemon_squeezy_api_key: str = ""
 
     class Config:

@@ -40,6 +40,17 @@ def health():
     return {"status": "ok"}
 
 
+# ── Version info (populated from build-args in Dockerfile) ──────────────────
+
+@app.get("/version")
+def version():
+    return {
+        "sha": os.getenv("GIT_SHA", "unknown"),
+        "built_at": os.getenv("BUILT_AT", "unknown"),
+        "environment": os.getenv("ENVIRONMENT", "unknown"),
+    }
+
+
 # ── CORS ─────────────────────────────────────────────────────────────────────
 
 app.add_middleware(

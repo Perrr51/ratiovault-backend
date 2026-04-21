@@ -25,6 +25,7 @@ INTERVAL_TO_VARIANT = {
 
 class CheckoutRequest(BaseModel):
     interval: str = "monthly"
+    plan: str = "pro"  # "pro" | "founder"
 
 
 @router.post("/subscription/checkout")
@@ -35,15 +36,25 @@ def create_checkout(request: CheckoutRequest, authorization: str = Header(None))
 
     claims = verify_supabase_jwt(token, settings.supabase_jwt_secret)
 
-    getter = INTERVAL_TO_VARIANT.get(request.interval)
-    if getter is None:
-        raise HTTPException(status_code=400, detail=f"Unknown interval: {request.interval}")
-    variant = getter(settings)
+    if request.plan not in ("pro", "founder"):
+        raise HTTPException(status_code=400, detail=f"Unknown plan: {request.plan}")
 
-    if not variant:
-        raise HTTPException(status_code=500, detail="Checkout variant not configured")
     if not settings.lemon_squeezy_checkout_base:
         raise HTTPException(status_code=500, detail="Checkout base URL not configured")
+
+    # Founder plan is a dedicated LS variant (yearly 35,52 €, capped at 100 sales).
+    # Interval is ignored — founders always use the single founder variant.
+    if request.plan == "founder":
+        variant = settings.lemon_squeezy_founder_variant_id
+        if not variant:
+            raise HTTPException(status_code=500, detail="Founder plan not available yet")
+    else:
+        getter = INTERVAL_TO_VARIANT.get(request.interval)
+        if getter is None:
+            raise HTTPException(status_code=400, detail=f"Unknown interval: {request.interval}")
+        variant = getter(settings)
+        if not variant:
+            raise HTTPException(status_code=500, detail="Checkout variant not configured")
 
     url = (
         f"{settings.lemon_squeezy_checkout_base}/{variant}"
