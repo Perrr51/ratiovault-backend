@@ -12,6 +12,14 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
+# Build-time metadata for /version endpoint. Pass via --build-arg.
+ARG GIT_SHA=unknown
+ARG BUILT_AT=unknown
+ARG ENVIRONMENT=unknown
+ENV GIT_SHA=$GIT_SHA
+ENV BUILT_AT=$BUILT_AT
+ENV ENVIRONMENT=$ENVIRONMENT
+
 ENV PYTHONUNBUFFERED=1
 ENV PORT=8000
 
