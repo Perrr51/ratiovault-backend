@@ -163,10 +163,25 @@ def get_news(request: Request, ticker: str):
     try:
         news_data = yf.Ticker(ticker).news
         results = []
+        ticker_upper = ticker.upper()
 
         for article in news_data:
             # Extract from content object if exists
             content = article.get("content", {})
+
+            # T11: yfinance returns tangentially related articles (e.g. NVDA
+            # query surfaces pieces where only a supplier is mentioned). Keep
+            # only items where the requested ticker appears in the structured
+            # relations list or in the headline text.
+            related_tickers = article.get("relatedTickers") or content.get("finance", {}).get("stockTickers", []) or []
+            if isinstance(related_tickers, list):
+                related_upper = [str(t).upper() for t in related_tickers if t]
+            else:
+                related_upper = []
+            title_raw = content.get("title") or article.get("title") or ""
+            title_upper = title_raw.upper()
+            if related_upper and ticker_upper not in related_upper and ticker_upper not in title_upper:
+                continue
 
             # Safely extract the first thumbnail resolution url
             image_url = ""
