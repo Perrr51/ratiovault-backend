@@ -37,15 +37,18 @@ def get_dividends(request: Request, tickers: str):
                             "date": date_idx.strftime('%Y-%m-%d'),
                             "amount": _safe_float(amount)
                         })
-                    # Detect frequency from intervals
+                    # Detect frequency from interval MEDIAN — the mean is
+                    # pulled around by a single late payment (issuer delays
+                    # by a month → AAPL's clean quarterly cadence bumps to
+                    # ~120d mean and gets classified as semi-annual). MB16.
                     if len(divs) >= 2:
                         intervals = divs.index.to_series().diff().dropna().dt.days
-                        avg_interval = intervals.mean()
-                        if avg_interval < 45:
+                        median_interval = float(intervals.median()) if not intervals.empty else 0
+                        if median_interval < 45:
                             frequency = "monthly"
-                        elif avg_interval < 100:
+                        elif median_interval < 100:
                             frequency = "quarterly"
-                        elif avg_interval < 200:
+                        elif median_interval < 200:
                             frequency = "semi-annual"
                         else:
                             frequency = "annual"
