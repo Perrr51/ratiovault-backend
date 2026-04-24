@@ -267,10 +267,21 @@ async def get_company_submissions(request: Request, ticker: str):
                     "fileNumber": file_numbers[i] if i < len(file_numbers) else None,
                 })
 
+            # SEC submissions JSON uses `name` for the legal entity, but
+            # some older records return an empty string. Cascade through the
+            # alternate fields so the UI never renders literal "undefined"
+            # (T19).
+            company_name = (
+                data.get("name")
+                or data.get("entityName")
+                or (data.get("formerNames") or [{}])[0].get("name")
+                or ticker.upper()
+            )
+
             return {
                 "ticker": ticker.upper(),
                 "cik": cik,
-                "companyName": data.get("name"),
+                "companyName": company_name,
                 "filings": recent_filings
             }
 
