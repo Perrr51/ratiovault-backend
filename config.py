@@ -38,6 +38,12 @@ class Settings(BaseSettings):
     # ── Internal cron (Task 5) ──────────────────────────────────────────────
     internal_cron_token: str = ""
 
+    # ── Fallback behavior (B-008) ───────────────────────────────────────────
+    # When yfinance returns price=0 for any ticker (not just the metals/forex
+    # patterns hardcoded in stooq.py), retry against Stooq. Disable to revert
+    # to the legacy pattern-only fallback.
+    stooq_any_ticker_fallback: bool = True
+
     # ── Lemon Squeezy (Task 7) ──────────────────────────────────────────────
     lemon_squeezy_webhook_secret: str = ""
     lemon_squeezy_store_id: str = ""

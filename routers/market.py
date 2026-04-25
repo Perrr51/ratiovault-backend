@@ -9,6 +9,7 @@ from deps import limiter, logger, _forex_cache, FOREX_CACHE_TTL
 from validators import QuotesRequest, SearchRequest
 from utils import _safe_float
 from stooq import should_try_stooq, fetch_stooq_quote_cached
+from config import settings
 
 router = APIRouter(tags=["Market"])
 
@@ -101,8 +102,10 @@ def get_quotes(request: Request, tickers: str):
                 # Try history as last resort
                 hist = stock.history(period="5d")
                 if hist.empty:
-                    # Try Stooq fallback for metals, crypto crosses, forex
-                    if should_try_stooq(t):
+                    # B-008: try Stooq for metals/forex/crypto patterns and,
+                    # when broad fallback is enabled, for any other ticker.
+                    if should_try_stooq(t, broad=settings.stooq_any_ticker_fallback):
+                        logger.info("Stooq fallback engaged for %s (yfinance empty)", t)
                         stooq_data = fetch_stooq_quote_cached(t)
                         if stooq_data:
                             return {
@@ -136,8 +139,9 @@ def get_quotes(request: Request, tickers: str):
                 }
 
             price = info.get("currentPrice") or info.get("regularMarketPrice") or info.get("navPrice") or 0.0
-            # If yfinance returned price=0, try Stooq fallback
-            if not price and should_try_stooq(t):
+            # If yfinance returned price=0, try Stooq fallback (B-008: broad).
+            if not price and should_try_stooq(t, broad=settings.stooq_any_ticker_fallback):
+                logger.info("Stooq fallback engaged for %s (yfinance price=0)", t)
                 stooq_data = fetch_stooq_quote_cached(t)
                 if stooq_data:
                     return {
@@ -171,8 +175,8 @@ def get_quotes(request: Request, tickers: str):
             }
         except Exception as e:
             logger.warning(f"Failed to fetch quote for {t}: {e}")
-            # Try Stooq fallback for metals, crypto crosses, forex
-            if should_try_stooq(t):
+            # Try Stooq fallback (B-008: broad when configured).
+            if should_try_stooq(t, broad=settings.stooq_any_ticker_fallback):
                 stooq_data = fetch_stooq_quote_cached(t)
                 if stooq_data:
                     return {
