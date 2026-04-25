@@ -96,8 +96,11 @@ def get_asset_info(request: Request, tickers: str):
                     parsed = urlparse(website)
                     host = parsed.hostname or ""
                     logo_domain = host.removeprefix("www.")
-                except Exception:
-                    pass
+                except (ValueError, AttributeError) as e:
+                    # B-009: urlparse only raises ValueError on truly malformed
+                    # input; AttributeError covers the rare case where website
+                    # was set to a non-string. Either way, just skip the logo.
+                    logger.warning("logo domain parse failed for %s: %s", t, e, exc_info=False)
 
             # Extended fundamental data from yfinance info dict
             fundamentals = {}

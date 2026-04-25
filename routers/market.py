@@ -74,8 +74,11 @@ def get_quotes(request: Request, tickers: str):
                         try:
                             info_currency = stock.info
                             quote_currency = info_currency.get("currency") or info_currency.get("financialCurrency") or None
-                        except Exception:
-                            pass
+                        except (KeyError, AttributeError, httpx.HTTPError) as e:
+                            # B-009: yfinance raises these when the symbol
+                            # is unknown or the upstream API throttles us;
+                            # fall through to suffix inference.
+                            logger.warning("stock.info lookup failed for %s: %s", t, e, exc_info=False)
                     if not quote_currency:
                         quote_currency = _infer_currency_from_suffix(t)
                     return {
@@ -88,8 +91,11 @@ def get_quotes(request: Request, tickers: str):
                         "dividendYield": None,
                         "currency": quote_currency,
                     }
-            except Exception:
-                pass  # fast_info failed, fall through to info
+            except (KeyError, AttributeError, httpx.HTTPError) as e:
+                # B-009: fast_info raises KeyError for missing fields and
+                # AttributeError when yfinance returns the SymbolNotFound
+                # placeholder; HTTPError is the upstream failure path.
+                logger.warning("fast_info failed for %s, falling back to info: %s", t, e, exc_info=False)
 
             # Fallback: full info dict (slower but has currency)
             info = stock.info
@@ -287,8 +293,10 @@ def get_forex_rates(request: Request):
                 rate = fi.get("lastPrice", 0) or fi.get("previousClose", 0) or 0
                 if rate and rate > 0:
                     result[key] = round(1 / rate, 6)
-            except Exception:
-                pass
+            except (KeyError, AttributeError, httpx.HTTPError) as e:
+                # B-009: per-pair failures are non-fatal; we fall back to
+                # Stooq below for the missing pair.
+                logger.warning("forex fetch failed for %s: %s", yf_ticker, e, exc_info=False)
 
         for yf_ticker, key in direct_pairs.items():
             try:
@@ -296,8 +304,8 @@ def get_forex_rates(request: Request):
                 rate = fi.get("lastPrice", 0) or fi.get("previousClose", 0) or 0
                 if rate and rate > 0:
                     result[key] = round(rate, 6)
-            except Exception:
-                pass
+            except (KeyError, AttributeError, httpx.HTTPError) as e:
+                logger.warning("forex fetch failed for %s: %s", yf_ticker, e, exc_info=False)
 
         # Stooq fallback for any forex pairs that yfinance failed to return
         all_pairs = {**invert_pairs, **direct_pairs}

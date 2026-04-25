@@ -2,6 +2,7 @@
 
 import time
 import io
+import httpx
 import pandas as pd
 import yfinance as yf
 from datetime import datetime as dt
@@ -137,8 +138,16 @@ def get_chart_data(request: Request, ticker: str, interval: str = "1M", indicato
 
         return result
 
-    except Exception as e:
-        logger.exception(f"Error fetching chart data for {ticker}: {e}")
+    except (KeyError, AttributeError, ValueError, httpx.HTTPError) as e:
+        # B-009: yfinance raises KeyError when a column is missing,
+        # AttributeError when the response shape changes, ValueError for
+        # bad date math, and HTTPError when Yahoo throttles or 5xx's. We
+        # log the traceback at WARNING (not exception/error) because each
+        # of these is recoverable and surfaced as a structured error in
+        # the response body.
+        logger.warning(
+            "Error fetching chart data for %s: %s", ticker, e, exc_info=True
+        )
         return {
             "timestamps": [],
             "prices": [],
