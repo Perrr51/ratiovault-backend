@@ -46,6 +46,17 @@ SEC_HEADERS = {"User-Agent": SEC_USER_AGENT}
 ticker_to_cik_cache: Dict[str, str] = {}
 
 
+# ── Forex rate cache (30-min TTL; B-007) ────────────────────────────────────
+# `/forex` is hit on every page load by every authenticated user; the
+# upstream yfinance call is the slowest part of the request (2-5s for a
+# batch of pairs). CLAUDE.md mandates 30-min TTL on the frontend cache;
+# mirroring it server-side amortizes the cost across all users on the
+# same VPS.
+
+FOREX_CACHE_TTL = 30 * 60  # 30 minutes
+_forex_cache: Dict[str, Any] = {}  # {"data": dict, "ts": float}
+
+
 # ── SEC EDGAR global rate limit + circuit breaker (B-004) ───────────────────
 # SEC EDGAR enforces 10 req/sec per IP. We cap at 8 across the whole process
 # (all users, all endpoints) to leave headroom and to keep the IP from being

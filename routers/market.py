@@ -1,9 +1,11 @@
 """Quotes, search, and forex rate endpoints."""
 
+import time
+
 import httpx
 import yfinance as yf
 from fastapi import APIRouter, HTTPException, Request
-from deps import limiter, logger
+from deps import limiter, logger, _forex_cache, FOREX_CACHE_TTL
 from validators import QuotesRequest, SearchRequest
 from utils import _safe_float
 from stooq import should_try_stooq, fetch_stooq_quote_cached
@@ -242,7 +244,16 @@ def get_forex_rates(request: Request):
     Uses yfinance forex tickers with fast_info (lightweight endpoint).
     Returns: { "USDEUR": rate, "USDCHF": rate, "USDGBP": rate, ... }
     Returns HTTP 503 if no rates could be resolved.
+
+    B-007: results cached in-process for 30 minutes. yfinance + Stooq only
+    refresh once per TTL window across all users; reduces upstream load and
+    page-load latency significantly on the shared VPS.
     """
+    # B-007: serve from cache while fresh.
+    cached = _forex_cache.get("rates")
+    if cached and (time.time() - cached["ts"]) < FOREX_CACHE_TTL:
+        return cached["data"]
+
     try:
         # Pairs where ticker gives "how many USD per 1 unit" (e.g. EURUSD=X -> 1 EUR = X USD)
         # We invert these to get USDEUR (1 USD = X EUR)
@@ -304,6 +315,8 @@ def get_forex_rates(request: Request):
         if not result:
             raise HTTPException(status_code=503, detail="No forex rates could be resolved")
 
+        # B-007: store in process-wide cache.
+        _forex_cache["rates"] = {"data": result, "ts": time.time()}
         return result
     except HTTPException:
         raise  # Re-raise 503
