@@ -185,14 +185,84 @@ def compare_tickers(request: Request, tickers: str, interval: str = "1M"):
     if len(ticker_list) > 5:
         raise HTTPException(status_code=400, detail="Maximum 5 tickers allowed for comparison")
 
+    # B-020: a single batched yf.download is dramatically faster than five
+    # serial yf.Ticker(t).history(...) calls — one HTTP round-trip and one
+    # pandas frame to slice instead of N. Per-ticker entries are still
+    # written to chart_cache so subsequent /chart calls (single-ticker)
+    # benefit too.
+    interval_map = {
+        "1D": {"period": "1d", "interval": "5m"},
+        "1W": {"period": "5d", "interval": "30m"},
+        "1M": {"period": "1mo", "interval": "1d"},
+        "3M": {"period": "3mo", "interval": "1d"},
+        "1Y": {"period": "1y", "interval": "1wk"},
+    }
+    params = interval_map.get(interval, {"period": "1mo", "interval": "1d"})
+
     results = {}
+
+    # Reuse cache where possible; only fetch the misses upstream.
+    to_fetch = []
     for ticker in ticker_list:
+        cache_key = f"{ticker}:{interval}:"
+        cached = chart_cache.get(cache_key)
+        if cached and time.time() - cached["cached_at"] < CHART_CACHE_TTL:
+            results[ticker] = cached["data"]
+        else:
+            to_fetch.append(ticker)
+
+    if to_fetch:
         try:
-            data = get_chart_data(request, ticker, interval, indicators="")
-            results[ticker] = data
-        except Exception as e:
-            logger.error(f"Error comparing ticker {ticker}: {e}")
-            results[ticker] = {"error": "Failed to fetch data"}
+            data = yf.download(
+                to_fetch,
+                period=params["period"],
+                interval=params["interval"],
+                progress=False,
+                auto_adjust=True,
+                group_by="ticker",
+            )
+        except (KeyError, AttributeError, ValueError, httpx.HTTPError) as e:
+            logger.warning("batched yf.download failed for %s: %s", to_fetch, e, exc_info=True)
+            for ticker in to_fetch:
+                results[ticker] = {"error": "Failed to fetch data"}
+            return results
+
+        _cleanup_chart_cache()
+
+        for ticker in to_fetch:
+            try:
+                # When `to_fetch` has a single ticker, yfinance returns a
+                # flat OHLCV frame instead of a per-ticker MultiIndex.
+                if len(to_fetch) == 1:
+                    sub = data
+                else:
+                    sub = data[ticker] if ticker in data.columns.get_level_values(0) else None
+
+                if sub is None or sub.empty:
+                    results[ticker] = {
+                        "timestamps": [], "prices": [], "volumes": [],
+                        "open": [], "high": [], "low": [],
+                        "error": "No data available for this period",
+                    }
+                    continue
+
+                sub = sub.dropna(how="all")
+                payload = {
+                    "timestamps": [int(ts.timestamp()) for ts in sub.index],
+                    "prices": sub["Close"].tolist(),
+                    "volumes": sub["Volume"].tolist() if "Volume" in sub.columns else [],
+                    "open": sub["Open"].tolist() if "Open" in sub.columns else [],
+                    "high": sub["High"].tolist() if "High" in sub.columns else [],
+                    "low": sub["Low"].tolist() if "Low" in sub.columns else [],
+                }
+                results[ticker] = payload
+                chart_cache[f"{ticker}:{interval}:"] = {
+                    "data": payload,
+                    "cached_at": time.time(),
+                }
+            except (KeyError, AttributeError, ValueError) as e:
+                logger.warning("compare slice failed for %s: %s", ticker, e, exc_info=False)
+                results[ticker] = {"error": "Failed to fetch data"}
 
     return results
 
