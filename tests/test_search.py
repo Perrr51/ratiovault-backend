@@ -49,6 +49,26 @@ def test_search_endpoint_422_on_too_long():
     assert resp.status_code == 422
 
 
+def test_search_returns_envelope_on_upstream_failure():
+    """B-016: when Yahoo throws, /search returns a structured error envelope."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    # Build an AsyncClient stub whose context-managed `.get(...)` raises.
+    inner = AsyncMock()
+    inner.get.side_effect = httpx.ConnectError("boom")
+    cm = MagicMock()
+    cm.__aenter__ = AsyncMock(return_value=inner)
+    cm.__aexit__ = AsyncMock(return_value=None)
+
+    with patch("routers.market.httpx.AsyncClient", return_value=cm):
+        client = TestClient(app)
+        resp = client.get("/search", params={"q": "AAPL"})
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body == {"results": [], "error": "fetch_failed", "retriable": True}
+
+
 def test_search_endpoint_accepts_alphanumeric():
     """Valid query reaches the upstream call (which we mock)."""
     client = TestClient(app)

@@ -242,8 +242,31 @@ async def search_symbol(request: Request, q: str):
                     "type": quote.get("typeDisp") or quote.get("quoteType") or "Equity"
                 })
             return results
-        except Exception as e:
-            return []
+        except (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError) as e:
+            # B-016: structured envelope so the client can show a "retry?"
+            # affordance instead of an indistinguishable "no results".
+            logger.warning("search upstream network error for q=%r: %s", q, e, exc_info=False)
+            return {
+                "results": [],
+                "error": "fetch_failed",
+                "retriable": True,
+            }
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code if e.response is not None else 0
+            retriable = status >= 500 or status == 429
+            logger.warning("search upstream HTTP %s for q=%r", status, q)
+            return {
+                "results": [],
+                "error": f"upstream_{status}",
+                "retriable": retriable,
+            }
+        except Exception as e:  # noqa: BLE001 — last-resort safety net
+            logger.warning("search unexpected failure for q=%r: %s", q, e, exc_info=True)
+            return {
+                "results": [],
+                "error": "fetch_failed",
+                "retriable": False,
+            }
 
 
 @router.get("/forex")
