@@ -165,7 +165,8 @@ def get_news(request: Request, ticker: str):
     - sentiment: positive/negative/neutral (placeholder)
     """
     try:
-        news_data = yf.Ticker(ticker).news
+        news_data = yf.Ticker(ticker).news or []
+        total_raw = len(news_data)
         results = []
         ticker_upper = ticker.upper()
 
@@ -260,7 +261,14 @@ def get_news(request: Request, ticker: str):
                 "sentiment": None,
             })
 
-        return results
+        # B-011: return an envelope with pre/post-filter counts so the
+        # frontend can distinguish "Yahoo had no news" (total=0) from
+        # "we filtered everything out as off-topic" (total>0, filtered=0).
+        return {
+            "articles": results,
+            "total": total_raw,
+            "filtered": len(results),
+        }
     except Exception as e:
         logger.exception(f"Error fetching news for {ticker}: {e}")
-        return []
+        return {"articles": [], "total": 0, "filtered": 0, "error": str(e)}
