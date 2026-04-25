@@ -37,21 +37,39 @@ def get_dividends(request: Request, tickers: str):
                             "date": date_idx.strftime('%Y-%m-%d'),
                             "amount": _safe_float(amount)
                         })
-                    # Detect frequency from interval MEDIAN — the mean is
-                    # pulled around by a single late payment (issuer delays
-                    # by a month → AAPL's clean quarterly cadence bumps to
-                    # ~120d mean and gets classified as semi-annual). MB16.
+                    # B-012: classify by MODE of inter-payment intervals
+                    # bucketed to the nearest week. The mode is robust to a
+                    # single suspended/delayed payment that previously
+                    # dragged AAPL's quarterly cadence into "semi-annual".
+                    # If the interval distribution is too noisy (std-dev >
+                    # 0.3 * mean), surface "irregular" instead of forcing
+                    # a fixed bucket.
                     if len(divs) >= 2:
                         intervals = divs.index.to_series().diff().dropna().dt.days
-                        median_interval = float(intervals.median()) if not intervals.empty else 0
-                        if median_interval < 45:
-                            frequency = "monthly"
-                        elif median_interval < 100:
-                            frequency = "quarterly"
-                        elif median_interval < 200:
-                            frequency = "semi-annual"
+                        if intervals.empty:
+                            frequency = "unknown"
                         else:
-                            frequency = "annual"
+                            mean_interval = float(intervals.mean())
+                            std_interval = (
+                                float(intervals.std(ddof=0))
+                                if len(intervals) >= 2
+                                else 0.0
+                            )
+                            if mean_interval > 0 and std_interval > 0.3 * mean_interval:
+                                frequency = "irregular"
+                            else:
+                                # Bucket to nearest week so 89/91/93 collapse onto one mode.
+                                buckets = (intervals / 7).round().astype(int)
+                                mode_weeks = int(buckets.mode().iloc[0])
+                                mode_days = mode_weeks * 7
+                                if mode_days < 45:
+                                    frequency = "monthly"
+                                elif mode_days < 100:
+                                    frequency = "quarterly"
+                                elif mode_days < 200:
+                                    frequency = "semi-annual"
+                                else:
+                                    frequency = "annual"
                     else:
                         frequency = "unknown"
                 else:
