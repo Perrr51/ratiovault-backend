@@ -69,6 +69,32 @@ def test_no_customer_id_returns_409(client, mock_service):
         headers={"Authorization": f"Bearer {_token()}"},
     )
     assert r.status_code == 409
+    # B-013: distinct detail string from the row-missing case.
+    assert "missing_customer_id" in r.json()["detail"]
+
+
+def test_no_row_vs_no_customer_have_distinct_messages(client, mock_service):
+    """B-013: 409 detail differs between 'no row' and 'no customer id'."""
+    # Case A: subscription row missing entirely.
+    q_no_row = MagicMock()
+    q_no_row.data = None
+    mock_service.table.return_value.select.return_value.eq.return_value.maybe_single.return_value.execute.return_value = q_no_row
+    r_no_row = client.post(
+        "/subscription/portal", headers={"Authorization": f"Bearer {_token()}"}
+    )
+    # Case B: row exists, customer_id is null.
+    q_null_id = MagicMock()
+    q_null_id.data = {"provider_customer_id": None}
+    mock_service.table.return_value.select.return_value.eq.return_value.maybe_single.return_value.execute.return_value = q_null_id
+    r_null_id = client.post(
+        "/subscription/portal", headers={"Authorization": f"Bearer {_token()}"}
+    )
+
+    assert r_no_row.status_code == 409
+    assert r_null_id.status_code == 409
+    assert r_no_row.json()["detail"] != r_null_id.json()["detail"]
+    assert "no_subscription_row" in r_no_row.json()["detail"]
+    assert "missing_customer_id" in r_null_id.json()["detail"]
 
 
 def test_subscription_row_missing_returns_409(client, mock_service):

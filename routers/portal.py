@@ -31,10 +31,24 @@ def create_portal_session(authorization: str = Header(None)):
         .maybe_single()
         .execute()
     )
-    row = resp.data or {}
+    # B-013: distinguish "no subscription row at all" from "row exists but
+    # provider_customer_id missing" from "LS upstream failure". The first
+    # two stay 409 (client-fixable: check out a plan / wait for the
+    # webhook to populate the customer id) but with distinct messages so
+    # the frontend can route to the right CTA. LS upstream errors stay
+    # 502 with their own distinct message.
+    if resp.data is None:
+        raise HTTPException(
+            status_code=409,
+            detail="no_subscription_row: user has not subscribed yet",
+        )
+    row = resp.data
     customer_id = row.get("provider_customer_id")
     if not customer_id:
-        raise HTTPException(status_code=409, detail="No active subscription customer record")
+        raise HTTPException(
+            status_code=409,
+            detail="missing_customer_id: subscription row exists but Lemon Squeezy customer id is not yet populated",
+        )
 
     if not settings.lemon_squeezy_api_key:
         raise HTTPException(status_code=500, detail="Lemon Squeezy API key not configured")
@@ -53,7 +67,10 @@ def create_portal_session(authorization: str = Header(None)):
     except HTTPException:
         raise
     except Exception:
-        raise HTTPException(status_code=502, detail="Lemon Squeezy API error")
+        raise HTTPException(
+            status_code=502,
+            detail="ls_api_error: Lemon Squeezy upstream call failed",
+        )
 
     portal_url = (
         ls_data.get("data", {})
@@ -62,5 +79,8 @@ def create_portal_session(authorization: str = Header(None)):
         .get("customer_portal")
     )
     if not portal_url:
-        raise HTTPException(status_code=502, detail="Customer portal URL not present in LS response")
+        raise HTTPException(
+            status_code=502,
+            detail="ls_missing_portal_url: customer_portal absent in Lemon Squeezy response",
+        )
     return {"portalUrl": portal_url}
