@@ -5,7 +5,7 @@ from typing import Optional
 import httpx
 from fastapi import APIRouter, HTTPException, Request
 
-from deps import limiter, logger, ticker_to_cik_cache, SEC_HEADERS
+from deps import limiter, logger, ticker_to_cik_cache, SEC_HEADERS, sec_http_get
 from validators import SECTickerRequest
 
 router = APIRouter(tags=["SEC"])
@@ -32,20 +32,18 @@ async def get_cik_from_ticker(request: Request, ticker: str):
         # SEC provides a company tickers JSON file
         url = "https://www.sec.gov/files/company_tickers.json"
 
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(url, headers=SEC_HEADERS)
-            response.raise_for_status()
-            data = response.json()
+        response = await sec_http_get(url, timeout=10.0)
+        data = response.json()
 
-            # Search for ticker in the data
-            for entry in data.values():
-                if entry.get("ticker", "").upper() == ticker:
-                    # CIK is stored as integer, convert to 10-digit string with leading zeros
-                    cik = str(entry["cik_str"]).zfill(10)
-                    ticker_to_cik_cache[ticker] = cik
-                    return {"ticker": ticker, "cik": cik}
+        # Search for ticker in the data
+        for entry in data.values():
+            if entry.get("ticker", "").upper() == ticker:
+                # CIK is stored as integer, convert to 10-digit string with leading zeros
+                cik = str(entry["cik_str"]).zfill(10)
+                ticker_to_cik_cache[ticker] = cik
+                return {"ticker": ticker, "cik": cik}
 
-            raise HTTPException(status_code=404, detail=f"CIK not found for ticker {ticker}")
+        raise HTTPException(status_code=404, detail=f"CIK not found for ticker {ticker}")
 
     except httpx.HTTPError as e:
         logger.error(f"SEC API error: {e}")
@@ -75,12 +73,8 @@ async def get_company_facts(request: Request, ticker: str):
         # Fetch company facts from SEC
         url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
 
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            response = await client.get(url, headers=SEC_HEADERS)
-            response.raise_for_status()
-            data = response.json()
-
-            return data
+        response = await sec_http_get(url, timeout=15.0)
+        return response.json()
 
     except HTTPException:
         raise
@@ -239,11 +233,10 @@ async def get_company_submissions(request: Request, ticker: str):
         # Fetch submissions data
         url = f"https://data.sec.gov/submissions/CIK{cik}.json"
 
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            response = await client.get(url, headers=SEC_HEADERS)
-            response.raise_for_status()
-            data = response.json()
+        response = await sec_http_get(url, timeout=15.0)
+        data = response.json()
 
+        if True:  # keep nesting depth comparable to previous version
             # Extract recent filings (limit to 20 most recent)
             filings = data.get("filings", {}).get("recent", {})
 
