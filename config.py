@@ -63,6 +63,22 @@ class Settings(BaseSettings):
 settings = Settings()
 
 
+# ── B-005: fail fast on empty webhook secret ───────────────────────────────
+# The Lemon Squeezy webhook secret is required for HMAC signature verification
+# on /webhooks/lemonsqueezy. An empty value would silently cause every webhook
+# to be rejected (or worse, accepted if verification logic regresses), so we
+# refuse to boot. Set RATIOVAULT_SKIP_SECRET_VALIDATION=1 in test environments
+# that intentionally run without subscription configured.
+import os as _os  # noqa: E402
+
+if not _os.environ.get("RATIOVAULT_SKIP_SECRET_VALIDATION"):
+    if not getattr(settings, "lemon_squeezy_webhook_secret", "").strip():
+        raise ValueError(
+            "LEMON_SQUEEZY_WEBHOOK_SECRET must be set (non-empty) "
+            "to verify Lemon Squeezy webhook signatures (audit B-005)"
+        )
+
+
 def validate_settings():
     """Validate critical settings on application startup.
 
