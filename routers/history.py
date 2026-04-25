@@ -24,7 +24,17 @@ def get_history(request: Request, tickers: str, start: str, end: str):
         data = yf.download(ticker_list, start=validated.start, end=validated.end, progress=False, auto_adjust=True)
 
         if data.empty:
-            return {"dates": [], "prices": {}, "forex": {}}
+            # B-003: explicit error envelope so the frontend can distinguish
+            # "no data at all" from "fetched zero-filled garbage". Stooq is
+            # not retried here because we have no date axis to align on.
+            return {
+                "dates": [],
+                "prices": {},
+                "forex": {},
+                "error": "no_data",
+                "tried": ["yfinance"],
+                "tickers": ticker_list,
+            }
 
         # Extract Close prices (yfinance always returns MultiIndex columns)
         closes = data['Close']
@@ -99,6 +109,22 @@ def get_history(request: Request, tickers: str, start: str, end: str):
                             forex['USDGBP'] = [_safe_float(1/v) if v and v != 0 else 0.0 for v in values]
         except Exception as e:
             logger.warning(f"Failed to fetch forex history: {e}")
+
+        # B-003: if every ticker is still zero-filled after the Stooq fallback,
+        # surface a structured error envelope instead of returning a misleading
+        # series of zeros that the frontend would chart as "value crashed to 0".
+        all_zero = bool(prices) and all(
+            all((v or 0.0) == 0.0 for v in series) for series in prices.values()
+        )
+        if all_zero:
+            return {
+                "dates": dates,
+                "prices": prices,
+                "forex": forex,
+                "error": "no_data",
+                "tried": ["yfinance", "stooq"],
+                "tickers": ticker_list,
+            }
 
         return {"dates": dates, "prices": prices, "forex": forex}
 
