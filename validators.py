@@ -12,6 +12,9 @@ from pydantic import BaseModel, validator, Field
 # Regex pattern for valid ticker symbols (alphanumeric + dash/period, 1-20 chars)
 TICKER_PATTERN = re.compile(r'^[A-Z0-9\.\-\=\^]{1,20}$')
 
+# B-001: /search?q=... allow-list — letters, digits, space, dot, hyphen, max 40
+SEARCH_QUERY_PATTERN = re.compile(r'^[A-Za-z0-9 .\-]{1,40}$')
+
 
 class TickerValidator(BaseModel):
     """Base validator for ticker symbols"""
@@ -64,18 +67,26 @@ class QuotesRequest(BaseModel):
 
 
 class SearchRequest(BaseModel):
-    """Validation for /search endpoint"""
-    q: str = Field(..., min_length=1, max_length=50, description="Search query")
+    """Validation for /search endpoint.
+
+    B-001: only allow alphanumeric, space, dot, hyphen — up to 40 chars.
+    Anything else (HTML tags, SQL specials, unicode tricks) is rejected
+    upstream of the upstream Yahoo call.
+    """
+    q: str = Field(..., min_length=1, max_length=40, description="Search query")
 
     @validator('q')
     def validate_query(cls, v):
         v = v.strip()
         if not v:
             raise ValueError("Search query cannot be empty")
-        if len(v) < 1:
-            raise ValueError("Search query too short (minimum 1 character)")
-        if len(v) > 50:
-            raise ValueError("Search query too long (maximum 50 characters)")
+        if len(v) > 40:
+            raise ValueError("Search query too long (maximum 40 characters)")
+        if not SEARCH_QUERY_PATTERN.match(v):
+            raise ValueError(
+                "Search query contains invalid characters "
+                "(allowed: letters, digits, space, '.', '-')"
+            )
         return v
 
 

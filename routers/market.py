@@ -200,8 +200,18 @@ def get_quotes(request: Request, tickers: str):
 @router.get("/search")
 @limiter.limit("100/minute")  # 100 requests per minute
 async def search_symbol(request: Request, q: str):
-    # Validate input
-    validated = SearchRequest(q=q)
+    # Validate input (B-001). Convert pydantic ValidationError → HTTP 422 so
+    # the client gets a structured rejection instead of a 500.
+    from pydantic import ValidationError
+    from fastapi import HTTPException
+
+    try:
+        validated = SearchRequest(q=q)
+    except ValidationError as ve:
+        raise HTTPException(
+            status_code=422,
+            detail=[{"msg": str(err.get("msg")), "loc": err.get("loc")} for err in ve.errors()],
+        )
     q = validated.q
     url = "https://query1.finance.yahoo.com/v1/finance/search"
     params = {"q": q, "quotesCount": 10, "newsCount": 0}
