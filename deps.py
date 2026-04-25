@@ -41,9 +41,13 @@ CHART_CACHE_MAX_SIZE = settings.chart_cache_max_size
 SEC_USER_AGENT = settings.sec_user_agent
 SEC_HEADERS = {"User-Agent": SEC_USER_AGENT}
 
-# ── Ticker-to-CIK cache (indefinite TTL) ────────────────────────────────────
+# ── Ticker-to-CIK cache (TTL via timestamp; B-010) ──────────────────────────
+# Stored as `{ticker: (cik, fetched_ts)}`. SEC ticker→CIK mapping changes
+# rarely (new IPOs / delistings), so a 7-day TTL keeps the cache useful
+# while still picking up newly-listed tickers within a week.
 
-ticker_to_cik_cache: Dict[str, str] = {}
+CIK_CACHE_TTL = 7 * 24 * 3600  # 7 days
+ticker_to_cik_cache: Dict[str, tuple] = {}
 
 
 # ── Forex rate cache (30-min TTL; B-007) ────────────────────────────────────
