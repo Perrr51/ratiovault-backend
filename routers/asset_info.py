@@ -1,6 +1,7 @@
 """Asset info and news endpoints — fundamentals, classification, and Yahoo Finance news."""
 
-import random
+# NOTE: `random` was previously used to fabricate impactScore/sentiment for
+# news items (audit B-002). Removed — AI-driven sentiment to land in v1.1.
 import time
 from datetime import datetime as dt
 from urllib.parse import urlparse
@@ -249,8 +250,11 @@ def get_news(request: Request, ticker: str):
                 "image": image_url,
                 "related": ticker,  # Related to the requested ticker
                 "category": category,
-                "impactScore": random.randint(1, 100),
-                "sentiment": random.choice(['positive', 'negative', 'neutral'])
+                # B-002: impactScore + sentiment were random placeholders.
+                # Real AI-driven sentiment is planned for v1.1; clients must
+                # treat these as null/absent until then.
+                "impactScore": None,
+                "sentiment": None,
             })
 
         return results
