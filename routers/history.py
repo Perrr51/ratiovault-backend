@@ -1,5 +1,8 @@
 """Historical price data endpoint for portfolio evolution chart."""
 
+import asyncio
+import concurrent.futures
+
 import yfinance as yf
 import pandas as pd
 from fastapi import APIRouter, HTTPException, Request
@@ -11,17 +14,62 @@ from stooq import should_try_stooq, fetch_stooq_history
 
 router = APIRouter(tags=["History"])
 
+# B-019: hard cap for the upstream yfinance call. yfinance.download is
+# synchronous, so we run it in a thread and impose the deadline at the
+# Future.result() level. Long-running upstream calls (10y of daily data
+# on 30+ tickers) used to hold a worker for minutes.
+HISTORY_UPSTREAM_TIMEOUT_S = 30.0
+
+
+def _yf_download_with_timeout(tickers, start, end, timeout=None):
+    """Run yf.download in a worker thread, raising asyncio.TimeoutError on overrun."""
+    if timeout is None:
+        # Read module-level constant at call time so tests can monkeypatch it.
+        timeout = HISTORY_UPSTREAM_TIMEOUT_S
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        fut = pool.submit(
+            yf.download,
+            tickers,
+            start=start,
+            end=end,
+            progress=False,
+            auto_adjust=True,
+        )
+        try:
+            return fut.result(timeout=timeout)
+        except concurrent.futures.TimeoutError as e:
+            # Don't wait for the download to finish; the daemon thread
+            # will exit on its own when the process tears down.
+            raise asyncio.TimeoutError("yfinance.download exceeded timeout") from e
+
 
 @router.get("/history")
 @limiter.limit("10/minute")
 def get_history(request: Request, tickers: str, start: str, end: str):
     """Get historical daily close prices for portfolio evolution chart."""
-    validated = HistoryRequest(tickers=tickers, start=start, end=end)
+    from pydantic import ValidationError
+    try:
+        validated = HistoryRequest(tickers=tickers, start=start, end=end)
+    except ValidationError as ve:
+        # B-019 follow-up: surface validator failures (e.g. >5y range) as
+        # 400 with a useful message instead of a generic 500.
+        msgs = "; ".join(str(err.get("msg")) for err in ve.errors())
+        raise HTTPException(status_code=400, detail=msgs)
     ticker_list = validated.tickers.split(",")
 
     try:
-        # Download historical prices
-        data = yf.download(ticker_list, start=validated.start, end=validated.end, progress=False, auto_adjust=True)
+        # B-019: bounded yfinance call. Times out at 30s → 504.
+        try:
+            data = _yf_download_with_timeout(ticker_list, validated.start, validated.end)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "yfinance.download timeout for tickers=%s start=%s end=%s",
+                ticker_list, validated.start, validated.end,
+            )
+            raise HTTPException(
+                status_code=504,
+                detail="yfinance upstream timeout (>30s); narrow the date range",
+            )
 
         if data.empty:
             # B-003: explicit error envelope so the frontend can distinguish
@@ -128,6 +176,9 @@ def get_history(request: Request, tickers: str, start: str, end: str):
 
         return {"dates": dates, "prices": prices, "forex": forex}
 
+    except HTTPException:
+        # B-019: don't swallow our own 504s into a generic 500.
+        raise
     except Exception as e:
         logger.error(f"Error fetching history: {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch historical data")

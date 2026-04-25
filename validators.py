@@ -251,9 +251,13 @@ class HistoryRequest(BaseModel):
         if start_val:
             start = date.fromisoformat(start_val)
             end = date.fromisoformat(v)
-            max_days = 365 * 10  # 10 years max
+            # B-019: cap /history at 5 years. Larger windows blew past the
+            # yfinance 30s SLA and timed the worker out before any rows
+            # came back. Five years covers every SPA chart (evolution,
+            # benchmark, drawdown).
+            max_days = 365 * 5
             if (end - start).days > max_days:
-                raise ValueError(f"Date range too large. Maximum {max_days} days (10 years)")
+                raise ValueError(f"Date range too large. Maximum {max_days} days (5 years)")
             if end < start:
                 raise ValueError("End date must be after start date")
         return v
