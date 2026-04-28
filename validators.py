@@ -153,17 +153,6 @@ class ChartExportRequest(BaseModel):
         return TickerValidator.validate_ticker(v)
 
 
-class NewsRequest(BaseModel):
-    """Validation for /news endpoint"""
-    ticker: Optional[str] = Field(None, description="Ticker symbol (optional)")
-
-    @field_validator('ticker')
-    def validate_ticker(cls, v):
-        if v is None or not v.strip():
-            return None
-        return TickerValidator.validate_ticker(v)
-
-
 class SECTickerRequest(BaseModel):
     """Validation for SEC endpoints that require a ticker"""
     ticker: str = Field(..., description="Stock ticker symbol")
