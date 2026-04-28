@@ -101,9 +101,12 @@ async def ai_chat(request: Request):
 
     response_text = "\n\n".join(sections)
 
+    # B-006: drop the misleading `mode: "mock"` field. Surface a clear
+    # `coming_soon: true` flag so the frontend can label the response as a
+    # placeholder until real LLM integration lands.
     return {
         "role": "assistant",
         "content": response_text,
-        "mode": "mock",
+        "coming_soon": True,
         "timestamp": time.time(),
     }

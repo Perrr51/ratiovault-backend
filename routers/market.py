@@ -1,12 +1,15 @@
 """Quotes, search, and forex rate endpoints."""
 
+import time
+
 import httpx
 import yfinance as yf
 from fastapi import APIRouter, HTTPException, Request
-from deps import limiter, logger
+from deps import limiter, logger, _forex_cache, FOREX_CACHE_TTL
 from validators import QuotesRequest, SearchRequest
 from utils import _safe_float
 from stooq import should_try_stooq, fetch_stooq_quote_cached
+from config import settings
 
 router = APIRouter(tags=["Market"])
 
@@ -71,8 +74,11 @@ def get_quotes(request: Request, tickers: str):
                         try:
                             info_currency = stock.info
                             quote_currency = info_currency.get("currency") or info_currency.get("financialCurrency") or None
-                        except Exception:
-                            pass
+                        except (KeyError, AttributeError, httpx.HTTPError) as e:
+                            # B-009: yfinance raises these when the symbol
+                            # is unknown or the upstream API throttles us;
+                            # fall through to suffix inference.
+                            logger.warning("stock.info lookup failed for %s: %s", t, e, exc_info=False)
                     if not quote_currency:
                         quote_currency = _infer_currency_from_suffix(t)
                     return {
@@ -85,8 +91,11 @@ def get_quotes(request: Request, tickers: str):
                         "dividendYield": None,
                         "currency": quote_currency,
                     }
-            except Exception:
-                pass  # fast_info failed, fall through to info
+            except (KeyError, AttributeError, httpx.HTTPError) as e:
+                # B-009: fast_info raises KeyError for missing fields and
+                # AttributeError when yfinance returns the SymbolNotFound
+                # placeholder; HTTPError is the upstream failure path.
+                logger.warning("fast_info failed for %s, falling back to info: %s", t, e, exc_info=False)
 
             # Fallback: full info dict (slower but has currency)
             info = stock.info
@@ -99,8 +108,10 @@ def get_quotes(request: Request, tickers: str):
                 # Try history as last resort
                 hist = stock.history(period="5d")
                 if hist.empty:
-                    # Try Stooq fallback for metals, crypto crosses, forex
-                    if should_try_stooq(t):
+                    # B-008: try Stooq for metals/forex/crypto patterns and,
+                    # when broad fallback is enabled, for any other ticker.
+                    if should_try_stooq(t, broad=settings.stooq_any_ticker_fallback):
+                        logger.info("Stooq fallback engaged for %s (yfinance empty)", t)
                         stooq_data = fetch_stooq_quote_cached(t)
                         if stooq_data:
                             return {
@@ -134,8 +145,9 @@ def get_quotes(request: Request, tickers: str):
                 }
 
             price = info.get("currentPrice") or info.get("regularMarketPrice") or info.get("navPrice") or 0.0
-            # If yfinance returned price=0, try Stooq fallback
-            if not price and should_try_stooq(t):
+            # If yfinance returned price=0, try Stooq fallback (B-008: broad).
+            if not price and should_try_stooq(t, broad=settings.stooq_any_ticker_fallback):
+                logger.info("Stooq fallback engaged for %s (yfinance price=0)", t)
                 stooq_data = fetch_stooq_quote_cached(t)
                 if stooq_data:
                     return {
@@ -169,8 +181,8 @@ def get_quotes(request: Request, tickers: str):
             }
         except Exception as e:
             logger.warning(f"Failed to fetch quote for {t}: {e}")
-            # Try Stooq fallback for metals, crypto crosses, forex
-            if should_try_stooq(t):
+            # Try Stooq fallback (B-008: broad when configured).
+            if should_try_stooq(t, broad=settings.stooq_any_ticker_fallback):
                 stooq_data = fetch_stooq_quote_cached(t)
                 if stooq_data:
                     return {
@@ -200,8 +212,18 @@ def get_quotes(request: Request, tickers: str):
 @router.get("/search")
 @limiter.limit("100/minute")  # 100 requests per minute
 async def search_symbol(request: Request, q: str):
-    # Validate input
-    validated = SearchRequest(q=q)
+    # Validate input (B-001). Convert pydantic ValidationError → HTTP 422 so
+    # the client gets a structured rejection instead of a 500.
+    from pydantic import ValidationError
+    from fastapi import HTTPException
+
+    try:
+        validated = SearchRequest(q=q)
+    except ValidationError as ve:
+        raise HTTPException(
+            status_code=422,
+            detail=[{"msg": str(err.get("msg")), "loc": err.get("loc")} for err in ve.errors()],
+        )
     q = validated.q
     url = "https://query1.finance.yahoo.com/v1/finance/search"
     params = {"q": q, "quotesCount": 10, "newsCount": 0}
@@ -220,8 +242,31 @@ async def search_symbol(request: Request, q: str):
                     "type": quote.get("typeDisp") or quote.get("quoteType") or "Equity"
                 })
             return results
-        except Exception as e:
-            return []
+        except (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError) as e:
+            # B-016: structured envelope so the client can show a "retry?"
+            # affordance instead of an indistinguishable "no results".
+            logger.warning("search upstream network error for q=%r: %s", q, e, exc_info=False)
+            return {
+                "results": [],
+                "error": "fetch_failed",
+                "retriable": True,
+            }
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code if e.response is not None else 0
+            retriable = status >= 500 or status == 429
+            logger.warning("search upstream HTTP %s for q=%r", status, q)
+            return {
+                "results": [],
+                "error": f"upstream_{status}",
+                "retriable": retriable,
+            }
+        except Exception as e:  # noqa: BLE001 — last-resort safety net
+            logger.warning("search unexpected failure for q=%r: %s", q, e, exc_info=True)
+            return {
+                "results": [],
+                "error": "fetch_failed",
+                "retriable": False,
+            }
 
 
 @router.get("/forex")
@@ -232,7 +277,16 @@ def get_forex_rates(request: Request):
     Uses yfinance forex tickers with fast_info (lightweight endpoint).
     Returns: { "USDEUR": rate, "USDCHF": rate, "USDGBP": rate, ... }
     Returns HTTP 503 if no rates could be resolved.
+
+    B-007: results cached in-process for 30 minutes. yfinance + Stooq only
+    refresh once per TTL window across all users; reduces upstream load and
+    page-load latency significantly on the shared VPS.
     """
+    # B-007: serve from cache while fresh.
+    cached = _forex_cache.get("rates")
+    if cached and (time.time() - cached["ts"]) < FOREX_CACHE_TTL:
+        return cached["data"]
+
     try:
         # Pairs where ticker gives "how many USD per 1 unit" (e.g. EURUSD=X -> 1 EUR = X USD)
         # We invert these to get USDEUR (1 USD = X EUR)
@@ -262,8 +316,10 @@ def get_forex_rates(request: Request):
                 rate = fi.get("lastPrice", 0) or fi.get("previousClose", 0) or 0
                 if rate and rate > 0:
                     result[key] = round(1 / rate, 6)
-            except Exception:
-                pass
+            except (KeyError, AttributeError, httpx.HTTPError) as e:
+                # B-009: per-pair failures are non-fatal; we fall back to
+                # Stooq below for the missing pair.
+                logger.warning("forex fetch failed for %s: %s", yf_ticker, e, exc_info=False)
 
         for yf_ticker, key in direct_pairs.items():
             try:
@@ -271,8 +327,8 @@ def get_forex_rates(request: Request):
                 rate = fi.get("lastPrice", 0) or fi.get("previousClose", 0) or 0
                 if rate and rate > 0:
                     result[key] = round(rate, 6)
-            except Exception:
-                pass
+            except (KeyError, AttributeError, httpx.HTTPError) as e:
+                logger.warning("forex fetch failed for %s: %s", yf_ticker, e, exc_info=False)
 
         # Stooq fallback for any forex pairs that yfinance failed to return
         all_pairs = {**invert_pairs, **direct_pairs}
@@ -294,6 +350,8 @@ def get_forex_rates(request: Request):
         if not result:
             raise HTTPException(status_code=503, detail="No forex rates could be resolved")
 
+        # B-007: store in process-wide cache.
+        _forex_cache["rates"] = {"data": result, "ts": time.time()}
         return result
     except HTTPException:
         raise  # Re-raise 503

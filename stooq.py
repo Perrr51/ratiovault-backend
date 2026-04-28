@@ -57,11 +57,28 @@ STOOQ_FALLBACK_PATTERNS = [
 _STOOQ_PATTERNS = [re.compile(p) for p in STOOQ_FALLBACK_PATTERNS]
 
 
-def should_try_stooq(yahoo_ticker: str) -> bool:
-    """Check if this ticker should attempt Stooq fallback."""
+def should_try_stooq(yahoo_ticker: str, *, broad: bool = False) -> bool:
+    """Check if this ticker should attempt Stooq fallback.
+
+    Args:
+        yahoo_ticker: Yahoo-format symbol.
+        broad: When True (B-008 path), accept any plausible ticker shape,
+            not just the curated metals/forex/crypto patterns. The caller
+            must still verify upstream returned a zero/empty quote — this
+            only decides whether Stooq is worth asking.
+    """
     if yahoo_ticker in YAHOO_TO_STOOQ:
         return True
-    return any(p.match(yahoo_ticker) for p in _STOOQ_PATTERNS)
+    if any(p.match(yahoo_ticker) for p in _STOOQ_PATTERNS):
+        return True
+    if broad:
+        # Stooq covers most US-listed equities (lowercase symbol). Skip
+        # incompatible shapes (index symbols starting with ^, empty input)
+        # but be permissive otherwise.
+        if not yahoo_ticker or yahoo_ticker.startswith("^"):
+            return False
+        return True
+    return False
 
 
 def yahoo_to_stooq_ticker(yahoo_ticker: str) -> str:

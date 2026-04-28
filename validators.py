@@ -6,11 +6,14 @@ Ensures all user inputs are validated before processing.
 import re
 from datetime import date
 from typing import List, Literal, Optional
-from pydantic import BaseModel, validator, Field
+from pydantic import BaseModel, field_validator, Field
 
 
 # Regex pattern for valid ticker symbols (alphanumeric + dash/period, 1-20 chars)
 TICKER_PATTERN = re.compile(r'^[A-Z0-9\.\-\=\^]{1,20}$')
+
+# B-001: /search?q=... allow-list — letters, digits, space, dot, hyphen, max 40
+SEARCH_QUERY_PATTERN = re.compile(r'^[A-Za-z0-9 .\-]{1,40}$')
 
 
 class TickerValidator(BaseModel):
@@ -57,25 +60,33 @@ class QuotesRequest(BaseModel):
     """Validation for /quotes endpoint"""
     tickers: str = Field(..., description="Comma-separated list of ticker symbols")
 
-    @validator('tickers')
+    @field_validator('tickers')
     def validate_tickers(cls, v):
         ticker_list = TickerValidator.validate_ticker_list(v, max_count=50)
         return ",".join(ticker_list)
 
 
 class SearchRequest(BaseModel):
-    """Validation for /search endpoint"""
-    q: str = Field(..., min_length=1, max_length=50, description="Search query")
+    """Validation for /search endpoint.
 
-    @validator('q')
+    B-001: only allow alphanumeric, space, dot, hyphen — up to 40 chars.
+    Anything else (HTML tags, SQL specials, unicode tricks) is rejected
+    upstream of the upstream Yahoo call.
+    """
+    q: str = Field(..., min_length=1, max_length=40, description="Search query")
+
+    @field_validator('q')
     def validate_query(cls, v):
         v = v.strip()
         if not v:
             raise ValueError("Search query cannot be empty")
-        if len(v) < 1:
-            raise ValueError("Search query too short (minimum 1 character)")
-        if len(v) > 50:
-            raise ValueError("Search query too long (maximum 50 characters)")
+        if len(v) > 40:
+            raise ValueError("Search query too long (maximum 40 characters)")
+        if not SEARCH_QUERY_PATTERN.match(v):
+            raise ValueError(
+                "Search query contains invalid characters "
+                "(allowed: letters, digits, space, '.', '-')"
+            )
         return v
 
 
@@ -91,11 +102,11 @@ class ChartRequest(BaseModel):
         description="Comma-separated list of indicators"
     )
 
-    @validator('ticker')
+    @field_validator('ticker')
     def validate_ticker(cls, v):
         return TickerValidator.validate_ticker(v)
 
-    @validator('indicators')
+    @field_validator('indicators')
     def validate_indicators(cls, v):
         if not v:
             return ""
@@ -123,7 +134,7 @@ class ChartCompareRequest(BaseModel):
         description="Time interval"
     )
 
-    @validator('tickers')
+    @field_validator('tickers')
     def validate_tickers(cls, v):
         ticker_list = TickerValidator.validate_ticker_list(v, max_count=5)
         return ",".join(ticker_list)
@@ -137,19 +148,8 @@ class ChartExportRequest(BaseModel):
         description="Time interval"
     )
 
-    @validator('ticker')
+    @field_validator('ticker')
     def validate_ticker(cls, v):
-        return TickerValidator.validate_ticker(v)
-
-
-class NewsRequest(BaseModel):
-    """Validation for /news endpoint"""
-    ticker: Optional[str] = Field(None, description="Ticker symbol (optional)")
-
-    @validator('ticker')
-    def validate_ticker(cls, v):
-        if v is None or not v.strip():
-            return None
         return TickerValidator.validate_ticker(v)
 
 
@@ -157,7 +157,7 @@ class SECTickerRequest(BaseModel):
     """Validation for SEC endpoints that require a ticker"""
     ticker: str = Field(..., description="Stock ticker symbol")
 
-    @validator('ticker')
+    @field_validator('ticker')
     def validate_ticker(cls, v):
         return TickerValidator.validate_ticker(v)
 
@@ -217,12 +217,12 @@ class HistoryRequest(BaseModel):
     start: str = Field(..., description="Start date YYYY-MM-DD")
     end: str = Field(..., description="End date YYYY-MM-DD")
 
-    @validator('tickers')
+    @field_validator('tickers')
     def validate_tickers(cls, v):
         ticker_list = TickerValidator.validate_ticker_list(v, max_count=50)
         return ",".join(ticker_list)
 
-    @validator('start', 'end')
+    @field_validator('start', 'end')
     def validate_date(cls, v):
         try:
             parsed = date.fromisoformat(v)
@@ -233,14 +233,20 @@ class HistoryRequest(BaseModel):
             raise ValueError(f"Date cannot be in the future: {v}")
         return v
 
-    @validator('end')
-    def validate_date_range(cls, v, values):
-        if 'start' in values:
-            start = date.fromisoformat(values['start'])
+    @field_validator('end')
+    def validate_date_range(cls, v, info):
+        # Pydantic v2: cross-field access via `info.data` (already-validated fields).
+        start_val = (info.data or {}).get('start') if info is not None else None
+        if start_val:
+            start = date.fromisoformat(start_val)
             end = date.fromisoformat(v)
-            max_days = 365 * 10  # 10 years max
+            # B-019: cap /history at 5 years. Larger windows blew past the
+            # yfinance 30s SLA and timed the worker out before any rows
+            # came back. Five years covers every SPA chart (evolution,
+            # benchmark, drawdown).
+            max_days = 365 * 5
             if (end - start).days > max_days:
-                raise ValueError(f"Date range too large. Maximum {max_days} days (10 years)")
+                raise ValueError(f"Date range too large. Maximum {max_days} days (5 years)")
             if end < start:
                 raise ValueError("End date must be after start date")
         return v
@@ -250,7 +256,7 @@ class DividendsRequest(BaseModel):
     """Validation for /dividends endpoint"""
     tickers: str = Field(..., description="Comma-separated list of ticker symbols")
 
-    @validator('tickers')
+    @field_validator('tickers')
     def validate_tickers(cls, v):
         ticker_list = TickerValidator.validate_ticker_list(v, max_count=30)
         return ",".join(ticker_list)
@@ -260,7 +266,7 @@ class TERRequest(BaseModel):
     """Validation for /ter/batch endpoint"""
     tickers: str = Field(..., description="Comma-separated list of ticker symbols")
 
-    @validator('tickers')
+    @field_validator('tickers')
     def validate_tickers(cls, v):
         ticker_list = TickerValidator.validate_ticker_list(v, max_count=30)
         return ",".join(ticker_list)
@@ -272,11 +278,11 @@ class BenchmarkHistoryRequest(BaseModel):
     start: str = Field(..., description="Start date YYYY-MM-DD")
     end: str = Field(..., description="End date YYYY-MM-DD")
 
-    @validator('symbol')
+    @field_validator('symbol')
     def validate_symbol(cls, v):
         return TickerValidator.validate_ticker(v)
 
-    @validator('start', 'end')
+    @field_validator('start', 'end')
     def validate_date(cls, v):
         try:
             parsed = date.fromisoformat(v)
@@ -286,10 +292,11 @@ class BenchmarkHistoryRequest(BaseModel):
             raise ValueError(f"Date cannot be in the future: {v}")
         return v
 
-    @validator('end')
-    def validate_date_range(cls, v, values):
-        if 'start' in values:
-            start = date.fromisoformat(values['start'])
+    @field_validator('end')
+    def validate_date_range(cls, v, info):
+        start_val = (info.data or {}).get('start') if info is not None else None
+        if start_val:
+            start = date.fromisoformat(start_val)
             end = date.fromisoformat(v)
             if end < start:
                 raise ValueError("End date must be after start date")
@@ -304,7 +311,7 @@ class CorrelationRequest(BaseModel):
     tickers: str = Field(..., description="Comma-separated list of ticker symbols")
     period: Literal["6mo", "1y", "2y"] = Field(default="1y", description="Historical period")
 
-    @validator('tickers')
+    @field_validator('tickers')
     def validate_tickers(cls, v):
         ticker_list = TickerValidator.validate_ticker_list(v, max_count=20)
         return ",".join(ticker_list)
@@ -341,7 +348,7 @@ class ETFSearchRequest(BaseModel):
     """Validation for /etf/search endpoint"""
     q: str = Field(..., min_length=2, max_length=100, description="Search query")
 
-    @validator('q')
+    @field_validator('q')
     def validate_query(cls, v):
         v = v.strip()
         if len(v) < 2:
@@ -360,7 +367,7 @@ class AlertItem(BaseModel):
     id: Optional[str] = Field(default=None, max_length=100)
     enabled: Optional[bool] = Field(default=True)
 
-    @validator('ticker')
+    @field_validator('ticker')
     def validate_ticker(cls, v):
         v = v.strip().upper()
         if not TICKER_PATTERN.match(v):

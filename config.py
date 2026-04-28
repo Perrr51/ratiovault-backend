@@ -38,6 +38,12 @@ class Settings(BaseSettings):
     # ── Internal cron (Task 5) ──────────────────────────────────────────────
     internal_cron_token: str = ""
 
+    # ── Fallback behavior (B-008) ───────────────────────────────────────────
+    # When yfinance returns price=0 for any ticker (not just the metals/forex
+    # patterns hardcoded in stooq.py), retry against Stooq. Disable to revert
+    # to the legacy pattern-only fallback.
+    stooq_any_ticker_fallback: bool = True
+
     # ── Lemon Squeezy (Task 7) ──────────────────────────────────────────────
     lemon_squeezy_webhook_secret: str = ""
     lemon_squeezy_store_id: str = ""
@@ -61,6 +67,22 @@ class Settings(BaseSettings):
 
 # Global settings instance
 settings = Settings()
+
+
+# ── B-005: fail fast on empty webhook secret ───────────────────────────────
+# The Lemon Squeezy webhook secret is required for HMAC signature verification
+# on /webhooks/lemonsqueezy. An empty value would silently cause every webhook
+# to be rejected (or worse, accepted if verification logic regresses), so we
+# refuse to boot. Set RATIOVAULT_SKIP_SECRET_VALIDATION=1 in test environments
+# that intentionally run without subscription configured.
+import os as _os  # noqa: E402
+
+if not _os.environ.get("RATIOVAULT_SKIP_SECRET_VALIDATION"):
+    if not getattr(settings, "lemon_squeezy_webhook_secret", "").strip():
+        raise ValueError(
+            "LEMON_SQUEEZY_WEBHOOK_SECRET must be set (non-empty) "
+            "to verify Lemon Squeezy webhook signatures (audit B-005)"
+        )
 
 
 def validate_settings():

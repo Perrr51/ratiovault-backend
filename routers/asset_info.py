@@ -1,15 +1,12 @@
-"""Asset info and news endpoints — fundamentals, classification, and Yahoo Finance news."""
+"""Asset info endpoints — fundamentals and classification."""
 
-import random
-import time
-from datetime import datetime as dt
 from urllib.parse import urlparse
 
 import yfinance as yf
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Request
 
 from deps import limiter, logger
-from validators import QuotesRequest, NewsRequest
+from validators import QuotesRequest
 from utils import _safe_float
 from services.asset_classifier import infer_asset_type
 
@@ -95,8 +92,11 @@ def get_asset_info(request: Request, tickers: str):
                     parsed = urlparse(website)
                     host = parsed.hostname or ""
                     logo_domain = host.removeprefix("www.")
-                except Exception:
-                    pass
+                except (ValueError, AttributeError) as e:
+                    # B-009: urlparse only raises ValueError on truly malformed
+                    # input; AttributeError covers the rare case where website
+                    # was set to a non-string. Either way, just skip the logo.
+                    logger.warning("logo domain parse failed for %s: %s", t, e, exc_info=False)
 
             # Extended fundamental data from yfinance info dict
             fundamentals = {}
@@ -139,121 +139,3 @@ def get_asset_info(request: Request, tickers: str):
     return result
 
 
-@router.get("/news")
-@limiter.limit("20/minute")  # ✅ 20 requests per minute
-def get_news(request: Request, ticker: str):
-    # ✅ Validate input
-    validated = NewsRequest(ticker=ticker)
-    ticker = validated.ticker if validated.ticker else ""
-    """
-    Get news for a specific ticker from Yahoo Finance
-    Returns a list of news articles with the following fields:
-    - id: unique identifier
-    - headline: article title
-    - source: publisher name
-    - url: article URL
-    - datetime: Unix timestamp
-    - summary: article summary/description
-    - image: thumbnail image URL
-    - related: related ticker
-    - category: content type (article, video, etc.)
-    - impactScore: random score 1-100 (placeholder)
-    - sentiment: positive/negative/neutral (placeholder)
-    """
-    try:
-        news_data = yf.Ticker(ticker).news
-        results = []
-        ticker_upper = ticker.upper()
-
-        for article in news_data:
-            # Extract from content object if exists
-            content = article.get("content", {})
-
-            # T11: yfinance returns tangentially related articles (e.g. NVDA
-            # query surfaces pieces where only a supplier is mentioned). Keep
-            # only items where the requested ticker appears in the structured
-            # relations list or in the headline text.
-            related_tickers = article.get("relatedTickers") or content.get("finance", {}).get("stockTickers", []) or []
-            if isinstance(related_tickers, list):
-                related_upper = [str(t).upper() for t in related_tickers if t]
-            else:
-                related_upper = []
-            title_raw = content.get("title") or article.get("title") or ""
-            title_upper = title_raw.upper()
-            if related_upper and ticker_upper not in related_upper and ticker_upper not in title_upper:
-                continue
-
-            # Safely extract the first thumbnail resolution url
-            image_url = ""
-            thumbnail = content.get("thumbnail") or article.get("thumbnail")
-            if thumbnail and isinstance(thumbnail, dict):
-                resolutions = thumbnail.get("resolutions", [])
-                if resolutions and len(resolutions) > 0:
-                    image_url = resolutions[0].get("url", "")
-
-            # Get title/headline
-            headline = content.get("title") or article.get("title", "Sin título")
-
-            # Get URL
-            url = ""
-            canonical = content.get("canonicalUrl") or article.get("canonicalUrl")
-            if canonical and isinstance(canonical, dict):
-                url = canonical.get("url", "")
-            if not url:
-                click_through = content.get("clickThroughUrl") or article.get("clickThroughUrl")
-                if click_through and isinstance(click_through, dict):
-                    url = click_through.get("url", "")
-            if not url:
-                url = article.get("link", "")
-
-            # Get source
-            provider = content.get("provider") or article.get("provider")
-            if isinstance(provider, dict):
-                source = provider.get("displayName", "Yahoo Finance")
-            else:
-                source = article.get("publisher", "Yahoo Finance")
-
-            # Get datetime - convert ISO string to timestamp
-            pub_date = content.get("pubDate") or article.get("pubDate", "")
-            datetime_value = 0
-            if pub_date:
-                try:
-                    # Parse ISO format date
-                    parsed = dt.fromisoformat(pub_date.replace('Z', '+00:00'))
-                    datetime_value = int(parsed.timestamp())
-                except (ValueError, TypeError):
-                    datetime_value = int(time.time())
-            else:
-                datetime_value = article.get("providerPublishTime", int(time.time()))
-
-            # Summary
-            summary = content.get("summary") or content.get("description") or headline
-
-            # Article ID
-            article_id = article.get("id", "") or content.get("id", "") or f"{ticker}-{datetime_value}"
-
-            # Category/type
-            category = content.get("contentType", "article")
-            if isinstance(category, str):
-                category = category.lower()
-            else:
-                category = "article"
-
-            results.append({
-                "id": article_id,
-                "headline": headline,
-                "source": source,
-                "url": url,
-                "datetime": datetime_value,
-                "summary": summary,
-                "image": image_url,
-                "related": ticker,  # Related to the requested ticker
-                "category": category,
-                "impactScore": random.randint(1, 100),
-                "sentiment": random.choice(['positive', 'negative', 'neutral'])
-            })
-
-        return results
-    except Exception as e:
-        logger.exception(f"Error fetching news for {ticker}: {e}")
-        return []
