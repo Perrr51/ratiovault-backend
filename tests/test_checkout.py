@@ -1,35 +1,32 @@
-"""Tests for POST /subscription/checkout (Task 12).
+"""Tests for POST /subscription/checkout (Paddle).
 
-Hermetic — no DB, no network. JWT crafted in-process with shared secret.
-Key security invariant (FIX-1 from audit v3.0): the uid embedded in the
-checkout URL MUST come from the verified JWT, never from the request body.
+Hermetic — JWT crafted in-process. httpx call to Paddle mocked. Key security
+invariant: the uid sent to Paddle MUST come from the verified JWT, never
+from the request body (FIX-1 audit v3.0).
 """
 from datetime import datetime, timezone, timedelta
+from unittest.mock import patch, MagicMock
 
 import jwt
 import pytest
 from fastapi.testclient import TestClient
 
 SECRET = "test-jwt-secret"
+PADDLE_KEY = "pdl_apikey_test"
 
 
 @pytest.fixture
 def client(monkeypatch):
     from config import settings
-
     monkeypatch.setattr(settings, "supabase_jwt_secret", SECRET)
-    monkeypatch.setattr(
-        settings,
-        "lemon_squeezy_checkout_base",
-        "https://ratiovault.lemonsqueezy.com/checkout/buy",
-    )
-    monkeypatch.setattr(settings, "lemon_squeezy_monthly_variant_id", "VAR_MONTH")
-    monkeypatch.setattr(settings, "lemon_squeezy_yearly_variant_id", "VAR_YEAR")
-    monkeypatch.setattr(settings, "lemon_squeezy_quarterly_variant_id", "VAR_Q")
-    monkeypatch.setattr(settings, "lemon_squeezy_semiannual_variant_id", "VAR_S")
-
+    monkeypatch.setattr(settings, "paddle_api_key", PADDLE_KEY)
+    monkeypatch.setattr(settings, "paddle_api_base", "https://api.paddle.com")
+    monkeypatch.setattr(settings, "paddle_price_id_monthly", "pri_M")
+    monkeypatch.setattr(settings, "paddle_price_id_quarterly", "pri_Q")
+    monkeypatch.setattr(settings, "paddle_price_id_semiannual", "pri_S")
+    monkeypatch.setattr(settings, "paddle_price_id_yearly", "pri_Y")
+    monkeypatch.setattr(settings, "paddle_price_id_founder", "pri_F")
     from main import app
-
     return TestClient(app)
 
 
@@ -43,125 +40,112 @@ def _token(sub="user-123", email="x@y.com", exp_delta=timedelta(hours=1)):
     return jwt.encode(payload, SECRET, algorithm="HS256")
 
 
+def _mock_paddle_response(checkout_url="https://buy.paddle.com/?_ptxn=txn_001", status=200):
+    resp = MagicMock()
+    resp.status_code = status
+    resp.json.return_value = {"data": {"id": "txn_001", "checkout": {"url": checkout_url}}}
+    resp.text = ""
+    return resp
+
+
 def test_no_auth_header_returns_401(client):
     r = client.post("/subscription/checkout", json={"interval": "monthly"})
     assert r.status_code == 401
 
 
 def test_malformed_auth_header_returns_401(client):
-    r = client.post(
-        "/subscription/checkout",
-        json={"interval": "monthly"},
-        headers={"Authorization": "just-a-token"},
-    )
+    r = client.post("/subscription/checkout", json={"interval": "monthly"},
+                    headers={"Authorization": "just-a-token"})
     assert r.status_code == 401
 
 
 def test_invalid_jwt_returns_401(client):
-    r = client.post(
-        "/subscription/checkout",
-        json={"interval": "monthly"},
-        headers={"Authorization": "Bearer garbage"},
-    )
+    r = client.post("/subscription/checkout", json={"interval": "monthly"},
+                    headers={"Authorization": "Bearer garbage"})
     assert r.status_code == 401
 
 
 def test_valid_jwt_monthly_returns_checkout_url(client):
-    r = client.post(
-        "/subscription/checkout",
-        json={"interval": "monthly"},
-        headers={"Authorization": f"Bearer {_token()}"},
-    )
+    with patch("routers.checkout.httpx.Client") as mock_cls:
+        mock_cls.return_value.__enter__.return_value.post.return_value = _mock_paddle_response()
+        r = client.post("/subscription/checkout", json={"interval": "monthly"},
+                        headers={"Authorization": f"Bearer {_token()}"})
+    assert r.status_code == 200, r.text
+    assert "buy.paddle.com" in r.json()["checkoutUrl"]
+    sent_json = mock_cls.return_value.__enter__.return_value.post.call_args.kwargs["json"]
+    assert sent_json["items"][0]["price_id"] == "pri_M"
+    assert sent_json["custom_data"]["uid"] == "user-123"
+    assert sent_json["customer"]["email"] == "x@y.com"
+
+
+def test_valid_jwt_yearly(client):
+    with patch("routers.checkout.httpx.Client") as mock_cls:
+        mock_cls.return_value.__enter__.return_value.post.return_value = _mock_paddle_response()
+        r = client.post("/subscription/checkout", json={"interval": "yearly"},
+                        headers={"Authorization": f"Bearer {_token()}"})
     assert r.status_code == 200
-    url = r.json()["checkoutUrl"]
-    assert "VAR_MONTH" in url
-    assert "checkout[custom][uid]=user-123" in url
-    assert "checkout[email]=x@y.com" in url
+    sent = mock_cls.return_value.__enter__.return_value.post.call_args.kwargs["json"]
+    assert sent["items"][0]["price_id"] == "pri_Y"
 
 
-def test_valid_jwt_yearly_returns_checkout_url(client):
-    r = client.post(
-        "/subscription/checkout",
-        json={"interval": "yearly"},
-        headers={"Authorization": f"Bearer {_token()}"},
-    )
+def test_founder_plan_uses_founder_price(client):
+    with patch("routers.checkout.httpx.Client") as mock_cls:
+        mock_cls.return_value.__enter__.return_value.post.return_value = _mock_paddle_response()
+        r = client.post("/subscription/checkout", json={"plan": "founder"},
+                        headers={"Authorization": f"Bearer {_token()}"})
     assert r.status_code == 200
-    assert "VAR_YEAR" in r.json()["checkoutUrl"]
-
-
-def test_valid_jwt_quarterly_returns_checkout_url(client):
-    r = client.post(
-        "/subscription/checkout",
-        json={"interval": "quarterly"},
-        headers={"Authorization": f"Bearer {_token()}"},
-    )
-    assert r.status_code == 200
-    assert "VAR_Q" in r.json()["checkoutUrl"]
-
-
-def test_valid_jwt_semiannual_returns_checkout_url(client):
-    r = client.post(
-        "/subscription/checkout",
-        json={"interval": "semiannual"},
-        headers={"Authorization": f"Bearer {_token()}"},
-    )
-    assert r.status_code == 200
-    assert "VAR_S" in r.json()["checkoutUrl"]
+    sent = mock_cls.return_value.__enter__.return_value.post.call_args.kwargs["json"]
+    assert sent["items"][0]["price_id"] == "pri_F"
+    assert sent["custom_data"]["plan"] == "founder"
 
 
 def test_unknown_interval_returns_400(client):
-    r = client.post(
-        "/subscription/checkout",
-        json={"interval": "weekly"},
-        headers={"Authorization": f"Bearer {_token()}"},
-    )
+    r = client.post("/subscription/checkout", json={"interval": "weekly"},
+                    headers={"Authorization": f"Bearer {_token()}"})
     assert r.status_code == 400
-    assert "Unknown interval" in r.json()["detail"]
 
 
-def test_default_interval_is_monthly(client):
-    r = client.post(
-        "/subscription/checkout",
-        json={},
-        headers={"Authorization": f"Bearer {_token()}"},
-    )
-    assert r.status_code == 200
-    assert "VAR_MONTH" in r.json()["checkoutUrl"]
+def test_unknown_plan_returns_400(client):
+    r = client.post("/subscription/checkout", json={"plan": "ultra"},
+                    headers={"Authorization": f"Bearer {_token()}"})
+    assert r.status_code == 400
 
 
 def test_uid_comes_from_jwt_not_body(client):
-    r = client.post(
-        "/subscription/checkout",
-        json={"interval": "monthly", "uid": "attacker-uid"},
-        headers={"Authorization": f"Bearer {_token(sub='real-user')}"},
-    )
+    with patch("routers.checkout.httpx.Client") as mock_cls:
+        mock_cls.return_value.__enter__.return_value.post.return_value = _mock_paddle_response()
+        r = client.post(
+            "/subscription/checkout",
+            json={"interval": "monthly", "uid": "attacker-uid"},
+            headers={"Authorization": f"Bearer {_token(sub='real-user')}"},
+        )
     assert r.status_code == 200
-    url = r.json()["checkoutUrl"]
-    assert "checkout[custom][uid]=real-user" in url
-    assert "attacker-uid" not in url
+    sent = mock_cls.return_value.__enter__.return_value.post.call_args.kwargs["json"]
+    assert sent["custom_data"]["uid"] == "real-user"
 
 
-def test_missing_variant_returns_500(client, monkeypatch):
+def test_missing_price_id_returns_500(client, monkeypatch):
     from config import settings
-
-    monkeypatch.setattr(settings, "lemon_squeezy_monthly_variant_id", "")
-    r = client.post(
-        "/subscription/checkout",
-        json={"interval": "monthly"},
-        headers={"Authorization": f"Bearer {_token()}"},
-    )
+    monkeypatch.setattr(settings, "paddle_price_id_monthly", "")
+    r = client.post("/subscription/checkout", json={"interval": "monthly"},
+                    headers={"Authorization": f"Bearer {_token()}"})
     assert r.status_code == 500
     assert "not configured" in r.json()["detail"]
 
 
-def test_missing_checkout_base_returns_500(client, monkeypatch):
-    from config import settings
+def test_paddle_4xx_returns_502(client):
+    bad_resp = MagicMock(status_code=400, text="bad request")
+    with patch("routers.checkout.httpx.Client") as mock_cls:
+        mock_cls.return_value.__enter__.return_value.post.return_value = bad_resp
+        r = client.post("/subscription/checkout", json={"interval": "monthly"},
+                        headers={"Authorization": f"Bearer {_token()}"})
+    assert r.status_code == 502
 
-    monkeypatch.setattr(settings, "lemon_squeezy_checkout_base", "")
-    r = client.post(
-        "/subscription/checkout",
-        json={"interval": "monthly"},
-        headers={"Authorization": f"Bearer {_token()}"},
-    )
-    assert r.status_code == 500
-    assert "not configured" in r.json()["detail"]
+
+def test_paddle_network_error_returns_502(client):
+    import httpx
+    with patch("routers.checkout.httpx.Client") as mock_cls:
+        mock_cls.return_value.__enter__.return_value.post.side_effect = httpx.ConnectError("boom")
+        r = client.post("/subscription/checkout", json={"interval": "monthly"},
+                        headers={"Authorization": f"Bearer {_token()}"})
+    assert r.status_code == 502

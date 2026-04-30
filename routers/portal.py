@@ -1,8 +1,15 @@
-"""Customer portal URL generation for subscription management.
+"""Customer portal URL generation for Paddle Billing.
 
-Looks up the LS customer_id for the authenticated user, calls the LS API
-to fetch the hosted customer portal URL, and returns it to the frontend.
+Looks up the Paddle customer_id for the authenticated user, calls Paddle's
+customer-portal-sessions endpoint, and returns the authenticated portal URL
+to the frontend. The URL contains a temporary auth token — never persist it.
+
+Endpoint: POST /customers/{customer_id}/portal-sessions
+Optional body: {"subscription_ids": [<sub_id>]} — produces deep links to
+specific subscriptions; we include it when the user has an active sub.
 """
+import logging
+
 import httpx
 from fastapi import APIRouter, Header, HTTPException
 
@@ -10,9 +17,9 @@ from auth import verify_supabase_jwt
 from config import settings
 from supabase_client import get_supabase_service
 
-LS_API_BASE = "https://api.lemonsqueezy.com/v1"
 REQUEST_TIMEOUT_S = 10.0
 
+logger = logging.getLogger(__name__)
 router = APIRouter(tags=["subscription"])
 
 
@@ -26,17 +33,11 @@ def create_portal_session(authorization: str = Header(None)):
     client = get_supabase_service()
     resp = (
         client.table("subscriptions")
-        .select("provider_customer_id")
+        .select("provider_customer_id, provider_subscription_id")
         .eq("user_id", claims["uid"])
         .maybe_single()
         .execute()
     )
-    # B-013: distinguish "no subscription row at all" from "row exists but
-    # provider_customer_id missing" from "LS upstream failure". The first
-    # two stay 409 (client-fixable: check out a plan / wait for the
-    # webhook to populate the customer id) but with distinct messages so
-    # the frontend can route to the right CTA. LS upstream errors stay
-    # 502 with their own distinct message.
     if resp.data is None:
         raise HTTPException(
             status_code=409,
@@ -47,40 +48,58 @@ def create_portal_session(authorization: str = Header(None)):
     if not customer_id:
         raise HTTPException(
             status_code=409,
-            detail="missing_customer_id: subscription row exists but Lemon Squeezy customer id is not yet populated",
+            detail="missing_customer_id: subscription row exists but Paddle customer id is not yet populated",
         )
+    subscription_id = row.get("provider_subscription_id")
 
-    if not settings.lemon_squeezy_api_key:
-        raise HTTPException(status_code=500, detail="Lemon Squeezy API key not configured")
+    if not settings.paddle_api_key:
+        raise HTTPException(status_code=500, detail="Paddle API key not configured")
+
+    body: dict = {}
+    if subscription_id:
+        body["subscription_ids"] = [subscription_id]
 
     try:
-        with httpx.Client(timeout=REQUEST_TIMEOUT_S) as http:
-            r = http.get(
-                f"{LS_API_BASE}/customers/{customer_id}",
+        with httpx.Client(base_url=settings.paddle_api_base, timeout=REQUEST_TIMEOUT_S) as http:
+            r = http.post(
+                f"/customers/{customer_id}/portal-sessions",
                 headers={
-                    "Authorization": f"Bearer {settings.lemon_squeezy_api_key}",
-                    "Accept": "application/vnd.api+json",
+                    "Authorization": f"Bearer {settings.paddle_api_key}",
+                    "Content-Type": "application/json",
                 },
+                json=body,
             )
-        r.raise_for_status()
-        ls_data = r.json()
-    except HTTPException:
-        raise
-    except Exception:
+    except httpx.HTTPError as exc:
+        logger.error("Paddle portal-sessions network error: %s", exc)
         raise HTTPException(
             status_code=502,
-            detail="ls_api_error: Lemon Squeezy upstream call failed",
+            detail="paddle_api_error: Paddle upstream call failed",
         )
 
-    portal_url = (
-        ls_data.get("data", {})
-        .get("attributes", {})
-        .get("urls", {})
-        .get("customer_portal")
-    )
+    if r.status_code >= 400:
+        logger.error(
+            "Paddle portal-sessions failed: status=%s body=%s",
+            r.status_code, r.text[:500],
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="paddle_api_error: Paddle upstream call failed",
+        )
+
+    try:
+        data = r.json().get("data", {}) or {}
+        urls = data.get("urls", {}) or {}
+        general = urls.get("general", {}) or {}
+        portal_url = general.get("overview")
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(
+            status_code=502,
+            detail="paddle_malformed_response: portal session response unparseable",
+        )
+
     if not portal_url:
         raise HTTPException(
             status_code=502,
-            detail="ls_missing_portal_url: customer_portal absent in Lemon Squeezy response",
+            detail="paddle_missing_portal_url: urls.general.overview absent in response",
         )
     return {"portalUrl": portal_url}
