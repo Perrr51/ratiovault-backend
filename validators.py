@@ -380,17 +380,3 @@ class AlertEvaluateRequest(BaseModel):
     alerts: List[AlertItem] = Field(..., max_length=100)
 
 
-class PortfolioItemForAI(BaseModel):
-    """Validation for a portfolio item in /ai/chat"""
-    ticker: str = Field(default="", max_length=20)
-    value: float = Field(default=0)
-    cost: float = Field(default=0)
-    sector: str = Field(default="", max_length=100)
-    shares: float = Field(default=0)
-    pnl: float = Field(default=0)
-
-
-class AIChatRequest(BaseModel):
-    """Validation for /ai/chat POST body"""
-    message: str = Field(..., max_length=2000)
-    positions: List[PortfolioItemForAI] = Field(default=[], max_length=200)
