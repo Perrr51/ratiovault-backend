@@ -73,7 +73,6 @@ from routers.history import router as history_router
 from routers.dividends_funds import router as dividends_funds_router
 from routers.alerts import router as alerts_router
 from routers.justetf_routes import router as justetf_router
-from routers.ai_chat import router as ai_chat_router
 from routers.stooq_routes import router as stooq_router
 from routers.internal import router as internal_router
 from routers.checkout import router as checkout_router
@@ -91,7 +90,6 @@ app.include_router(history_router)
 app.include_router(dividends_funds_router)
 app.include_router(alerts_router)
 app.include_router(justetf_router)
-app.include_router(ai_chat_router)
 app.include_router(stooq_router)
 app.include_router(internal_router)
 app.include_router(checkout_router)
