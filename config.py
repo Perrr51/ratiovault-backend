@@ -4,7 +4,8 @@ Loads settings from environment variables with sensible defaults.
 """
 
 import logging
-from typing import List
+from typing import List, Literal
+from pydantic import field_validator
 from pydantic_settings import BaseSettings
 
 logger = logging.getLogger(__name__)
@@ -30,30 +31,37 @@ class Settings(BaseSettings):
     port: int = 8000
     host: str = "0.0.0.0"
 
-    # ── Supabase (Task 1 + Task 7) ──────────────────────────────────────────
+    # ── Supabase ────────────────────────────────────────────────────────────
     supabase_url: str = ""
     supabase_service_role_key: str = ""
     supabase_jwt_secret: str = ""
 
-    # ── Internal cron (Task 5) ──────────────────────────────────────────────
+    # ── Internal cron ───────────────────────────────────────────────────────
     internal_cron_token: str = ""
 
     # ── Fallback behavior (B-008) ───────────────────────────────────────────
-    # When yfinance returns price=0 for any ticker (not just the metals/forex
-    # patterns hardcoded in stooq.py), retry against Stooq. Disable to revert
-    # to the legacy pattern-only fallback.
     stooq_any_ticker_fallback: bool = True
 
-    # ── Lemon Squeezy (Task 7) ──────────────────────────────────────────────
-    lemon_squeezy_webhook_secret: str = ""
-    lemon_squeezy_store_id: str = ""
-    lemon_squeezy_checkout_base: str = ""
-    lemon_squeezy_monthly_variant_id: str = ""
-    lemon_squeezy_quarterly_variant_id: str = ""
-    lemon_squeezy_semiannual_variant_id: str = ""
-    lemon_squeezy_yearly_variant_id: str = ""
-    lemon_squeezy_founder_variant_id: str = ""
-    lemon_squeezy_api_key: str = ""
+    # ── Paddle Billing (supersedes LemonSqueezy 2026-04-30) ─────────────────
+    # MoR processor. Webhook signature: Paddle-Signature header (ts + h1).
+    # See ADR docs/decisions/2026-04-30-paddle-supersedes-lemonsqueezy.md.
+    paddle_environment: Literal["sandbox", "production"] = "production"
+    paddle_api_base: str = ""  # auto-derived from paddle_environment if empty
+    paddle_api_key: str = ""
+    paddle_notification_secret: str = ""
+    paddle_price_id_monthly: str = ""
+    paddle_price_id_quarterly: str = ""
+    paddle_price_id_semiannual: str = ""
+    paddle_price_id_yearly: str = ""
+    paddle_price_id_founder: str = ""
+
+    @field_validator("paddle_api_base", mode="before")
+    @classmethod
+    def _derive_paddle_api_base(cls, v, info):
+        if v:
+            return v
+        env = info.data.get("paddle_environment", "production")
+        return "https://sandbox-api.paddle.com" if env == "sandbox" else "https://api.paddle.com"
 
     class Config:
         env_file = ".env"
@@ -69,29 +77,26 @@ class Settings(BaseSettings):
 settings = Settings()
 
 
-# ── B-005: fail fast on empty webhook secret ───────────────────────────────
-# The Lemon Squeezy webhook secret is required for HMAC signature verification
-# on /webhooks/lemonsqueezy. An empty value would silently cause every webhook
-# to be rejected (or worse, accepted if verification logic regresses), so we
-# refuse to boot. Set RATIOVAULT_SKIP_SECRET_VALIDATION=1 in test environments
-# that intentionally run without subscription configured.
+# ── Fail fast on empty webhook signing secret ─────────────────────────────
+# Paddle notification secret required for HMAC verification on
+# /webhooks/paddle. Empty value would reject every webhook silently. Set
+# RATIOVAULT_SKIP_SECRET_VALIDATION=1 in test envs without subscription cfg.
 import os as _os  # noqa: E402
 
 if not _os.environ.get("RATIOVAULT_SKIP_SECRET_VALIDATION"):
-    if not getattr(settings, "lemon_squeezy_webhook_secret", "").strip():
+    if not getattr(settings, "paddle_notification_secret", "").strip():
         raise ValueError(
-            "LEMON_SQUEEZY_WEBHOOK_SECRET must be set (non-empty) "
-            "to verify Lemon Squeezy webhook signatures (audit B-005)"
+            "PADDLE_NOTIFICATION_SECRET must be set (non-empty) "
+            "to verify Paddle webhook signatures"
         )
 
 
 def validate_settings():
     """Validate critical settings on application startup.
 
-    Hard-fails only on the SEC user-agent default (yfinance/SEC EDGAR break
-    without a real UA). Everything else logs a warning so the app can still
-    boot with reduced functionality (e.g. subscription endpoints fail closed
-    when Lemon Squeezy / Supabase creds are missing).
+    Hard-fails only on the SEC user-agent default. Everything else logs a
+    warning so the app can still boot with reduced functionality (e.g.
+    subscription endpoints fail closed when Paddle / Supabase creds missing).
     """
     if not settings.sec_user_agent or "contact@example.com" in settings.sec_user_agent:
         raise ValueError(
@@ -105,7 +110,6 @@ def validate_settings():
     if settings.chart_cache_max_size < 1:
         raise ValueError("CHART_CACHE_MAX_SIZE must be at least 1")
 
-    # ── Non-fatal warnings for subscription-related config ──────────────────
     if (
         not settings.supabase_url
         or not settings.supabase_service_role_key
@@ -115,9 +119,9 @@ def validate_settings():
             "Supabase credentials missing; subscription endpoints will fail"
         )
 
-    if not settings.lemon_squeezy_webhook_secret:
+    if not settings.paddle_notification_secret:
         logger.warning(
-            "LS webhook secret missing; webhooks will reject all requests"
+            "Paddle notification secret missing; webhooks will reject all requests"
         )
 
     if not settings.internal_cron_token:
@@ -125,24 +129,22 @@ def validate_settings():
             "Internal cron token missing; retention endpoint will reject all requests"
         )
 
-    # Grouped warning for the remaining Lemon Squeezy vars — one message is enough.
-    ls_vars_missing = [
+    paddle_vars_missing = [
         name
         for name, value in (
-            ("LEMON_SQUEEZY_STORE_ID", settings.lemon_squeezy_store_id),
-            ("LEMON_SQUEEZY_CHECKOUT_BASE", settings.lemon_squeezy_checkout_base),
-            ("LEMON_SQUEEZY_MONTHLY_VARIANT_ID", settings.lemon_squeezy_monthly_variant_id),
-            ("LEMON_SQUEEZY_QUARTERLY_VARIANT_ID", settings.lemon_squeezy_quarterly_variant_id),
-            ("LEMON_SQUEEZY_SEMIANNUAL_VARIANT_ID", settings.lemon_squeezy_semiannual_variant_id),
-            ("LEMON_SQUEEZY_YEARLY_VARIANT_ID", settings.lemon_squeezy_yearly_variant_id),
-            ("LEMON_SQUEEZY_API_KEY", settings.lemon_squeezy_api_key),
+            ("PADDLE_API_KEY", settings.paddle_api_key),
+            ("PADDLE_PRICE_ID_MONTHLY", settings.paddle_price_id_monthly),
+            ("PADDLE_PRICE_ID_QUARTERLY", settings.paddle_price_id_quarterly),
+            ("PADDLE_PRICE_ID_SEMIANNUAL", settings.paddle_price_id_semiannual),
+            ("PADDLE_PRICE_ID_YEARLY", settings.paddle_price_id_yearly),
+            ("PADDLE_PRICE_ID_FOUNDER", settings.paddle_price_id_founder),
         )
         if not value
     ]
-    if ls_vars_missing:
+    if paddle_vars_missing:
         logger.warning(
-            "Lemon Squeezy config incomplete (missing: %s); checkout/portal flows may fail",
-            ", ".join(ls_vars_missing),
+            "Paddle config incomplete (missing: %s); checkout/portal flows may fail",
+            ", ".join(paddle_vars_missing),
         )
 
     logger.info("Configuration validated successfully")
@@ -150,6 +152,6 @@ def validate_settings():
     logger.info("Cache TTL: %ss", settings.chart_cache_ttl)
     logger.info("Cache Max Size: %s", settings.chart_cache_max_size)
     logger.info("SEC User Agent: %s", settings.sec_user_agent)
-    # Keep a single stdout breadcrumb so boot logs remain visually obvious
-    # even when the logging handler filters INFO.
+    logger.info("Paddle environment: %s (api_base=%s)",
+                settings.paddle_environment, settings.paddle_api_base)
     print("✅ Configuration validated successfully")

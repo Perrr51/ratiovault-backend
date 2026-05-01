@@ -1,15 +1,26 @@
-"""Lemon Squeezy webhook handler (HMAC-SHA256)."""
+"""Paddle webhook handler.
+
+Supersedes LemonSqueezy 2026-04-30 (ADR
+docs/decisions/2026-04-30-paddle-supersedes-lemonsqueezy.md).
+
+Signature: `Paddle-Signature: ts=...;h1=...`, HMAC-SHA256 over
+`f"{ts}:{raw_body}"` (see services.paddle_signature).
+
+Dedup: `event_id` from body (`ntf_xxx`) — unique per Paddle notification.
+The legacy `/webhooks/lemonsqueezy` URL is preserved for 30 days returning
+410 Gone, in case external Paddle config rotates before deploy.
+"""
 import asyncio
-import hashlib
-import hmac
 import json
 import logging
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import JSONResponse
 
 from config import settings
+from services.paddle_signature import verify_paddle_signature
 from supabase_client import get_supabase_service
 
 logger = logging.getLogger(__name__)
@@ -17,20 +28,8 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["webhooks"])
 
 
-def _verify_signature(body: bytes, signature: str, secret: str) -> bool:
-    """Verify X-Signature header against HMAC-SHA256(body, secret).
-
-    Fail-closed: empty secret or empty signature returns False.
-    Uses hmac.compare_digest for constant-time comparison.
-    """
-    if not secret or not signature:
-        return False
-    expected = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, signature)
-
-
 def _parse_timestamp(iso_string: Optional[str]) -> Optional[datetime]:
-    """Parse LS ISO-8601 timestamp (e.g. '2026-05-01T00:00:00.000000Z'). Returns None on failure."""
+    """Parse RFC 3339 timestamp from Paddle. Returns None on failure."""
     if not iso_string:
         return None
     try:
@@ -39,129 +38,134 @@ def _parse_timestamp(iso_string: Optional[str]) -> Optional[datetime]:
         return None
 
 
-def _determine_interval(variant_name: Optional[str]) -> str:
-    """Infer plan_interval from variant name. Patterns checked in order.
+def _determine_interval(items: list[dict]) -> str:
+    """Infer plan_interval from Paddle items[*].price.billing_cycle.
 
-    Supports 4 intervals: monthly | quarterly | semiannual | yearly.
-    Order matters: more specific patterns (3 mes, 6 mes, semiannual) must
-    be checked before generic ones (year/annual, mensual) to avoid false
-    positives (e.g. "semiannual" contains "annual").
+    Paddle expresses cycle as `interval` (month/year) + `frequency` (int).
+    Maps to RatioVault's 4 intervals. Defaults to monthly when ambiguous.
     """
-    if not variant_name:
+    if not items:
         return "monthly"
-    lower = variant_name.lower()
-    if any(tok in lower for tok in ("3 mes", "3 month", "3month", "quarter", "trimestr")):
-        return "quarterly"
-    if any(tok in lower for tok in ("6 mes", "6 month", "6month", "semestr", "semiannual", "semi-annual")):
-        return "semiannual"
-    if any(tok in lower for tok in ("year", "annual", "anual", "1 año", "1 ano")):
+    price = (items[0] or {}).get("price") or {}
+    cycle = price.get("billing_cycle") or {}
+    interval = (cycle.get("interval") or "").lower()
+    frequency = cycle.get("frequency") or 1
+    if interval == "month":
+        if frequency == 1:
+            return "monthly"
+        if frequency == 3:
+            return "quarterly"
+        if frequency == 6:
+            return "semiannual"
+        if frequency == 12:
+            return "yearly"
+    if interval == "year":
         return "yearly"
-    return "monthly"  # default includes "mensual", "monthly", "mes"
+    return "monthly"
 
 
-def _compute_event_id(event_name: str, data: dict) -> str:
-    """Construct a deterministic lemon_event_id from the verified body.
-
-    Lemon Squeezy does not emit an X-Event-Id header; we synthesize one from
-    the event name + subscription id + updated_at so retries dedupe correctly.
-    """
-    return f"{event_name}:{data['id']}:{data['attributes']['updated_at']}"
-
-
-def _is_founder_variant(variant_id) -> bool:
-    """True when the purchased variant matches the configured founder variant.
-
-    Compared as strings — LS sends numeric IDs, env var may be numeric or UUID.
-    Empty env var disables the flag (founder feature off).
-    """
-    configured = (settings.lemon_squeezy_founder_variant_id or "").strip()
+def _items_have_founder_price(items: list[dict]) -> bool:
+    """True iff any item.price.id matches the configured founder price id."""
+    configured = (settings.paddle_price_id_founder or "").strip()
     if not configured:
         return False
-    return str(variant_id) == configured
+    for item in items or []:
+        price = (item or {}).get("price") or {}
+        if str(price.get("id", "")) == configured:
+            return True
+    return False
 
 
-def _process_subscription_event(event_name: str, data: dict) -> dict:
-    """Map a LS webhook event's `data` object → subscriptions state_update dict.
+def _get_uid(data: dict) -> Optional[str]:
+    """Extract `uid` from `data.custom_data.uid` (Paddle stores at data root)."""
+    custom = (data or {}).get("custom_data") or {}
+    if not isinstance(custom, dict):
+        return None
+    uid = custom.get("uid")
+    return str(uid) if uid else None
 
-    Semantics:
-      - Keys ABSENT from the returned dict = 'no change' (RPC COALESCEs existing).
-      - Keys present with value `None` = 'set to NULL' (overwrite).
-      - `is_founder: true` is additive in the RPC (once true, never reset).
+
+def _process_subscription_event(event_type: str, data: dict) -> dict:
+    """Map a Paddle event's `data` → subscriptions state_update dict.
+
+    Same contract as the LS handler: keys absent = no change (RPC COALESCEs),
+    keys present with None = set NULL, `is_founder: true` is additive.
     """
-    attrs = data.get("attributes", {}) or {}
     subscription_id = str(data.get("id", ""))
-    customer_id = attrs.get("customer_id")
-    variant_id = attrs.get("variant_id")
-    variant_name = attrs.get("variant_name", "")
-    renews_at = _parse_timestamp(attrs.get("renews_at"))
-    ends_at = _parse_timestamp(attrs.get("ends_at"))
-    cancelled = bool(attrs.get("cancelled", False))
-    status = attrs.get("status", "")
+    customer_id = data.get("customer_id")
+    status = data.get("status", "")
+    items = data.get("items") or []
+    period = data.get("current_billing_period") or {}
+    period_ends = _parse_timestamp(period.get("ends_at"))
+    scheduled_change = data.get("scheduled_change") or {}
+    cancel_at = (
+        _parse_timestamp(scheduled_change.get("effective_at"))
+        if scheduled_change.get("action") == "cancel"
+        else None
+    )
 
-    if event_name == "subscription_created":
-        result = {
+    first_price_id = ""
+    if items:
+        first_price_id = str(((items[0] or {}).get("price") or {}).get("id") or "")
+
+    if event_type == "subscription.created":
+        result: dict[str, Any] = {
             "plan": "pro",
             "status": "active",
             "cancel_at_period_end": False,
-            "current_period_end": renews_at,
-            "provider": "lemonsqueezy",
+            "current_period_end": period_ends,
+            "provider": "paddle",
             "provider_subscription_id": subscription_id,
             "provider_customer_id": str(customer_id) if customer_id is not None else None,
-            "provider_variant_id": str(variant_id) if variant_id is not None else None,
-            "plan_interval": _determine_interval(variant_name),
+            "provider_variant_id": first_price_id,
+            "plan_interval": _determine_interval(items),
         }
-        if _is_founder_variant(variant_id):
+        if _items_have_founder_price(items):
             result["is_founder"] = True
         return result
 
-    if event_name == "subscription_updated":
+    if event_type == "subscription.updated":
+        cancelled = bool(cancel_at)
         return {
             "plan": "pro",
-            "status": "cancelled" if cancelled else status,
+            "status": "cancelled" if cancelled else (status or "active"),
             "cancel_at_period_end": cancelled,
-            "current_period_end": ends_at if cancelled else renews_at,
+            "current_period_end": cancel_at if cancelled else period_ends,
             "provider_subscription_id": subscription_id,
-            "plan_interval": _determine_interval(variant_name),
+            "provider_variant_id": first_price_id,
+            "plan_interval": _determine_interval(items),
         }
 
-    if event_name == "subscription_cancelled":
+    if event_type == "subscription.canceled":
         return {
             "plan": "pro",
             "status": "cancelled",
             "cancel_at_period_end": True,
-            "current_period_end": ends_at,
+            "current_period_end": period_ends,
         }
 
-    if event_name == "subscription_expired":
-        return {
-            "plan": "free",
-            "status": "expired",
-            "cancel_at_period_end": False,
-            "current_period_end": None,
-            "provider_subscription_id": None,
-        }
-
-    if event_name == "subscription_payment_failed":
-        return {"status": "past_due"}
-
-    if event_name == "subscription_resumed":
+    if event_type == "subscription.activated":
         return {
             "plan": "pro",
             "status": "active",
             "cancel_at_period_end": False,
-            "current_period_end": renews_at,
+            "current_period_end": period_ends,
         }
+
+    if event_type == "subscription.paused":
+        return {"status": "paused"}
+
+    if event_type == "transaction.payment_failed":
+        return {"status": "past_due"}
+
+    if event_type == "transaction.completed":
+        return {}
 
     return {}
 
 
 def _serialize_state_update(state_update: dict) -> dict:
-    """Serialize datetimes in state_update to ISO strings for JSONB round-trip.
-
-    Values that are `None` are preserved (they mean 'set to NULL' per the RPC
-    contract). Anything with an `isoformat()` method (datetime/date) becomes
-    a string. All other values pass through unchanged.
-    """
+    """Serialize datetimes to ISO strings for JSONB round-trip."""
     out = {}
     for k, v in state_update.items():
         if v is None:
@@ -174,12 +178,8 @@ def _serialize_state_update(state_update: dict) -> dict:
 
 
 def _handle_webhook(body: bytes, signature: str) -> dict:
-    """Sync core of the webhook handler — runs in a threadpool.
-
-    Keeps the FastAPI async handler lightweight (just body reading) while the
-    blocking supabase-py RPC call runs off the event loop.
-    """
-    if not _verify_signature(body, signature, settings.lemon_squeezy_webhook_secret):
+    """Sync core — verify, parse, dispatch. Runs in threadpool."""
+    if not verify_paddle_signature(settings.paddle_notification_secret, signature, body):
         raise HTTPException(status_code=400, detail="Invalid signature")
 
     try:
@@ -190,25 +190,25 @@ def _handle_webhook(body: bytes, signature: str) -> dict:
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Invalid payload")
 
-    meta = payload.get("meta") or {}
-    event_name = meta.get("event_name", "")
-    custom_data = meta.get("custom_data") or {}
-    uid = custom_data.get("uid")
-    if not uid:
-        raise HTTPException(status_code=400, detail="Missing uid in custom_data")
+    event_id = payload.get("event_id") or ""
+    event_type = payload.get("event_type") or ""
+    if not event_id or not event_type:
+        raise HTTPException(status_code=400, detail="Missing event_id or event_type")
 
     data = payload.get("data")
-    if not isinstance(data, dict) or not data.get("id") or not isinstance(data.get("attributes"), dict):
+    if not isinstance(data, dict) or not data.get("id"):
         raise HTTPException(status_code=400, detail="Malformed data object")
 
-    # Optional store_id validation — skip when the env var is unset.
-    if settings.lemon_squeezy_store_id:
-        store_id = str(data["attributes"].get("store_id", ""))
-        if store_id != settings.lemon_squeezy_store_id:
-            raise HTTPException(status_code=400, detail="Store ID mismatch")
+    uid = _get_uid(data)
+    if not uid:
+        if event_type.startswith("transaction."):
+            return {"applied": False, "reason": "no_uid_for_transaction"}
+        raise HTTPException(status_code=400, detail="Missing uid in custom_data")
 
-    event_id = _compute_event_id(event_name, data)
-    state_update = _process_subscription_event(event_name, data)
+    state_update = _process_subscription_event(event_type, data)
+    if not state_update:
+        return {"applied": False, "reason": "no_state_change"}
+
     serialized = _serialize_state_update(state_update)
 
     client = get_supabase_service()
@@ -216,35 +216,40 @@ def _handle_webhook(body: bytes, signature: str) -> dict:
         resp = client.rpc(
             "apply_subscription_event",
             {
-                "p_lemon_event_id": event_id,
+                "p_provider_event_id": event_id,
                 "p_user_id": uid,
-                "p_event_type": event_name,
+                "p_event_type": event_type,
                 "p_raw_payload": payload,
                 "p_state_update": serialized,
             },
         ).execute()
     except HTTPException:
         raise
-    except Exception as exc:  # noqa: BLE001 — we want to catch every failure mode
+    except Exception as exc:  # noqa: BLE001
         logger.critical(
-            "Webhook RPC failed: event_id=%s uid=%s err=%s",
-            event_id,
-            uid,
-            exc,
+            "Paddle webhook RPC failed: event_id=%s uid=%s err=%s",
+            event_id, uid, exc,
         )
         raise HTTPException(status_code=500, detail="Apply failed")
 
     return resp.data if resp.data is not None else {"applied": True}
 
 
-@router.post("/webhooks/lemonsqueezy")
-async def handle_lemonsqueezy_webhook(request: Request):
-    """Lemon Squeezy webhook entry point.
-
-    Reads the raw body (required for HMAC verification — we cannot use the
-    re-serialized JSON) and offloads the synchronous verification + RPC call
-    to a threadpool so the event loop stays responsive.
-    """
+@router.post("/webhooks/paddle")
+async def handle_paddle_webhook(request: Request):
+    """Paddle webhook entry point."""
     body = await request.body()
-    signature = request.headers.get("X-Signature", "")
+    signature = request.headers.get("Paddle-Signature", "")
     return await asyncio.to_thread(_handle_webhook, body, signature)
+
+
+@router.api_route("/webhooks/lemonsqueezy", methods=["POST"])
+async def handle_lemonsqueezy_webhook_deprecated(request: Request):
+    """Deprecated 2026-04-30 — kept 30 days for race-condition window."""
+    return JSONResponse(
+        status_code=410,
+        content={
+            "error": "deprecated",
+            "message": "LemonSqueezy webhook removed; use /webhooks/paddle.",
+        },
+    )

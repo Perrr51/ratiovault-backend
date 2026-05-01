@@ -3,7 +3,7 @@
 Covers the 5 scenarios from the task spec:
 
 1. subscription_created → inserts event + flips subscriptions to pro/active.
-2. Duplicate lemon_event_id → second call is a no-op ({applied:false, reason:'duplicate'}).
+2. Duplicate provider_event_id → second call is a no-op ({applied:false, reason:'duplicate'}).
 3. subscription_payment_failed → status='past_due' WITHOUT clobbering
    provider_subscription_id or current_period_end (regression for the SRS
    sample-SQL bug).
@@ -48,13 +48,13 @@ def _iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).isoformat()
 
 
-def _call_rpc(supabase_local, lemon_event_id: str, user_id: str, event_type: str,
+def _call_rpc(supabase_local, provider_event_id: str, user_id: str, event_type: str,
               raw_payload: dict, state_update: dict) -> dict:
     """Invoke apply_subscription_event via supabase-py and return its jsonb result."""
     res = supabase_local.rpc(
         "apply_subscription_event",
         {
-            "p_lemon_event_id": lemon_event_id,
+            "p_provider_event_id": provider_event_id,
             "p_user_id": user_id,
             "p_event_type": event_type,
             "p_raw_payload": raw_payload,
@@ -76,7 +76,7 @@ def _set_subscription(pg_conn: psycopg.Connection, user_id: str, *,
             update public.subscriptions
             set plan = %s,
                 status = %s,
-                provider = 'lemonsqueezy',
+                provider = 'paddle',
                 provider_subscription_id = %s,
                 current_period_end = %s,
                 cancel_at_period_end = %s,
@@ -112,11 +112,11 @@ def _read_subscription(pg_conn: psycopg.Connection, user_id: str) -> dict:
     }
 
 
-def _count_events(pg_conn: psycopg.Connection, lemon_event_id: str) -> int:
+def _count_events(pg_conn: psycopg.Connection, provider_event_id: str) -> int:
     with pg_conn.cursor() as cur:
         cur.execute(
-            "select count(*) from public.subscription_events where lemon_event_id = %s",
-            (lemon_event_id,),
+            "select count(*) from public.subscription_events where provider_event_id = %s",
+            (provider_event_id,),
         )
         return cur.fetchone()[0]
 
@@ -134,7 +134,7 @@ def test_created_event_applies(
         "status": "active",
         "cancel_at_period_end": False,
         "current_period_end": _iso(renews_at),
-        "provider": "lemonsqueezy",
+        "provider": "paddle",
         "provider_subscription_id": "sub_999",
         "provider_customer_id": "cust_1",
         "provider_variant_id": "var_1",
@@ -157,7 +157,7 @@ def test_created_event_applies(
     assert sub["provider_subscription_id"] == "sub_999"
     assert sub["current_period_end"] is not None
     assert sub["plan_interval"] == "monthly"
-    assert sub["provider"] == "lemonsqueezy"
+    assert sub["provider"] == "paddle"
 
     assert _count_events(pg_conn, event_id) == 1
 
@@ -165,7 +165,7 @@ def test_created_event_applies(
 def test_duplicate_event_is_noop(
     supabase_local, pg_conn: psycopg.Connection, new_auth_user: str
 ) -> None:
-    """Applying the same lemon_event_id twice must dedupe."""
+    """Applying the same provider_event_id twice must dedupe."""
     user_id = new_auth_user
     event_id = f"subscription_created:sub_dup:{uuid.uuid4().hex}"
     state_update = {
@@ -173,7 +173,7 @@ def test_duplicate_event_is_noop(
         "status": "active",
         "cancel_at_period_end": False,
         "current_period_end": _iso(datetime(2026, 6, 1, tzinfo=timezone.utc)),
-        "provider": "lemonsqueezy",
+        "provider": "paddle",
         "provider_subscription_id": "sub_dup",
         "provider_customer_id": "cust_dup",
         "provider_variant_id": "var_dup",

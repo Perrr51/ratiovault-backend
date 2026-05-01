@@ -8,7 +8,7 @@ fixture), the database contains:
 3. Index `subscription_events_user_time_idx` exists.
 4. RLS policy `subscription_events_select_own` on the table for `cmd = SELECT`.
 5. Table is NOT part of the `supabase_realtime` publication.
-6. Dedup: inserting the same `lemon_event_id` twice raises UniqueViolation.
+6. Dedup: inserting the same `provider_event_id` twice raises UniqueViolation.
 
 Uses the shared `pg_conn` fixture from `conftest.py`. The dedup test creates
 and tears down an auth user via the service_role admin API.
@@ -129,7 +129,7 @@ def dedup_test_user(supabase_local):
             pass
 
 
-def test_dedup_on_lemon_event_id(
+def test_dedup_on_provider_event_id(
     pg_conn: psycopg.Connection, dedup_test_user: str
 ) -> None:
     user_id = dedup_test_user
@@ -140,7 +140,7 @@ def test_dedup_on_lemon_event_id(
         cur.execute(
             """
             insert into public.subscription_events
-              (lemon_event_id, user_id, event_type, raw_payload)
+              (provider_event_id, user_id, event_type, raw_payload)
             values (%s, %s, %s, %s::jsonb)
             """,
             (event_id, user_id, "subscription_created", payload),
@@ -152,7 +152,7 @@ def test_dedup_on_lemon_event_id(
                 cur.execute(
                     """
                     insert into public.subscription_events
-                      (lemon_event_id, user_id, event_type, raw_payload)
+                      (provider_event_id, user_id, event_type, raw_payload)
                     values (%s, %s, %s, %s::jsonb)
                     """,
                     (event_id, user_id, "subscription_updated", payload),
@@ -160,6 +160,6 @@ def test_dedup_on_lemon_event_id(
     finally:
         with pg_conn.cursor() as cur:
             cur.execute(
-                "delete from public.subscription_events where lemon_event_id = %s",
+                "delete from public.subscription_events where provider_event_id = %s",
                 (event_id,),
             )
