@@ -14,6 +14,64 @@ from supabase_client import get_supabase_service
 logger = logging.getLogger(__name__)
 
 
+# ── Custom exceptions for RPC error mapping ───────────────────────────────────
+
+
+class TokenInvalidOrExpired(Exception):
+    """RPC P0002: token not found, already consumed, or expired."""
+
+
+class UserAlreadyLinked(Exception):
+    """RPC P0003: user already has a linked Telegram channel."""
+
+
+class ChatAlreadyLinked(Exception):
+    """RPC P0004: chat_id already linked to another user."""
+
+
+def consume_link_token(token: str, chat_id: str, locale: str = "es") -> dict:
+    """Atomically consume a Telegram link token via the RPC.
+
+    Calls ``consume_telegram_link_token(p_token, p_chat_id, p_locale)`` via
+    service_role client. The RPC is SECURITY DEFINER and handles race conditions.
+
+    Args:
+        token:   UUID string from the deep-link ``?start=<token>`` parameter.
+        chat_id: Telegram chat_id (as string) received in the /start message.
+        locale:  User locale sent by the bot (e.g. "es", "en"). Defaults to "es".
+
+    Returns:
+        {"user_id": str, "locale": str}  — passthrough from the RPC.
+
+    Raises:
+        TokenInvalidOrExpired: RPC errcode P0002 (token gone / expired / consumed).
+        UserAlreadyLinked:     RPC errcode P0003 (user already has a channel).
+        ChatAlreadyLinked:     RPC errcode P0004 (chat_id belongs to another user).
+        RuntimeError:          Any other database error.
+    """
+    supa = get_supabase_service()
+    try:
+        result = supa.rpc(
+            "consume_telegram_link_token",
+            {"p_token": token, "p_chat_id": str(chat_id), "p_locale": locale},
+        ).execute()
+    except APIError as exc:
+        code = getattr(exc, "code", "") or ""
+        msg = str(exc)
+        # APIError may carry the Postgres errcode in .code or in the message.
+        if "P0002" in code or "P0002" in msg or "TOKEN_INVALID_OR_EXPIRED" in msg:
+            raise TokenInvalidOrExpired("Token is invalid, expired or already consumed") from exc
+        if "P0003" in code or "P0003" in msg or "USER_ALREADY_LINKED" in msg:
+            raise UserAlreadyLinked("User already has a linked Telegram channel") from exc
+        if "P0004" in code or "P0004" in msg or "CHAT_ALREADY_LINKED" in msg:
+            raise ChatAlreadyLinked("Chat ID is already linked to another user") from exc
+        logger.error("consume_telegram_link_token RPC failed: %s", exc)
+        raise RuntimeError("DB error consuming link token") from exc
+
+    data = result.data
+    return {"user_id": data["user_id"], "locale": data["locale"]}
+
+
 def init_link(user_id: str) -> dict:
     """Generate a Telegram deep-link token for the given user.
 
