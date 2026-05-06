@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 # Command sets
 # ---------------------------------------------------------------------------
 META_COMMANDS = {"start", "help", "idioma", "desvincular", "vincular"}
-QUOTA_COMMANDS = {"vault", "watchlist", "precio"}
+QUOTA_COMMANDS = {"vault", "watchlist", "precio", "vault_refresh"}
 
 # ---------------------------------------------------------------------------
 # Anti-DOS sliding window config

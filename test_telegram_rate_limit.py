@@ -274,3 +274,38 @@ def test_all_quota_commands_call_rpc(cmd):
     call_args = mock_supa.rpc.call_args
     assert call_args[0][0] == "consume_telegram_usage"
     assert call_args[0][1]["p_command"] == cmd
+
+
+# ── T1.5: vault_refresh in QUOTA_COMMANDS ────────────────────────────────────
+
+
+def test_vault_refresh_in_quota_commands():
+    """vault_refresh must be in QUOTA_COMMANDS so it routes to RPC, not 'unknown_command'."""
+    from services.telegram_rate_limit import QUOTA_COMMANDS
+    assert "vault_refresh" in QUOTA_COMMANDS
+
+
+def test_vault_refresh_routes_to_rpc():
+    """should_serve(command='vault_refresh') calls the RPC and returns (True, None)."""
+    from services.telegram_rate_limit import should_serve
+
+    mock_supa = _make_supa_mock_ok()
+    with patch("services.telegram_rate_limit.get_supabase_service", return_value=mock_supa):
+        allowed, code = should_serve("user-11", chat_id=2100, command="vault_refresh")
+
+    assert allowed is True
+    assert code is None
+    mock_supa.rpc.assert_called_once()
+    call_args = mock_supa.rpc.call_args
+    assert call_args[0][1]["p_command"] == "vault_refresh"
+
+
+def test_vault_refresh_plan_exceeded():
+    """vault_refresh quota exhausted returns plan_exceeded."""
+    from services.telegram_rate_limit import should_serve
+
+    with patch("services.telegram_rate_limit.get_supabase_service", return_value=_make_supa_mock_plan_exceeded()):
+        allowed, code = should_serve("user-12", chat_id=2101, command="vault_refresh")
+
+    assert allowed is False
+    assert code == "plan_exceeded"
