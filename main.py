@@ -79,6 +79,7 @@ from routers.checkout import router as checkout_router
 from routers.webhooks import router as webhooks_router
 from routers.portal import router as portal_router
 from routers.health import router as health_router
+from routers.telegram import router as telegram_router
 
 app.include_router(market_router)
 app.include_router(charts_router)
@@ -96,3 +97,4 @@ app.include_router(checkout_router)
 app.include_router(webhooks_router)
 app.include_router(portal_router)
 app.include_router(health_router)
+app.include_router(telegram_router)
