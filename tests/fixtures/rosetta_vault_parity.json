@@ -1,0 +1,163 @@
+{
+  "_comment": "Golden parity fixture for test_vault_parity.py (T2.6 / S6). Hand-derived expected values. DO NOT edit without re-computing the expected block using the formula in test_vault_parity.py docstring.",
+  "positions": [
+    {
+      "id": "pos-vwce",
+      "ticker": "VWCE.DE",
+      "shares": 100.0,
+      "buy_price": 95.0,
+      "currency": "EUR",
+      "purchase_base_rate": 1.08,
+      "account_id": "acc-1",
+      "exclude_from_totals": false,
+      "_note": "EUR position with purchase_base_rate: cost uses 1.08, value uses live EUR→EUR=1.0"
+    },
+    {
+      "id": "pos-aapl-lot1",
+      "ticker": "AAPL",
+      "shares": 50.0,
+      "buy_price": 150.0,
+      "currency": "USD",
+      "purchase_base_rate": null,
+      "account_id": "acc-1",
+      "exclude_from_totals": false,
+      "_note": "USD lot 1, no purchase_base_rate → cost and value use live USDEUR=0.875"
+    },
+    {
+      "id": "pos-nesn",
+      "ticker": "NESN.SW",
+      "shares": 20.0,
+      "buy_price": 100.0,
+      "currency": "CHF",
+      "purchase_base_rate": 0.95,
+      "account_id": "acc-1",
+      "exclude_from_totals": false,
+      "_note": "CHF position with purchase_base_rate: cost=20*100*0.95, value uses USDEUR/USDCHF pivot"
+    },
+    {
+      "id": "pos-barc",
+      "ticker": "BARC.L",
+      "shares": 100.0,
+      "buy_price": 200.0,
+      "currency": "GBP",
+      "purchase_base_rate": null,
+      "account_id": "acc-1",
+      "exclude_from_totals": false,
+      "_note": "GBP position, no purchase_base_rate → cost and value use USDEUR/USDGBP pivot"
+    },
+    {
+      "id": "pos-msft",
+      "ticker": "MSFT",
+      "shares": 30.0,
+      "buy_price": 280.0,
+      "currency": "USD",
+      "purchase_base_rate": 0.88,
+      "account_id": "acc-1",
+      "exclude_from_totals": false,
+      "_note": "USD position with purchase_base_rate=0.88 for cost basis"
+    },
+    {
+      "id": "pos-aapl-lot2",
+      "ticker": "AAPL",
+      "shares": 20.0,
+      "buy_price": 160.0,
+      "currency": "USD",
+      "purchase_base_rate": null,
+      "account_id": "acc-1",
+      "exclude_from_totals": false,
+      "_note": "AAPL lot 2 (multi-lot same ticker) — same price dict used via get_prices_batch"
+    },
+    {
+      "id": "pos-exclude1",
+      "ticker": "EXCLUDE_ME",
+      "shares": 5.0,
+      "buy_price": 50.0,
+      "currency": "USD",
+      "purchase_base_rate": null,
+      "account_id": "acc-1",
+      "exclude_from_totals": true,
+      "_note": "Excluded from totals — must NOT contribute to total/pnl (S6-B)"
+    },
+    {
+      "id": "pos-exclude2",
+      "ticker": "VOW3.DE",
+      "shares": 40.0,
+      "buy_price": 80.0,
+      "currency": "EUR",
+      "purchase_base_rate": 1.0,
+      "account_id": "acc-1",
+      "exclude_from_totals": true,
+      "_note": "EUR excluded position — must NOT contribute to total/pnl (S6-B)"
+    }
+  ],
+  "prices": {
+    "VWCE.DE": {
+      "ticker": "VWCE.DE",
+      "price": 110.0,
+      "currency": "EUR",
+      "previous_close": 109.0,
+      "change_pct_day": 0.917431,
+      "source": "fixture"
+    },
+    "AAPL": {
+      "ticker": "AAPL",
+      "price": 180.0,
+      "currency": "USD",
+      "previous_close": 178.5,
+      "change_pct_day": 0.840336,
+      "source": "fixture"
+    },
+    "NESN.SW": {
+      "ticker": "NESN.SW",
+      "price": 105.0,
+      "currency": "CHF",
+      "previous_close": 104.0,
+      "change_pct_day": 0.961538,
+      "source": "fixture"
+    },
+    "BARC.L": {
+      "ticker": "BARC.L",
+      "price": 220.0,
+      "currency": "GBP",
+      "previous_close": 218.0,
+      "change_pct_day": 0.917431,
+      "source": "fixture"
+    },
+    "MSFT": {
+      "ticker": "MSFT",
+      "price": 300.0,
+      "currency": "USD",
+      "previous_close": 298.0,
+      "change_pct_day": 0.671141,
+      "source": "fixture"
+    },
+    "EXCLUDE_ME": {
+      "ticker": "EXCLUDE_ME",
+      "price": 55.0,
+      "currency": "USD",
+      "previous_close": 54.0,
+      "change_pct_day": 1.851852,
+      "source": "fixture"
+    },
+    "VOW3.DE": {
+      "ticker": "VOW3.DE",
+      "price": 95.0,
+      "currency": "EUR",
+      "previous_close": 94.0,
+      "change_pct_day": 1.063830,
+      "source": "fixture"
+    }
+  },
+  "forex": {
+    "USDEUR": 0.875,
+    "USDCHF": 0.885,
+    "USDGBP": 0.79
+  },
+  "expected": {
+    "_derivation": "Hand-computed using USD-pivot formula. See test_vault_parity.py docstring for full arithmetic. Tolerance ±0.01 EUR.",
+    "total_value_eur": 56343.36,
+    "pnl_total_eur": 5276.96,
+    "pnl_day_eur": 485.67,
+    "position_count": 6
+  }
+}
