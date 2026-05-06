@@ -26,8 +26,9 @@ import pytest
 
 LOCAL_DB_DSN = "postgresql://postgres:postgres@127.0.0.1:54322/postgres"
 
-# portfolio-tracker root (one level above `api/`) — where `supabase/config.toml` lives.
-REPO_ROOT = Path(__file__).resolve().parents[2]
+# Frontend repo root — where `supabase/config.toml` + migrations live.
+# Backend is hermano del frontend post-rename 2026-05-06: /home/perrr51/ratiovault/{ratiovault-front,ratiovault-back}
+REPO_ROOT = Path(__file__).resolve().parents[2] / "ratiovault-front"
 
 
 def _run(cmd: list[str], *, capture: bool = True, check: bool = True, timeout: int | None = None) -> subprocess.CompletedProcess:
