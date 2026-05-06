@@ -5,7 +5,7 @@ import time
 import httpx
 import yfinance as yf
 from fastapi import APIRouter, HTTPException, Request
-from deps import limiter, logger, _forex_cache, FOREX_CACHE_TTL
+from deps import limiter, logger, _forex_cache, FOREX_CACHE_TTL, get_forex_rates as _get_forex_rates_from_deps
 from validators import QuotesRequest, SearchRequest
 from utils import _safe_float
 from stooq import should_try_stooq, fetch_stooq_quote_cached
@@ -278,83 +278,10 @@ def get_forex_rates(request: Request):
     Returns: { "USDEUR": rate, "USDCHF": rate, "USDGBP": rate, ... }
     Returns HTTP 503 if no rates could be resolved.
 
-    B-007: results cached in-process for 30 minutes. yfinance + Stooq only
-    refresh once per TTL window across all users; reduces upstream load and
-    page-load latency significantly on the shared VPS.
+    B-007: results cached in-process for 30 minutes via deps.get_forex_rates().
+    vault_snapshot.py also reads from the same cache, so both surfaces stay in sync (T1.1 / S2).
     """
-    # B-007: serve from cache while fresh.
-    cached = _forex_cache.get("rates")
-    if cached and (time.time() - cached["ts"]) < FOREX_CACHE_TTL:
-        return cached["data"]
-
-    try:
-        # Pairs where ticker gives "how many USD per 1 unit" (e.g. EURUSD=X -> 1 EUR = X USD)
-        # We invert these to get USDEUR (1 USD = X EUR)
-        invert_pairs = {
-            "EURUSD=X": "USDEUR",
-            "GBPUSD=X": "USDGBP",
-            "AUDUSD=X": "USDAUD",
-        }
-        # Pairs where ticker gives "how many units per 1 USD" (e.g. USDCHF=X -> 1 USD = X CHF)
-        direct_pairs = {
-            "USDCHF=X": "USDCHF",
-            "USDJPY=X": "USDJPY",
-            "USDCAD=X": "USDCAD",
-            "USDSEK=X": "USDSEK",
-            "USDNOK=X": "USDNOK",
-            "USDDKK=X": "USDDKK",
-        }
-
-        all_tickers = list(invert_pairs.keys()) + list(direct_pairs.keys())
-        pairs = yf.Tickers(" ".join(all_tickers))
-
-        result = {}
-
-        for yf_ticker, key in invert_pairs.items():
-            try:
-                fi = pairs.tickers[yf_ticker].fast_info
-                rate = fi.get("lastPrice", 0) or fi.get("previousClose", 0) or 0
-                if rate and rate > 0:
-                    result[key] = round(1 / rate, 6)
-            except (KeyError, AttributeError, httpx.HTTPError) as e:
-                # B-009: per-pair failures are non-fatal; we fall back to
-                # Stooq below for the missing pair.
-                logger.warning("forex fetch failed for %s: %s", yf_ticker, e, exc_info=False)
-
-        for yf_ticker, key in direct_pairs.items():
-            try:
-                fi = pairs.tickers[yf_ticker].fast_info
-                rate = fi.get("lastPrice", 0) or fi.get("previousClose", 0) or 0
-                if rate and rate > 0:
-                    result[key] = round(rate, 6)
-            except (KeyError, AttributeError, httpx.HTTPError) as e:
-                logger.warning("forex fetch failed for %s: %s", yf_ticker, e, exc_info=False)
-
-        # Stooq fallback for any forex pairs that yfinance failed to return
-        all_pairs = {**invert_pairs, **direct_pairs}
-        for yf_ticker, key in all_pairs.items():
-            if key not in result:
-                stooq_data = fetch_stooq_quote_cached(yf_ticker)
-                if stooq_data and stooq_data['price'] > 0:
-                    rate = stooq_data['price']
-                    if yf_ticker in invert_pairs:
-                        result[key] = round(1 / rate, 6)
-                    else:
-                        result[key] = round(rate, 6)
-                    logger.info(f"Forex fallback: {yf_ticker} -> {key} = {result[key]} (stooq)")
-
-        # GBX (pence) = GBP / 100
-        if "USDGBP" in result:
-            result["USDGBX"] = round(result["USDGBP"] * 100, 6)
-
-        if not result:
-            raise HTTPException(status_code=503, detail="No forex rates could be resolved")
-
-        # B-007: store in process-wide cache.
-        _forex_cache["rates"] = {"data": result, "ts": time.time()}
-        return result
-    except HTTPException:
-        raise  # Re-raise 503
-    except Exception as e:
-        logger.error(f"Error fetching forex rates: {e}")
-        raise HTTPException(status_code=503, detail="Forex service temporarily unavailable")
+    result = _get_forex_rates_from_deps()
+    if not result:
+        raise HTTPException(status_code=503, detail="No forex rates could be resolved")
+    return result
