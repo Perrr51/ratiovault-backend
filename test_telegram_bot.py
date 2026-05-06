@@ -411,6 +411,124 @@ def test_vault_callback_calls_snapshot_and_edits_message(client):
     assert any("editMessageText" in u for u in urls) or any("answerCallbackQuery" in u for u in urls)
 
 
+# ── T2.4: vault_refresh button in keyboard ────────────────────────────────────
+
+
+class TestVaultRefreshButton:
+    """Vault replies must include 🔄 Actualizar precios button (T2.4 / S5 I5.1-I5.2)."""
+
+    def test_single_account_vault_has_refresh_button(self, client):
+        """Single-account /vault reply keyboard includes vault_refresh button."""
+        update = _make_message("/vault")
+        mock_cls, mock_instance = _httpx_mock_client()
+
+        mock_supa = MagicMock()
+        mock_supa.table.return_value.select.return_value.eq.return_value.limit.return_value.execute.return_value.data = [
+            {"base_currency": "EUR"}
+        ]
+        mock_supa.table.return_value.select.return_value.eq.return_value.execute.return_value.data = [
+            {"id": "acc-1", "name": "DEGIRO"}
+        ]
+
+        mock_snapshot = {
+            "total": 10000.0, "pnl_total": 500.0, "pnl_day": 50.0,
+            "top_up": None, "top_down": None, "position_count": 5, "base_currency": "EUR",
+        }
+
+        with (
+            patch("routers.telegram_bot.resolve_user_by_chat", return_value={"user_id": "u1", "locale": "es"}),
+            patch("routers.telegram_bot.telegram_rate_limit.should_serve", return_value=(True, None)),
+            patch("routers.telegram_bot.get_supabase_service", return_value=mock_supa),
+            patch("routers.telegram_bot.get_vault_snapshot", return_value=mock_snapshot),
+            patch("routers.telegram_bot.httpx.Client", mock_cls),
+        ):
+            r = client.post("/telegram/webhook", headers=_secret_header(), json=update)
+
+        assert r.status_code == 200
+        payload = mock_instance.post.call_args[1]["json"]
+        assert "reply_markup" in payload
+        keyboard = payload["reply_markup"]["inline_keyboard"]
+        flat_buttons = [btn for row in keyboard for btn in row]
+        refresh_btn = next((b for b in flat_buttons if "vault_refresh" in b.get("callback_data", "")), None)
+        assert refresh_btn is not None, "vault_refresh button not found in keyboard"
+        assert "🔄" in refresh_btn["text"] or "Actualizar" in refresh_btn["text"]
+        # callback_data must be ≤ 64 bytes
+        assert len(refresh_btn["callback_data"].encode()) <= 64
+
+    def test_multi_account_picker_has_refresh_all_button(self, client):
+        """Multi-account first render keyboard includes vault_refresh:all."""
+        update = _make_message("/vault")
+        mock_cls, mock_instance = _httpx_mock_client()
+
+        mock_supa = MagicMock()
+
+        def _table_side_effect(name):
+            tbl = MagicMock()
+            if name == "user_settings":
+                tbl.select.return_value.eq.return_value.limit.return_value.execute.return_value.data = [
+                    {"base_currency": "EUR"}
+                ]
+            elif name == "accounts":
+                tbl.select.return_value.eq.return_value.execute.return_value.data = [
+                    {"id": "acc-1", "name": "DEGIRO"},
+                    {"id": "acc-2", "name": "IB"},
+                ]
+            return tbl
+
+        mock_supa.table.side_effect = _table_side_effect
+
+        with (
+            patch("routers.telegram_bot.resolve_user_by_chat", return_value={"user_id": "u1", "locale": "es"}),
+            patch("routers.telegram_bot.telegram_rate_limit.should_serve", return_value=(True, None)),
+            patch("routers.telegram_bot.get_supabase_service", return_value=mock_supa),
+            patch("routers.telegram_bot.httpx.Client", mock_cls),
+        ):
+            r = client.post("/telegram/webhook", headers=_secret_header(), json=update)
+
+        assert r.status_code == 200
+        payload = mock_instance.post.call_args[1]["json"]
+        assert "reply_markup" in payload
+        keyboard = payload["reply_markup"]["inline_keyboard"]
+        flat_buttons = [btn for row in keyboard for btn in row]
+        callback_datas = [b.get("callback_data", "") for b in flat_buttons]
+        assert any("vault_refresh:all" in d for d in callback_datas)
+
+    def test_vault_callback_selected_account_has_refresh_button(self, client):
+        """Per-account callback view includes vault_refresh:<uuid> button."""
+        update = _make_callback("vault:acc-1")
+        mock_cls, mock_instance = _httpx_mock_client()
+
+        mock_supa = MagicMock()
+        mock_supa.table.return_value.select.return_value.eq.return_value.limit.return_value.execute.return_value.data = [
+            {"base_currency": "EUR"}
+        ]
+
+        mock_snapshot = {
+            "total": 5000.0, "pnl_total": 100.0, "pnl_day": 10.0,
+            "top_up": None, "top_down": None, "position_count": 3, "base_currency": "EUR",
+        }
+
+        with (
+            patch("routers.telegram_bot.resolve_user_by_chat", return_value={"user_id": "u1", "locale": "es"}),
+            patch("routers.telegram_bot.get_supabase_service", return_value=mock_supa),
+            patch("routers.telegram_bot.get_vault_snapshot", return_value=mock_snapshot),
+            patch("routers.telegram_bot.httpx.Client", mock_cls),
+        ):
+            r = client.post("/telegram/webhook", headers=_secret_header(), json=update)
+
+        assert r.status_code == 200
+        # Find editMessageText call (contains reply_markup)
+        calls = mock_instance.post.call_args_list
+        edit_calls = [c for c in calls if "editMessageText" in (c[0][0] if c[0] else "")]
+        # At minimum the answerCallbackQuery was called; we check for refresh button in any send/edit
+        all_payloads = [c[1].get("json", {}) for c in calls]
+        refresh_found = any(
+            "vault_refresh:acc-1" in str(p.get("reply_markup", ""))
+            for p in all_payloads
+        )
+        assert refresh_found, "vault_refresh:acc-1 button not found in any Telegram call"
+
+
 # ── T14: /watchlist ───────────────────────────────────────────────────────────
 
 
