@@ -21,6 +21,25 @@ logger = logging.getLogger(__name__)
 
 CACHE_TTL_MINUTES = 5
 
+# ── Stooq currency suffix map (T1.4 / S3) ─────────────────────────────────────
+# Mirrors market.py::_EXCHANGE_CURRENCY for consistent currency inference.
+# .L is GBP: Stooq returns GBP (not GBX) for London-listed instruments,
+# unlike Yahoo Finance which is ambiguous. Kept separate from market.py
+# to allow Stooq-specific overrides (e.g. .L inclusion here).
+_STOOQ_CURRENCY_BY_SUFFIX: dict[str, str] = {
+    ".DE": "EUR", ".F": "EUR", ".PA": "EUR", ".AS": "EUR",
+    ".MI": "EUR", ".MC": "EUR", ".BR": "EUR", ".LS": "EUR",
+    ".HE": "EUR", ".VI": "EUR", ".IR": "EUR",
+    ".SW": "CHF",
+    ".L":  "GBP",  # Stooq .L returns GBP (not GBX)
+    ".TO": "CAD",
+    ".AX": "AUD",
+    ".T":  "JPY",
+    ".ST": "SEK",
+    ".OL": "NOK",
+    ".CO": "DKK",
+}
+
 
 # ── Internal fetchers ──────────────────────────────────────────────────────────
 
@@ -56,7 +75,11 @@ def _fetch_yfinance(symbol: str) -> Optional[dict]:
 
 
 def _fetch_stooq(symbol: str) -> Optional[dict]:
-    """Fetch price via Stooq fallback. Returns shaped dict or None."""
+    """Fetch price via Stooq fallback. Returns shaped dict or None.
+
+    Currency is inferred from the ticker suffix using _STOOQ_CURRENCY_BY_SUFFIX
+    (T1.4 / S3). Unknown suffixes default to USD with a WARNING.
+    """
     try:
         raw = fetch_stooq_quote(symbol)
         if raw is None:
@@ -66,7 +89,20 @@ def _fetch_stooq(symbol: str) -> Optional[dict]:
         if not price:
             return None
 
-        currency = raw.get("currency", "USD")
+        # Infer currency from exchange suffix (last dot segment).
+        dot = symbol.rfind(".")
+        if dot >= 0:
+            suffix = symbol[dot:]
+            currency = _STOOQ_CURRENCY_BY_SUFFIX.get(suffix)
+            if currency is None:
+                logger.warning(
+                    "Stooq: unknown suffix %r for %s; defaulting to USD",
+                    suffix[1:], symbol,
+                )
+                currency = "USD"
+        else:
+            # No suffix → US equity, default USD
+            currency = "USD"
 
         return {
             "ticker": symbol,
