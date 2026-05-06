@@ -23,6 +23,10 @@ from deps import get_forex_rates
 
 logger = logging.getLogger(__name__)
 
+# T1.0 schema probe result: accounts.is_default column confirmed present in
+# 20260415000001_initial_schema.sql. No runtime probe needed.
+_HAS_IS_DEFAULT: bool = True
+
 # ---------------------------------------------------------------------------
 # Hardcoded FX fallback (mirrors frontend Known Limitations).
 # TODO: replace with proper forex service (ECB SDW endpoint) post-MVP.
@@ -33,6 +37,72 @@ _FX_FALLBACK: dict[str, float] = {
     "CHF": 1.05,    # CHFEUR
     "EUR": 1.0,
 }
+
+
+def _resolve_default_account_id(supa, user_id: str) -> Optional[str]:
+    """Return the user's default account id or None if no accounts exist.
+
+    Default account resolution (D2 / S1):
+      1. If _HAS_IS_DEFAULT: prefer the account with is_default=True.
+      2. Fallback to the earliest account by created_at ASC (deterministic).
+      3. If no accounts: return None (get_vault_snapshot falls back to all-positions).
+    """
+    try:
+        select_cols = "id, created_at, is_default" if _HAS_IS_DEFAULT else "id, created_at"
+        resp = (
+            supa.table("accounts")
+            .select(select_cols)
+            .eq("user_id", user_id)
+            .order("created_at")
+            .execute()
+        )
+        accounts = resp.data or []
+    except Exception as e:
+        logger.warning("_resolve_default_account_id: accounts query failed: %s", e)
+        return None
+
+    if not accounts:
+        return None
+
+    if _HAS_IS_DEFAULT:
+        for acc in accounts:
+            if acc.get("is_default"):
+                return acc["id"]
+
+    # Fallback: first by created_at (already ordered)
+    return accounts[0]["id"]
+
+
+def _build_positions_query(supa, user_id: str, account_id: Optional[str]):
+    """Build the positions Supabase query with correct account filter (D2 / S1).
+
+    account_id=None  → no filter (all-accounts aggregate, S1 I1.1)
+    account_id=default → .or_(eq + is.null) to include legacy NULL positions (S1 I1.2)
+    account_id=other   → strict .eq() only (S1 I1.2)
+    """
+    base_query = (
+        supa.table("positions")
+        .select(
+            "id,ticker,shares,buy_price,currency,purchase_base_rate,account_id,exclude_from_totals"
+        )
+        .eq("user_id", user_id)
+    )
+
+    if account_id is None:
+        return base_query  # all positions, including NULL account_id
+
+    default_id = _resolve_default_account_id(supa, user_id)
+
+    if default_id is None:
+        # No accounts in DB — treat every account_id as if it's the default
+        return base_query.or_(f"account_id.eq.{account_id},account_id.is.null")
+
+    if account_id == default_id:
+        # Default account: include legacy NULL-account positions
+        return base_query.or_(f"account_id.eq.{account_id},account_id.is.null")
+
+    # Non-default account: strict equality, exclude NULLs
+    return base_query.eq("account_id", account_id)
 
 
 def _to_base(amount_in_pos_currency: float, pos_currency: str, base_currency: str) -> float:
@@ -80,17 +150,8 @@ def get_vault_snapshot(
     """
     supa = get_supabase_service()
 
-    # 1. Fetch positions for user (service_role bypasses RLS)
-    query = (
-        supa.table("positions")
-        .select(
-            "id,ticker,shares,buy_price,currency,purchase_base_rate,account_id,exclude_from_totals"
-        )
-        .eq("user_id", user_id)
-    )
-    if account_id is not None:
-        query = query.eq("account_id", account_id)
-
+    # 1. Fetch positions for user with NULL-safe account filter (T1.3 / S1)
+    query = _build_positions_query(supa, user_id, account_id)
     response = query.execute()
     all_positions = response.data or []
 

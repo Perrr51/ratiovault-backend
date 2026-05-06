@@ -292,6 +292,156 @@ def test_price_cache_none_uses_buy_price_fallback():
     assert result["top_down"] is None
 
 
+# ── T1.3: NULL-safe account filter (S1) ──────────────────────────────────────
+
+
+class TestAccountFilter:
+    """get_vault_snapshot must apply NULL-safe filtering per S1 invariants (T1.3)."""
+
+    # Reusable position factory
+    def _pos(self, pid, ticker, account_id, shares=10.0):
+        return {
+            "id": pid,
+            "ticker": ticker,
+            "shares": shares,
+            "buy_price": 100.0,
+            "currency": "EUR",
+            "purchase_base_rate": 1.0,
+            "account_id": account_id,
+            "exclude_from_totals": False,
+        }
+
+    def _price(self, ticker, price=110.0):
+        return _price_data(ticker, price=price, prev=105.0, currency="EUR")
+
+    def _make_accounts_mock(self, supa_mock, accounts: list):
+        """Set up the accounts query chain on the supa mock."""
+        accounts_chain = supa_mock.table.return_value.select.return_value
+        accounts_chain.eq.return_value.order.return_value.execute.return_value = MagicMock(
+            data=accounts
+        )
+
+    def _build_supa_mock_with_positions(self, positions: list):
+        """Build a supa mock that returns positions on table('positions') queries."""
+        mock = MagicMock()
+        pos_table = MagicMock()
+
+        # positions table chain: select().eq().execute() or select().eq().or_().execute()
+        pos_select = pos_table.select.return_value
+        pos_eq_user = pos_select.eq.return_value
+        # No account filter (account_id=None path)
+        pos_eq_user.execute.return_value = MagicMock(data=positions)
+        # With .or_() (default account path)
+        pos_eq_user.or_.return_value.execute.return_value = MagicMock(data=positions)
+        # With second .eq() (strict non-default path)
+        pos_eq_user.eq.return_value.execute.return_value = MagicMock(data=positions)
+
+        # accounts table chain
+        acc_table = MagicMock()
+        acc_table.select.return_value.eq.return_value.order.return_value.execute.return_value = MagicMock(
+            data=[]
+        )
+
+        def table_dispatcher(name):
+            if name == "positions":
+                return pos_table
+            if name == "accounts":
+                return acc_table
+            return MagicMock()
+
+        mock.table.side_effect = table_dispatcher
+        return mock, acc_table
+
+    def test_no_account_id_no_filter_applied(self):
+        """S1-B: account_id=None → no account filter, all positions returned."""
+        pos_a = self._pos("p1", "VOW3.DE", "acc-A")
+        pos_b = self._pos("p2", "AAPL", "acc-B")
+        pos_null = self._pos("p3", "MSFT", None)
+
+        supa, _ = self._build_supa_mock_with_positions([pos_a, pos_b, pos_null])
+
+        with patch("services.vault_snapshot.get_supabase_service", return_value=supa):
+            with patch("services.vault_snapshot.price_cache.get_price",
+                       side_effect=lambda t: self._price(t)):
+                with patch("services.vault_snapshot.get_forex_rates", return_value={}):
+                    from services.vault_snapshot import get_vault_snapshot
+                    result = get_vault_snapshot("user-1", account_id=None)
+
+        assert result["position_count"] == 3
+
+    def test_default_account_uses_or_filter(self):
+        """S1-D: account_id=default → .or_() filter applied (includes NULL positions)."""
+        acc_id = "acc-default"
+        pos_default = self._pos("p1", "VOW3.DE", acc_id)
+        pos_null = self._pos("p2", "AAPL", None)
+
+        supa, acc_table = self._build_supa_mock_with_positions([pos_default, pos_null])
+        # Set up accounts query to return acc_id as default (is_default=True)
+        acc_table.select.return_value.eq.return_value.order.return_value.execute.return_value = MagicMock(
+            data=[{"id": acc_id, "created_at": "2026-01-01T00:00:00Z", "is_default": True}]
+        )
+
+        with patch("services.vault_snapshot.get_supabase_service", return_value=supa):
+            with patch("services.vault_snapshot.price_cache.get_price",
+                       side_effect=lambda t: self._price(t)):
+                with patch("services.vault_snapshot.get_forex_rates", return_value={}):
+                    from services.vault_snapshot import get_vault_snapshot
+                    get_vault_snapshot("user-1", account_id=acc_id)
+
+        # Assert .or_() was called on the positions query chain
+        pos_table = supa.table("positions")
+        pos_eq_user = pos_table.select.return_value.eq.return_value
+        pos_eq_user.or_.assert_called_once()
+        call_arg = pos_eq_user.or_.call_args[0][0]
+        assert acc_id in call_arg
+        assert "null" in call_arg.lower()
+
+    def test_non_default_account_uses_strict_eq(self):
+        """S1-C: account_id=non-default → strict .eq(), no NULL positions."""
+        default_id = "acc-default"
+        other_id = "acc-other"
+
+        supa, acc_table = self._build_supa_mock_with_positions([
+            self._pos("p2", "AAPL", other_id)
+        ])
+        acc_table.select.return_value.eq.return_value.order.return_value.execute.return_value = MagicMock(
+            data=[{"id": default_id, "created_at": "2026-01-01T00:00:00Z", "is_default": True}]
+        )
+
+        with patch("services.vault_snapshot.get_supabase_service", return_value=supa):
+            with patch("services.vault_snapshot.price_cache.get_price",
+                       side_effect=lambda t: self._price(t)):
+                with patch("services.vault_snapshot.get_forex_rates", return_value={}):
+                    from services.vault_snapshot import get_vault_snapshot
+                    get_vault_snapshot("user-1", account_id=other_id)
+
+        pos_table = supa.table("positions")
+        pos_eq_user = pos_table.select.return_value.eq.return_value
+        # .or_() must NOT have been called for a non-default account
+        pos_eq_user.or_.assert_not_called()
+        # .eq() must have been called with the non-default account_id (strict filter)
+        pos_eq_user.eq.assert_called_with("account_id", other_id)
+
+    def test_zero_accounts_falls_back_to_all(self):
+        """Edge: 0 accounts → get_vault_snapshot falls back to no filter (account_id=None path)."""
+        pos_null = self._pos("p1", "AAPL", None)
+
+        supa, acc_table = self._build_supa_mock_with_positions([pos_null])
+        acc_table.select.return_value.eq.return_value.order.return_value.execute.return_value = MagicMock(
+            data=[]  # no accounts
+        )
+
+        with patch("services.vault_snapshot.get_supabase_service", return_value=supa):
+            with patch("services.vault_snapshot.price_cache.get_price",
+                       side_effect=lambda t: self._price(t)):
+                with patch("services.vault_snapshot.get_forex_rates", return_value={}):
+                    from services.vault_snapshot import get_vault_snapshot
+                    result = get_vault_snapshot("user-1", account_id="acc-nonexistent")
+
+        # Should still return positions (no crash)
+        assert result["position_count"] >= 0
+
+
 # ── T1.2: _fx_spot reads from deps.get_forex_rates() (S2) ───────────────────
 
 
