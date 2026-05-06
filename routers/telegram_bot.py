@@ -74,31 +74,50 @@ def _tg_send(chat_id: str | int, text: str, reply_markup: dict | None = None) ->
         logger.warning("sendMessage exception: %s", exc)
 
 
-def _tg_edit_message(chat_id: str | int, message_id: int, text: str) -> None:
+def _tg_edit_message(
+    chat_id: str | int,
+    message_id: int,
+    text: str,
+    reply_markup: dict | None = None,
+) -> None:
     """Edit an existing message text (used after callback_query handling)."""
     if not settings.telegram_bot_token:
         return
     url = f"{_TG_API_BASE}/bot{settings.telegram_bot_token}/editMessageText"
+    payload: dict = {"chat_id": chat_id, "message_id": message_id, "text": text, "parse_mode": "HTML"}
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
     try:
         with httpx.Client(timeout=8.0) as client:
-            resp = client.post(
-                url,
-                json={"chat_id": chat_id, "message_id": message_id, "text": text, "parse_mode": "HTML"},
-            )
+            resp = client.post(url, json=payload)
             if not resp.is_success:
                 logger.warning("editMessageText failed: %s %s", resp.status_code, resp.text)
     except Exception as exc:  # noqa: BLE001
         logger.warning("editMessageText exception: %s", exc)
 
 
-def _tg_answer_callback(callback_query_id: str) -> None:
-    """Acknowledge a callback_query so Telegram stops showing the loading spinner."""
+def _tg_answer_callback(
+    callback_query_id: str,
+    text: str | None = None,
+    show_alert: bool = False,
+) -> None:
+    """Acknowledge a callback_query so Telegram stops showing the loading spinner.
+
+    Args:
+        text: Optional notification text shown to the user (toast or alert).
+        show_alert: If True, shows an alert dialog instead of a toast.
+    """
     if not settings.telegram_bot_token:
         return
     url = f"{_TG_API_BASE}/bot{settings.telegram_bot_token}/answerCallbackQuery"
+    payload: dict = {"callback_query_id": callback_query_id}
+    if text:
+        payload["text"] = text
+    if show_alert:
+        payload["show_alert"] = True
     try:
         with httpx.Client(timeout=5.0) as client:
-            client.post(url, json={"callback_query_id": callback_query_id})
+            client.post(url, json=payload)
     except Exception as exc:  # noqa: BLE001
         logger.warning("answerCallbackQuery exception: %s", exc)
 
@@ -316,17 +335,35 @@ def _handle_vault(chat_id: str | int) -> None:
 
     if len(accounts) <= 1:
         account_id = accounts[0]["id"] if accounts else None
+        scope = account_id or "all"
         snapshot = get_vault_snapshot(user_id, account_id=account_id, base_currency=base_currency)
-        _tg_send(chat_id, _format_vault(snapshot))
+        _tg_send(chat_id, _format_vault(snapshot), reply_markup=_vault_refresh_keyboard(scope))
     else:
-        # Multi-account: send inline keyboard
+        # Multi-account: send inline keyboard with account picker + refresh button
         buttons = [[{"text": acc["name"], "callback_data": f"vault:{acc['id']}"}] for acc in accounts]
         buttons.append([{"text": "📊 Todas las cuentas", "callback_data": "vault:all"}])
+        buttons.append([{"text": "🔄 Actualizar precios", "callback_data": "vault_refresh:all"}])
         _tg_send(
             chat_id,
             "¿Qué cuenta quieres ver?",
             reply_markup={"inline_keyboard": buttons},
         )
+
+
+def _vault_refresh_keyboard(scope: str) -> dict:
+    """Build an inline keyboard with a single 🔄 Actualizar precios button.
+
+    Args:
+        scope: 'all' for all-accounts view, or account UUID for specific account.
+    Returns:
+        Telegram reply_markup dict with one row containing the refresh button.
+        callback_data format: 'vault_refresh:{scope}' (max 64 bytes; UUIDs are 36 chars).
+    """
+    return {
+        "inline_keyboard": [
+            [{"text": "🔄 Actualizar precios", "callback_data": f"vault_refresh:{scope}"}]
+        ]
+    }
 
 
 def _format_vault(snapshot: dict) -> str:
@@ -625,13 +662,15 @@ def _handle_vault_callback(chat_id: int, message_id: int | None, account_id_str:
         logger.warning("Failed to fetch user_settings for user %s: %s", user_id, exc)
 
     account_id = None if account_id_str == "all" else account_id_str
+    scope = account_id_str  # keep "all" or the UUID for the refresh button
     snapshot = get_vault_snapshot(user_id, account_id=account_id, base_currency=base_currency)
     text = _format_vault(snapshot)
+    keyboard = _vault_refresh_keyboard(scope)
 
     if message_id:
-        _tg_edit_message(chat_id, message_id, text)
+        _tg_edit_message(chat_id, message_id, text, reply_markup=keyboard)
     else:
-        _tg_send(chat_id, text)
+        _tg_send(chat_id, text, reply_markup=keyboard)
 
 
 def _handle_watchlist_callback(chat_id: int, message_id: int | None, watchlist_id: str) -> None:
