@@ -9,6 +9,8 @@ RLS: disabled — service_role only.
 from __future__ import annotations
 
 import logging
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
@@ -191,3 +193,107 @@ def get_price(ticker: str) -> Optional[dict]:
     # 6. Upsert + return
     _upsert(result)
     return result
+
+
+def get_prices_batch(tickers: list[str]) -> dict[str, dict | None]:
+    """Return price dicts for multiple tickers in a single batch operation (T2.1 / S4).
+
+    Strategy:
+    1. Single Supabase IN query for all tickers (one round-trip).
+    2. Classify rows as fresh, stale, or missing.
+    3. Fetch stale/missing concurrently via ThreadPoolExecutor(max_workers=8).
+    4. Batch-upsert fetched rows back to Supabase.
+
+    Returns:
+        dict mapping ticker → price dict (same shape as get_price).
+        Failed individual fetches map to None — caller uses buy_price fallback.
+        Empty input → {} with no DB call.
+    """
+    if not tickers:
+        return {}
+
+    # Deduplicate while preserving order
+    unique: list[str] = list(dict.fromkeys(tickers))
+
+    supabase = get_supabase_service()
+
+    # Step 1: single IN query for all cached rows
+    cache_rows: dict[str, dict] = {}
+    try:
+        resp = supabase.table("price_cache").select("*").in_("ticker", unique).execute()
+        for row in (resp.data or []):
+            cache_rows[row["ticker"]] = row
+    except Exception as e:
+        logger.warning("price_cache batch SELECT failed: %s; all treated as misses", e)
+
+    # Step 2: classify fresh vs stale/missing
+    fresh: dict[str, dict] = {}
+    stale_or_missing: list[str] = []
+    for t in unique:
+        row = cache_rows.get(t)
+        if row and _is_fresh(row.get("fetched_at", "")):
+            fresh[t] = row
+        else:
+            stale_or_missing.append(t)
+
+    # Step 3: parallel fetch for misses/stale (per-snapshot ThreadPoolExecutor)
+    fetched: dict[str, dict | None] = {}
+    if stale_or_missing:
+        def _fetch_one(ticker: str) -> dict | None:
+            result = _fetch_yfinance(ticker)
+            if result is None:
+                result = _fetch_stooq(ticker)
+            return result
+
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            future_to_ticker = {ex.submit(_fetch_one, t): t for t in stale_or_missing}
+            for fut in as_completed(future_to_ticker):
+                t = future_to_ticker[fut]
+                try:
+                    data = fut.result(timeout=15)
+                    fetched[t] = data
+                except Exception as e:
+                    logger.warning("price fetch failed for %s: %s", t, e)
+                    fetched[t] = None  # caller uses buy_price fallback
+
+        # Step 4: batch upsert successful fetches
+        upsert_rows = [d for d in fetched.values() if d is not None]
+        if upsert_rows:
+            try:
+                supabase.table("price_cache").upsert(
+                    upsert_rows, on_conflict="ticker"
+                ).execute()
+            except Exception as e:
+                logger.warning("price_cache batch UPSERT failed: %s", e)
+
+    return {**fresh, **fetched}
+
+
+def invalidate_prices(tickers: list[str]) -> int:
+    """Delete price_cache rows for the given tickers (T2.2 / S5).
+
+    Idempotent: calling with already-absent tickers returns 0, no error.
+
+    Args:
+        tickers: list of ticker symbols to invalidate (deduplicated internally).
+
+    Returns:
+        Number of rows actually deleted.
+    """
+    if not tickers:
+        return 0
+
+    unique: list[str] = list(dict.fromkeys(tickers))
+    supabase = get_supabase_service()
+    try:
+        resp = (
+            supabase.table("price_cache").delete().in_("ticker", unique).execute()
+        )
+        deleted = len(resp.data or [])
+        logger.info(
+            "price_cache invalidated %d rows for %d tickers", deleted, len(unique)
+        )
+        return deleted
+    except Exception as e:
+        logger.error("price_cache invalidation failed: %s", e)
+        return 0
