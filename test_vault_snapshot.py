@@ -32,11 +32,17 @@ def clear_supabase_lru_cache():
     The singleton is cached via @lru_cache; without clearing it, a real
     Supabase client initialised by a previous test bleeds into subsequent tests
     even when we patch the factory function.
+
+    Also resets the forex cache between tests so that live yfinance calls
+    from a previous test don't bleed in when tests don't mock get_forex_rates.
     """
     import supabase_client
+    import deps
     supabase_client.get_supabase_service.cache_clear()
+    deps._forex_cache.clear()
     yield
     supabase_client.get_supabase_service.cache_clear()
+    deps._forex_cache.clear()
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -121,7 +127,7 @@ def test_multi_currency_usd_position_eur_base():
 
     Position: 5 shares of AAPL, buy_price=150 USD, purchase_base_rate=0.90.
     Current price from yfinance: 160 USD; yfinance returns currency="USD".
-    FX fallback USDEUR = 0.92.
+    FX fallback USDEUR = 0.92 (empty live rates → _FX_FALLBACK).
 
     cost_base = 5 * 150 * 0.90 = 675 EUR
     current_value = 5 * 160 * 0.92 = 736 EUR
@@ -141,8 +147,9 @@ def test_multi_currency_usd_position_eur_base():
 
     with patch("services.vault_snapshot.get_supabase_service", return_value=_make_supabase_mock([pos])):
         with patch("services.vault_snapshot.price_cache.get_price", return_value=price_info):
-            from services.vault_snapshot import get_vault_snapshot
-            result = get_vault_snapshot(user_id="user-2", base_currency="EUR")
+            with patch("services.vault_snapshot.get_forex_rates", return_value={}):
+                from services.vault_snapshot import get_vault_snapshot
+                result = get_vault_snapshot(user_id="user-2", base_currency="EUR")
 
     assert result["position_count"] == 1
     assert result["total"] == pytest.approx(736.0, abs=TOLERANCE)
@@ -189,12 +196,13 @@ def test_closed_position_not_counted():
 
     with patch("services.vault_snapshot.get_supabase_service", return_value=_make_supabase_mock([open_pos, closed_pos])):
         with patch("services.vault_snapshot.price_cache.get_price", side_effect=fake_get_price):
-            from services.vault_snapshot import get_vault_snapshot
-            result = get_vault_snapshot(user_id="user-3", base_currency="EUR")
+            with patch("services.vault_snapshot.get_forex_rates", return_value={}):
+                from services.vault_snapshot import get_vault_snapshot
+                result = get_vault_snapshot(user_id="user-3", base_currency="EUR")
 
     # Only MSFT counted
     assert result["position_count"] == 1
-    # MSFT: current_value = 10 * 310 * 0.92 = 2852
+    # MSFT: current_value = 10 * 310 * 0.92 = 2852 (uses _FX_FALLBACK since rates={})
     assert result["total"] == pytest.approx(2852.0, abs=TOLERANCE)
 
 
@@ -284,6 +292,105 @@ def test_price_cache_none_uses_buy_price_fallback():
     assert result["top_down"] is None
 
 
+# ── T1.2: _fx_spot reads from deps.get_forex_rates() (S2) ───────────────────
+
+
+class TestFxSpotAccessor:
+    """_fx_spot must use deps.get_forex_rates() as primary source (T1.2 / S2)."""
+
+    def test_fx_spot_uses_live_rates(self):
+        """When get_forex_rates() returns warm data, _fx_spot uses it (not _FX_FALLBACK)."""
+        from services.vault_snapshot import _fx_spot
+
+        live_rates = {"USDEUR": 0.875, "USDCHF": 0.885, "USDGBP": 0.79}
+        with patch("services.vault_snapshot.get_forex_rates", return_value=live_rates):
+            result = _fx_spot("USD", "EUR")
+
+        # Live rate: 1 USD = 0.875 EUR
+        assert abs(result - 0.875) < 1e-9
+
+    def test_fx_spot_falls_back_to_fallback_on_empty_rates(self, caplog):
+        """When get_forex_rates() returns {}, _fx_spot uses _FX_FALLBACK and logs WARNING."""
+        import logging
+        from services.vault_snapshot import _fx_spot
+
+        with patch("services.vault_snapshot.get_forex_rates", return_value={}):
+            with caplog.at_level(logging.WARNING, logger="services.vault_snapshot"):
+                result = _fx_spot("USD", "EUR")
+
+        # _FX_FALLBACK["USD"] = 0.92
+        assert abs(result - 0.92) < 1e-9
+        assert any("fallback" in r.message.lower() or "forex" in r.message.lower()
+                   for r in caplog.records)
+
+    def test_fx_spot_eur_to_eur_identity(self):
+        """EUR→EUR always returns 1.0 regardless of rates."""
+        from services.vault_snapshot import _fx_spot
+
+        with patch("services.vault_snapshot.get_forex_rates", return_value={}):
+            result = _fx_spot("EUR", "EUR")
+        assert result == 1.0
+
+    def test_fx_spot_chf_to_eur_live(self):
+        """CHF→EUR uses USDEUR/USDCHF pivot from live rates."""
+        from services.vault_snapshot import _fx_spot
+
+        live_rates = {"USDEUR": 0.875, "USDCHF": 0.885}
+        with patch("services.vault_snapshot.get_forex_rates", return_value=live_rates):
+            result = _fx_spot("CHF", "EUR")
+
+        # CHF→EUR = USDEUR / USDCHF = 0.875 / 0.885
+        expected = 0.875 / 0.885
+        assert abs(result - expected) < 1e-6
+
+    def test_snapshot_uses_live_forex_in_total(self):
+        """Full snapshot with live forex rates produces correct total (S2-A)."""
+        pos = {
+            "id": "pos-live-fx",
+            "ticker": "AAPL",
+            "shares": 10.0,
+            "buy_price": 150.0,
+            "currency": "USD",
+            "purchase_base_rate": None,
+            "account_id": None,
+            "exclude_from_totals": False,
+        }
+        price_info = _price_data("AAPL", price=180.0, prev=175.0, currency="USD")
+        live_rates = {"USDEUR": 0.875, "USDCHF": 0.885}
+
+        with patch("services.vault_snapshot.get_supabase_service", return_value=_make_supabase_mock([pos])):
+            with patch("services.vault_snapshot.price_cache.get_price", return_value=price_info):
+                with patch("services.vault_snapshot.get_forex_rates", return_value=live_rates):
+                    from services.vault_snapshot import get_vault_snapshot
+                    result = get_vault_snapshot(user_id="user-fx", base_currency="EUR")
+
+        # current_value = 10 * 180 * 0.875 = 1575 EUR (live rate, not 0.92 fallback)
+        assert result["total"] == pytest.approx(1575.0, abs=TOLERANCE)
+
+    def test_snapshot_fallback_on_empty_forex(self):
+        """When live forex is empty, snapshot uses _FX_FALLBACK and still returns (S2-C)."""
+        pos = {
+            "id": "pos-fallback-fx",
+            "ticker": "AAPL",
+            "shares": 10.0,
+            "buy_price": 150.0,
+            "currency": "USD",
+            "purchase_base_rate": None,
+            "account_id": None,
+            "exclude_from_totals": False,
+        }
+        price_info = _price_data("AAPL", price=180.0, prev=175.0, currency="USD")
+
+        with patch("services.vault_snapshot.get_supabase_service", return_value=_make_supabase_mock([pos])):
+            with patch("services.vault_snapshot.price_cache.get_price", return_value=price_info):
+                with patch("services.vault_snapshot.get_forex_rates", return_value={}):
+                    from services.vault_snapshot import get_vault_snapshot
+                    result = get_vault_snapshot(user_id="user-fallback", base_currency="EUR")
+
+        # Falls back to _FX_FALLBACK["USD"] = 0.92
+        assert result["total"] == pytest.approx(1656.0, abs=TOLERANCE)  # 10 * 180 * 0.92
+
+
 # ── Edge case 7: purchase_base_rate=None → current FX fallback ───────────────
 
 
@@ -312,11 +419,12 @@ def test_missing_purchase_base_rate_falls_back_to_current_fx():
 
     with patch("services.vault_snapshot.get_supabase_service", return_value=_make_supabase_mock([pos])):
         with patch("services.vault_snapshot.price_cache.get_price", return_value=price_info):
-            from services.vault_snapshot import get_vault_snapshot
-            result = get_vault_snapshot(user_id="user-7", base_currency="EUR")
+            with patch("services.vault_snapshot.get_forex_rates", return_value={}):
+                from services.vault_snapshot import get_vault_snapshot
+                result = get_vault_snapshot(user_id="user-7", base_currency="EUR")
 
     assert result["position_count"] == 1
     assert result["total"] == pytest.approx(2024.0, abs=TOLERANCE)
     assert result["pnl_total"] == pytest.approx(184.0, abs=TOLERANCE)
-    # day_pnl = (220-210)*10*0.92 = 92
+    # day_pnl = (220-210)*10*0.92 = 92 (uses _FX_FALLBACK since rates={})
     assert result["pnl_day"] == pytest.approx(92.0, abs=TOLERANCE)
