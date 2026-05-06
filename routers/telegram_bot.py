@@ -1,12 +1,13 @@
-"""Telegram webhook receiver — T11 skeleton.
+"""Telegram webhook receiver — T12-T17 full command dispatcher.
+
+# TODO T18: extract strings to i18n with locale lookup per chat.
+# All Spanish strings are hardcoded here for now.
 
 POST /telegram/webhook
   - Auth: X-Telegram-Bot-Api-Secret-Token header must match settings.telegram_webhook_secret.
   - Always returns 200 on auth-pass (Telegram retries on non-200; ack fast).
   - Dispatches to handle_update() for command routing.
   - Replies via httpx POST to Telegram sendMessage (not python-telegram-bot for sends).
-
-T12-T17 fill in the remaining command handlers.
 """
 from __future__ import annotations
 
@@ -21,18 +22,37 @@ from services.telegram_link import (
     TokenInvalidOrExpired,
     UserAlreadyLinked,
     consume_link_token,
+    delete_link,
+    resolve_user_by_chat,
+    update_locale,
 )
+from services import telegram_rate_limit
+from services.vault_snapshot import get_vault_snapshot
+from services.price_cache import get_price
+from supabase_client import get_supabase_service
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["telegram-bot"])
 
-# ── Telegram API helper ────────────────────────────────────────────────────────
+# ── Telegram API helpers ───────────────────────────────────────────────────────
 
 _TG_API_BASE = "https://api.telegram.org"
 
+_VALID_LOCALES = {"es", "en", "de", "fr", "it"}
 
-def _tg_send(chat_id: str | int, text: str) -> None:
+_HELP_TEXT = (
+    "📋 <b>Comandos disponibles:</b>\n\n"
+    "/vault — Ver resumen de tu cartera\n"
+    "/watchlist — Ver tu watchlist\n"
+    "/precio AAPL — Precio de un ticker de tu watchlist\n"
+    "/idioma es|en|de|fr|it — Cambiar idioma del bot\n"
+    "/desvincular — Desvincular este Telegram de tu cuenta\n"
+    "/help — Mostrar esta ayuda"
+)
+
+
+def _tg_send(chat_id: str | int, text: str, reply_markup: dict | None = None) -> None:
     """Fire-and-forget sendMessage via httpx.
 
     Logs on failure but does NOT raise — webhook always returns 200.
@@ -41,31 +61,89 @@ def _tg_send(chat_id: str | int, text: str) -> None:
         logger.debug("telegram_bot_token not set; skipping sendMessage to %s", chat_id)
         return
     url = f"{_TG_API_BASE}/bot{settings.telegram_bot_token}/sendMessage"
+    payload: dict = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
     try:
         with httpx.Client(timeout=8.0) as client:
-            resp = client.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"})
+            resp = client.post(url, json=payload)
             if not resp.is_success:
                 logger.warning("sendMessage failed: %s %s", resp.status_code, resp.text)
     except Exception as exc:  # noqa: BLE001
         logger.warning("sendMessage exception: %s", exc)
 
 
+def _tg_edit_message(chat_id: str | int, message_id: int, text: str) -> None:
+    """Edit an existing message text (used after callback_query handling)."""
+    if not settings.telegram_bot_token:
+        return
+    url = f"{_TG_API_BASE}/bot{settings.telegram_bot_token}/editMessageText"
+    try:
+        with httpx.Client(timeout=8.0) as client:
+            resp = client.post(
+                url,
+                json={"chat_id": chat_id, "message_id": message_id, "text": text, "parse_mode": "HTML"},
+            )
+            if not resp.is_success:
+                logger.warning("editMessageText failed: %s %s", resp.status_code, resp.text)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("editMessageText exception: %s", exc)
+
+
+def _tg_answer_callback(callback_query_id: str) -> None:
+    """Acknowledge a callback_query so Telegram stops showing the loading spinner."""
+    if not settings.telegram_bot_token:
+        return
+    url = f"{_TG_API_BASE}/bot{settings.telegram_bot_token}/answerCallbackQuery"
+    try:
+        with httpx.Client(timeout=5.0) as client:
+            client.post(url, json={"callback_query_id": callback_query_id})
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("answerCallbackQuery exception: %s", exc)
+
+
+# ── Currency formatting helpers ────────────────────────────────────────────────
+
+_CURRENCY_SYMBOLS: dict[str, str] = {
+    "EUR": "€",
+    "USD": "$",
+    "GBP": "£",
+    "CHF": "CHF ",
+}
+
+
+def _fmt_currency(amount: float, currency: str) -> str:
+    """Format amount with currency symbol. E.g. 12345.67 EUR → '12.345,67 €'"""
+    sym = _CURRENCY_SYMBOLS.get(currency, f"{currency} ")
+    formatted = f"{abs(amount):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    sign = "+" if amount >= 0 else "-"
+    # For total (no sign needed), caller handles sign.
+    return f"{sym}{formatted}"
+
+
+def _fmt_signed(amount: float, currency: str) -> str:
+    sym = _CURRENCY_SYMBOLS.get(currency, f"{currency} ")
+    formatted = f"{abs(amount):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    sign = "+" if amount >= 0 else "-"
+    return f"{sign}{sym}{formatted}"
+
+
+def _fmt_pct(value: float) -> str:
+    return f"{'+' if value >= 0 else ''}{value:.1f}%"
+
+
 # ── Update dispatcher ──────────────────────────────────────────────────────────
 
 
 def handle_update(update: dict) -> None:
-    """Route an incoming Telegram update.
-
-    T11 skeleton: handles /start <token>, unknown commands, ignores the rest.
-    T12-T17 will extend this with /vault, /watchlist, /precio, etc.
-    """
+    """Route an incoming Telegram update."""
     message = update.get("message")
     callback_query = update.get("callback_query")
 
     if message:
         _handle_message(message)
     elif callback_query:
-        logger.info("telegram update: callback_query (not handled pre-T13)")
+        _handle_callback_query(callback_query)
     else:
         logger.info("telegram update: unknown type — keys=%s", list(update.keys()))
 
@@ -78,43 +156,478 @@ def _handle_message(message: dict) -> None:
 
     if text.startswith("/start"):
         _handle_start(message, text, chat_id)
+    elif text.startswith("/vault"):
+        _handle_vault(chat_id)
+    elif text.startswith("/watchlist"):
+        _handle_watchlist(chat_id)
+    elif text.startswith("/precio"):
+        _handle_precio(message, text, chat_id)
+    elif text.startswith("/desvincular"):
+        _handle_desvincular(chat_id)
+    elif text.startswith("/idioma"):
+        _handle_idioma(message, text, chat_id)
+    elif text.startswith("/help"):
+        _handle_help(chat_id)
     elif text.startswith("/"):
-        # T12-T17 not yet implemented
-        _tg_send(chat_id, "Comando no reconocido (pre-15). Disponible: /start &lt;token&gt;")
+        # T17 fallback — unknown command
+        _tg_send(chat_id, _HELP_TEXT)
     else:
-        # Non-command messages — ignore silently for now
-        logger.debug("telegram: non-command message ignored from chat_id=%s", chat_id)
+        # T17 fallback — non-command text
+        _tg_send(chat_id, _HELP_TEXT)
+
+
+# ── /start ─────────────────────────────────────────────────────────────────────
 
 
 def _handle_start(message: dict, text: str, chat_id: str | int | None) -> None:
-    """Handle /start <token> — consume link token and reply."""
+    """T12: Handle /start [token]."""
     parts = text.strip().split(None, 1)
     if len(parts) < 2 or not parts[1].strip():
-        _tg_send(chat_id, "Para vincular tu cuenta, usa el enlace generado en RatioVault → Ajustes → Telegram.")
+        _tg_send(
+            chat_id,
+            "¡Bienvenido a RatioVault! 👋\n\n"
+            "Para vincular tu cuenta, genera un enlace en <b>RatioVault → Ajustes → Telegram</b> "
+            "y ábrelo desde este chat.",
+        )
         return
 
     token = parts[1].strip()
-    # Detect locale from user's language_code if available
     user = message.get("from", {})
     lang = (user.get("language_code") or "en").split("-")[0].lower()
-    locale = lang if lang in ("es", "en", "de", "fr", "it") else "en"
+    locale = lang if lang in _VALID_LOCALES else "en"
 
     try:
         result = consume_link_token(token=token, chat_id=str(chat_id), locale=locale)
         logger.info("telegram: link consumed for user_id=%s chat_id=%s", result.get("user_id"), chat_id)
-        _tg_send(chat_id, "✅ Cuenta vinculada correctamente. Usa /help para ver los comandos disponibles.")
+        _tg_send(
+            chat_id,
+            "✓ Vinculado. Envía /vault para ver tu cartera, o /help para comandos.",
+        )
     except TokenInvalidOrExpired:
         logger.info("telegram: /start token invalid/expired for chat_id=%s", chat_id)
-        _tg_send(chat_id, "❌ El enlace ha expirado o ya fue usado. Genera uno nuevo desde Ajustes → Telegram.")
+        _tg_send(chat_id, "Enlace caducado o ya usado. Genera uno nuevo en /ajustes.")
     except UserAlreadyLinked:
         logger.info("telegram: /start user already linked for chat_id=%s", chat_id)
-        _tg_send(chat_id, "⚠️ Tu cuenta ya está vinculada. Si quieres desvincular, usa /desvincular.")
+        _tg_send(
+            chat_id,
+            "Tu cuenta RatioVault ya está vinculada a otro Telegram. "
+            "Envía /desvincular desde el chat anterior primero.",
+        )
     except ChatAlreadyLinked:
         logger.info("telegram: /start chat already linked for chat_id=%s", chat_id)
-        _tg_send(chat_id, "⚠️ Este chat ya está vinculado a otra cuenta.")
+        _tg_send(chat_id, "Este Telegram ya está vinculado a otra cuenta RatioVault.")
     except Exception as exc:  # noqa: BLE001
         logger.error("telegram: /start unexpected error for chat_id=%s: %s", chat_id, exc)
         _tg_send(chat_id, "❌ Error interno. Inténtalo de nuevo más tarde.")
+
+
+# ── /vault ─────────────────────────────────────────────────────────────────────
+
+
+def _handle_vault(chat_id: str | int) -> None:
+    """T13: Show vault snapshot with optional multi-account picker."""
+    user_info = resolve_user_by_chat(str(chat_id))
+    if user_info is None:
+        _tg_send(chat_id, "No vinculado. Genera enlace en /ajustes web.")
+        return
+
+    user_id = user_info["user_id"]
+
+    ok, reason = telegram_rate_limit.should_serve(user_id, int(chat_id), "vault")
+    if not ok:
+        if reason == "plan_exceeded":
+            _tg_send(
+                chat_id,
+                "Has agotado tus 5 consultas semanales gratis. "
+                "Hazte Pro: https://ratiovault.com/ajustes#subscription-heading",
+            )
+        else:
+            _tg_send(chat_id, "Espera un momento, estás enviando demasiados mensajes.")
+        return
+
+    supa = get_supabase_service()
+
+    # Fetch base_currency
+    base_currency = "EUR"
+    try:
+        us_resp = (
+            supa.table("user_settings")
+            .select("base_currency")
+            .eq("user_id", user_id)
+            .limit(1)
+            .execute()
+        )
+        if us_resp.data:
+            base_currency = us_resp.data[0].get("base_currency") or "EUR"
+    except Exception as exc:
+        logger.warning("Failed to fetch user_settings for user %s: %s", user_id, exc)
+
+    # Fetch accounts
+    try:
+        acc_resp = (
+            supa.table("accounts")
+            .select("id,name")
+            .eq("user_id", user_id)
+            .execute()
+        )
+        accounts = acc_resp.data or []
+    except Exception as exc:
+        logger.warning("Failed to fetch accounts for user %s: %s", user_id, exc)
+        accounts = []
+
+    if len(accounts) <= 1:
+        account_id = accounts[0]["id"] if accounts else None
+        snapshot = get_vault_snapshot(user_id, account_id=account_id, base_currency=base_currency)
+        _tg_send(chat_id, _format_vault(snapshot))
+    else:
+        # Multi-account: send inline keyboard
+        buttons = [[{"text": acc["name"], "callback_data": f"vault:{acc['id']}"}] for acc in accounts]
+        buttons.append([{"text": "📊 Todas las cuentas", "callback_data": "vault:all"}])
+        _tg_send(
+            chat_id,
+            "¿Qué cuenta quieres ver?",
+            reply_markup={"inline_keyboard": buttons},
+        )
+
+
+def _format_vault(snapshot: dict) -> str:
+    """Format vault snapshot as HTML string."""
+    base = snapshot.get("base_currency", "EUR")
+
+    if snapshot.get("position_count", 0) == 0:
+        return "Tu Vault está vacío. Importa CSV o añade posiciones desde /portfolio."
+
+    total = snapshot["total"]
+    pnl_total = snapshot["pnl_total"]
+    pnl_day = snapshot["pnl_day"]
+    pct_total = (pnl_total / (total - pnl_total) * 100) if (total - pnl_total) != 0 else 0.0
+    pct_day = (pnl_day / (total - pnl_day) * 100) if (total - pnl_day) != 0 else 0.0
+
+    lines = [
+        "📊 <b>Tu Vault</b>",
+        "",
+        f"Total: {_fmt_currency(total, base)}",
+        f"P&amp;L Total: {_fmt_signed(pnl_total, base)} ({_fmt_pct(pct_total)})",
+        f"P&amp;L Día: {_fmt_signed(pnl_day, base)} ({_fmt_pct(pct_day)})",
+    ]
+
+    top_up = snapshot.get("top_up")
+    top_down = snapshot.get("top_down")
+    if top_up or top_down:
+        lines.append("")
+        if top_up:
+            lines.append(f"📈 Mejor: {top_up['ticker']} ({_fmt_pct(top_up['change_pct'])})")
+        if top_down:
+            lines.append(f"📉 Peor: {top_down['ticker']} ({_fmt_pct(top_down['change_pct'])})")
+
+    lines.append("")
+    lines.append(f"Posiciones abiertas: {snapshot['position_count']}")
+
+    return "\n".join(lines)
+
+
+# ── /watchlist ──────────────────────────────────────────────────────────────────
+
+
+def _handle_watchlist(chat_id: str | int) -> None:
+    """T14: Show watchlist with optional multi-watchlist picker."""
+    user_info = resolve_user_by_chat(str(chat_id))
+    if user_info is None:
+        _tg_send(chat_id, "No vinculado. Genera enlace en /ajustes web.")
+        return
+
+    user_id = user_info["user_id"]
+
+    ok, reason = telegram_rate_limit.should_serve(user_id, int(chat_id), "watchlist")
+    if not ok:
+        if reason == "plan_exceeded":
+            _tg_send(
+                chat_id,
+                "Has agotado tus 5 consultas semanales gratis. "
+                "Hazte Pro: https://ratiovault.com/ajustes#subscription-heading",
+            )
+        else:
+            _tg_send(chat_id, "Espera un momento, estás enviando demasiados mensajes.")
+        return
+
+    supa = get_supabase_service()
+    try:
+        wl_resp = (
+            supa.table("watchlists")
+            .select("id,name,tickers")
+            .eq("user_id", user_id)
+            .execute()
+        )
+        watchlists = wl_resp.data or []
+    except Exception as exc:
+        logger.warning("Failed to fetch watchlists for user %s: %s", user_id, exc)
+        watchlists = []
+
+    if not watchlists:
+        _tg_send(chat_id, "Watchlist vacía, añade tickers desde /seguimiento web pulsando ⭐.")
+        return
+
+    if len(watchlists) == 1:
+        _tg_send(chat_id, _format_watchlist(watchlists[0]))
+    else:
+        buttons = [
+            [{"text": wl["name"], "callback_data": f"watchlist:{wl['id']}"}]
+            for wl in watchlists
+        ]
+        _tg_send(
+            chat_id,
+            "¿Qué watchlist quieres ver?",
+            reply_markup={"inline_keyboard": buttons},
+        )
+
+
+def _format_watchlist(watchlist: dict) -> str:
+    """Format watchlist with live prices."""
+    name = watchlist.get("name", "Watchlist")
+    tickers = watchlist.get("tickers") or []
+
+    if not tickers:
+        return f"<b>{name}</b>\n\nWatchlist vacía, añade tickers desde /seguimiento web pulsando ⭐."
+
+    lines = [f"⭐ <b>{name}</b>", ""]
+    for ticker in tickers:
+        price_data = get_price(ticker)
+        if price_data is None:
+            lines.append(f"{ticker}: sin datos")
+        else:
+            price = price_data["price"]
+            currency = price_data.get("currency", "")
+            change_pct = price_data.get("change_pct_day")
+            pct_str = f" ({_fmt_pct(change_pct)})" if change_pct is not None else ""
+            lines.append(f"{ticker}: {price:.2f} {currency}{pct_str}")
+
+    return "\n".join(lines)
+
+
+# ── /precio ─────────────────────────────────────────────────────────────────────
+
+
+def _handle_precio(message: dict, text: str, chat_id: str | int) -> None:
+    """T15: Show price for a ticker — only if it's in user's watchlist."""
+    parts = text.strip().split(None, 1)
+    if len(parts) < 2 or not parts[1].strip():
+        _tg_send(chat_id, "Uso: /precio AAPL")
+        return
+
+    ticker = parts[1].strip().upper()
+
+    user_info = resolve_user_by_chat(str(chat_id))
+    if user_info is None:
+        _tg_send(chat_id, "No vinculado. Genera enlace en /ajustes web.")
+        return
+
+    user_id = user_info["user_id"]
+
+    ok, reason = telegram_rate_limit.should_serve(user_id, int(chat_id), "precio")
+    if not ok:
+        if reason == "plan_exceeded":
+            _tg_send(
+                chat_id,
+                "Has agotado tus 5 consultas semanales gratis. "
+                "Hazte Pro: https://ratiovault.com/ajustes#subscription-heading",
+            )
+        else:
+            _tg_send(chat_id, "Espera un momento, estás enviando demasiados mensajes.")
+        return
+
+    # Verify ticker is in user's watchlists
+    supa = get_supabase_service()
+    try:
+        wl_resp = (
+            supa.table("watchlists")
+            .select("tickers")
+            .eq("user_id", user_id)
+            .execute()
+        )
+        watchlists = wl_resp.data or []
+    except Exception as exc:
+        logger.warning("Failed to fetch watchlists for price check, user %s: %s", user_id, exc)
+        watchlists = []
+
+    all_tickers = {t for wl in watchlists for t in (wl.get("tickers") or [])}
+    if ticker not in all_tickers:
+        _tg_send(
+            chat_id,
+            f"{ticker} no está en tu watchlist; añádelo desde /seguimiento web.",
+        )
+        return
+
+    price_data = get_price(ticker)
+    if price_data is None:
+        _tg_send(chat_id, f"No encuentro {ticker}; verifica símbolo (ej: VWCE.DE).")
+        return
+
+    price = price_data["price"]
+    currency = price_data.get("currency", "")
+    change_pct = price_data.get("change_pct_day")
+    pct_str = f" ({_fmt_pct(change_pct)})" if change_pct is not None else ""
+    _tg_send(chat_id, f"{ticker}: {price:.2f} {currency}{pct_str}")
+
+
+# ── /desvincular ───────────────────────────────────────────────────────────────
+
+
+def _handle_desvincular(chat_id: str | int) -> None:
+    """T16: Unlink Telegram from the user's account."""
+    user_info = resolve_user_by_chat(str(chat_id))
+    if user_info is None:
+        _tg_send(chat_id, "Este chat no está vinculado a ninguna cuenta RatioVault.")
+        return
+
+    user_id = user_info["user_id"]
+    try:
+        delete_link(user_id)
+        _tg_send(chat_id, "✓ Desvinculado. Datos Telegram borrados.")
+    except Exception as exc:
+        logger.error("telegram: /desvincular failed for user %s: %s", user_id, exc)
+        _tg_send(chat_id, "❌ Error al desvincular. Inténtalo de nuevo más tarde.")
+
+
+# ── /idioma ────────────────────────────────────────────────────────────────────
+
+_LOCALE_CONFIRMATIONS = {
+    "es": "✓ Idioma actualizado a Español.",
+    "en": "✓ Language updated to English.",
+    "de": "✓ Sprache auf Deutsch aktualisiert.",
+    "fr": "✓ Langue mise à jour en Français.",
+    "it": "✓ Lingua aggiornata in Italiano.",
+}
+
+
+def _handle_idioma(message: dict, text: str, chat_id: str | int) -> None:
+    """T16: Change bot language. Validates code, updates DB, replies in new locale."""
+    parts = text.strip().split(None, 1)
+    if len(parts) < 2 or not parts[1].strip():
+        _tg_send(chat_id, "Idiomas: es, en, de, fr, it.")
+        return
+
+    locale = parts[1].strip().lower()
+    if locale not in _VALID_LOCALES:
+        _tg_send(chat_id, "Idiomas: es, en, de, fr, it.")
+        return
+
+    user_info = resolve_user_by_chat(str(chat_id))
+    if user_info is None:
+        _tg_send(chat_id, "No vinculado. Genera enlace en /ajustes web.")
+        return
+
+    user_id = user_info["user_id"]
+    try:
+        update_locale(user_id, locale)
+        _tg_send(chat_id, _LOCALE_CONFIRMATIONS[locale])
+    except Exception as exc:
+        logger.error("telegram: /idioma update failed for user %s: %s", user_id, exc)
+        _tg_send(chat_id, "❌ Error al actualizar idioma. Inténtalo de nuevo.")
+
+
+# ── /help ──────────────────────────────────────────────────────────────────────
+
+
+def _handle_help(chat_id: str | int) -> None:
+    """T16: Static help text."""
+    _tg_send(chat_id, _HELP_TEXT)
+
+
+# ── callback_query handler ─────────────────────────────────────────────────────
+
+
+def _handle_callback_query(callback_query: dict) -> None:
+    """Handle inline keyboard callbacks (vault:<account_id|all>, watchlist:<id>)."""
+    callback_id = callback_query.get("id")
+    data: str = callback_query.get("data") or ""
+    from_chat = callback_query.get("message", {}).get("chat", {})
+    chat_id = from_chat.get("id")
+    message_id = callback_query.get("message", {}).get("message_id")
+
+    # Acknowledge to Telegram
+    if callback_id:
+        _tg_answer_callback(callback_id)
+
+    if not data or not chat_id:
+        return
+
+    if data.startswith("vault:"):
+        account_id_str = data[len("vault:"):]
+        _handle_vault_callback(chat_id, message_id, account_id_str)
+    elif data.startswith("watchlist:"):
+        watchlist_id = data[len("watchlist:"):]
+        _handle_watchlist_callback(chat_id, message_id, watchlist_id)
+    else:
+        logger.info("Unknown callback data: %r", data)
+
+
+def _handle_vault_callback(chat_id: int, message_id: int | None, account_id_str: str) -> None:
+    """Resolve vault snapshot for a specific account or all, edit the message."""
+    user_info = resolve_user_by_chat(str(chat_id))
+    if user_info is None:
+        _tg_send(chat_id, "No vinculado. Genera enlace en /ajustes web.")
+        return
+
+    user_id = user_info["user_id"]
+
+    supa = get_supabase_service()
+    base_currency = "EUR"
+    try:
+        us_resp = (
+            supa.table("user_settings")
+            .select("base_currency")
+            .eq("user_id", user_id)
+            .limit(1)
+            .execute()
+        )
+        if us_resp.data:
+            base_currency = us_resp.data[0].get("base_currency") or "EUR"
+    except Exception as exc:
+        logger.warning("Failed to fetch user_settings for user %s: %s", user_id, exc)
+
+    account_id = None if account_id_str == "all" else account_id_str
+    snapshot = get_vault_snapshot(user_id, account_id=account_id, base_currency=base_currency)
+    text = _format_vault(snapshot)
+
+    if message_id:
+        _tg_edit_message(chat_id, message_id, text)
+    else:
+        _tg_send(chat_id, text)
+
+
+def _handle_watchlist_callback(chat_id: int, message_id: int | None, watchlist_id: str) -> None:
+    """Fetch and display a specific watchlist by id, editing the message."""
+    user_info = resolve_user_by_chat(str(chat_id))
+    if user_info is None:
+        _tg_send(chat_id, "No vinculado. Genera enlace en /ajustes web.")
+        return
+
+    user_id = user_info["user_id"]
+
+    supa = get_supabase_service()
+    try:
+        wl_resp = (
+            supa.table("watchlists")
+            .select("id,name,tickers")
+            .eq("user_id", user_id)
+            .eq("id", watchlist_id)
+            .limit(1)
+            .execute()
+        )
+        rows = wl_resp.data or []
+    except Exception as exc:
+        logger.warning("watchlist fetch failed for callback: %s", exc)
+        rows = []
+
+    if not rows:
+        _tg_send(chat_id, "Watchlist no encontrada.")
+        return
+
+    text = _format_watchlist(rows[0])
+    if message_id:
+        _tg_edit_message(chat_id, message_id, text)
+    else:
+        _tg_send(chat_id, text)
 
 
 # ── Webhook endpoint ───────────────────────────────────────────────────────────
@@ -130,12 +643,10 @@ async def telegram_webhook(
     Auth: X-Telegram-Bot-Api-Secret-Token header must match settings.telegram_webhook_secret.
     Always returns 200 on auth-pass so Telegram does not retry.
     """
-    # Auth guard
     expected = settings.telegram_webhook_secret
     if not expected or x_telegram_bot_api_secret_token != expected:
         raise HTTPException(status_code=401, detail="invalid secret")
 
-    # Parse body — empty body = no-op (still 200)
     try:
         body = await request.json()
     except Exception:
@@ -146,7 +657,6 @@ async def telegram_webhook(
         try:
             handle_update(body)
         except Exception as exc:  # noqa: BLE001
-            # Log but never propagate — Telegram must receive 200
             logger.error("telegram handle_update raised: %s", exc, exc_info=True)
 
     return {"ok": True}

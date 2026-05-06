@@ -108,6 +108,45 @@ def init_link(user_id: str) -> dict:
     return {"deep_link_url": deep_link_url, "expires_at": expires_at}
 
 
+def resolve_user_by_chat(chat_id: str) -> dict | None:
+    """Returns {user_id, locale} or None if not linked."""
+    supa = get_supabase_service()
+    try:
+        result = (
+            supa.table("notification_channels")
+            .select("user_id,locale")
+            .eq("channel_id", str(chat_id))
+            .eq("channel", "telegram")
+            .limit(1)
+            .execute()
+        )
+    except APIError as exc:
+        logger.error("notification_channels lookup failed for chat_id %s: %s", chat_id, exc)
+        return None
+
+    rows = result.data or []
+    if not rows:
+        return None
+    row = rows[0]
+    return {"user_id": row["user_id"], "locale": row.get("locale") or "es"}
+
+
+def update_locale(user_id: str, locale: str) -> None:
+    """Update the locale for the user's Telegram notification channel."""
+    supa = get_supabase_service()
+    try:
+        (
+            supa.table("notification_channels")
+            .update({"locale": locale})
+            .eq("user_id", user_id)
+            .eq("channel", "telegram")
+            .execute()
+        )
+    except APIError as exc:
+        logger.error("notification_channels locale update failed for user %s: %s", user_id, exc)
+        raise RuntimeError("DB error updating locale") from exc
+
+
 def delete_link(user_id: str) -> None:
     """Remove a user's Telegram link: purge channel row + unconsumed tokens.
 
