@@ -227,6 +227,14 @@ def _handle_vincular(message: dict, text: str, chat_id: str | int | None) -> Non
     # Strip dashes and whitespace (S3-B)
     code = raw_arg.replace("-", "").replace(" ", "")
 
+    # Anti-DOS gate (S6) — uses chat_id since user_id is not yet known.
+    # "vincular" is in META_COMMANDS → no quota consumed, only sliding window applied.
+    ok, reason = telegram_rate_limit.should_serve("", int(chat_id), "vincular")
+    if not ok:
+        if reason == "rate_limited":
+            _tg_send(chat_id, "Espera un momento, estás enviando demasiados mensajes.")
+        return
+
     user = message.get("from", {})
     lang = (user.get("language_code") or "en").split("-")[0].lower()
     locale = lang if lang in _VALID_LOCALES else "en"

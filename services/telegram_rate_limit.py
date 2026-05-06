@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Command sets
 # ---------------------------------------------------------------------------
-META_COMMANDS = {"start", "help", "idioma", "desvincular"}
+META_COMMANDS = {"start", "help", "idioma", "desvincular", "vincular"}
 QUOTA_COMMANDS = {"vault", "watchlist", "precio"}
 
 # ---------------------------------------------------------------------------
