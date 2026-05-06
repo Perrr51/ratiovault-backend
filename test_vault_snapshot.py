@@ -103,7 +103,7 @@ def test_single_eur_position_simple_pnl():
     price_info = _price_data("VOW3.DE", price=130.0, prev=128.0, currency="EUR")
 
     with patch("services.vault_snapshot.get_supabase_service", return_value=_make_supabase_mock([pos])):
-        with patch("services.vault_snapshot.price_cache.get_price", return_value=price_info):
+        with patch("services.vault_snapshot.price_cache.get_prices_batch", return_value={"VOW3.DE": price_info}):
             from services.vault_snapshot import get_vault_snapshot
             result = get_vault_snapshot(user_id="user-1", base_currency="EUR")
 
@@ -146,7 +146,7 @@ def test_multi_currency_usd_position_eur_base():
     price_info = _price_data("AAPL", price=160.0, prev=155.0, currency="USD")
 
     with patch("services.vault_snapshot.get_supabase_service", return_value=_make_supabase_mock([pos])):
-        with patch("services.vault_snapshot.price_cache.get_price", return_value=price_info):
+        with patch("services.vault_snapshot.price_cache.get_prices_batch", return_value={"AAPL": price_info}):
             with patch("services.vault_snapshot.get_forex_rates", return_value={}):
                 from services.vault_snapshot import get_vault_snapshot
                 result = get_vault_snapshot(user_id="user-2", base_currency="EUR")
@@ -189,13 +189,9 @@ def test_closed_position_not_counted():
     }
     price_msft = _price_data("MSFT", price=310.0, prev=305.0, currency="USD")
 
-    def fake_get_price(ticker: str):
-        if ticker == "MSFT":
-            return price_msft
-        return None
-
     with patch("services.vault_snapshot.get_supabase_service", return_value=_make_supabase_mock([open_pos, closed_pos])):
-        with patch("services.vault_snapshot.price_cache.get_price", side_effect=fake_get_price):
+        # Only MSFT is in open_positions (closed_pos shares=0 is excluded before batch call)
+        with patch("services.vault_snapshot.price_cache.get_prices_batch", return_value={"MSFT": price_msft}):
             with patch("services.vault_snapshot.get_forex_rates", return_value={}):
                 from services.vault_snapshot import get_vault_snapshot
                 result = get_vault_snapshot(user_id="user-3", base_currency="EUR")
@@ -230,7 +226,7 @@ def test_etf_ter_not_double_counted():
     price_info = _price_data("VWCE.DE", price=110.0, prev=108.0, currency="EUR")
 
     with patch("services.vault_snapshot.get_supabase_service", return_value=_make_supabase_mock([pos])):
-        with patch("services.vault_snapshot.price_cache.get_price", return_value=price_info):
+        with patch("services.vault_snapshot.price_cache.get_prices_batch", return_value={"VWCE.DE": price_info}):
             from services.vault_snapshot import get_vault_snapshot
             result = get_vault_snapshot(user_id="user-4", base_currency="EUR")
 
@@ -246,7 +242,7 @@ def test_etf_ter_not_double_counted():
 def test_empty_vault_returns_zeros():
     """User with no positions → zero snapshot."""
     with patch("services.vault_snapshot.get_supabase_service", return_value=_make_supabase_mock([])):
-        with patch("services.vault_snapshot.price_cache.get_price", return_value=None):
+        with patch("services.vault_snapshot.price_cache.get_prices_batch", return_value={}):
             from services.vault_snapshot import get_vault_snapshot
             result = get_vault_snapshot(user_id="user-5", base_currency="EUR")
 
@@ -276,7 +272,7 @@ def test_price_cache_none_uses_buy_price_fallback():
     }
 
     with patch("services.vault_snapshot.get_supabase_service", return_value=_make_supabase_mock([pos])):
-        with patch("services.vault_snapshot.price_cache.get_price", return_value=None):
+        with patch("services.vault_snapshot.price_cache.get_prices_batch", return_value={"FAKECORP": None}):
             from services.vault_snapshot import get_vault_snapshot
             result = get_vault_snapshot(user_id="user-6", base_currency="EUR")
 
@@ -352,17 +348,22 @@ class TestAccountFilter:
         mock.table.side_effect = table_dispatcher
         return mock, acc_table
 
+    def _prices_batch_for(self, positions: list) -> dict:
+        """Build a prices_batch dict from a list of positions using self._price()."""
+        return {p["ticker"]: self._price(p["ticker"]) for p in positions if (p.get("shares") or 0) > 0}
+
     def test_no_account_id_no_filter_applied(self):
         """S1-B: account_id=None → no account filter, all positions returned."""
         pos_a = self._pos("p1", "VOW3.DE", "acc-A")
         pos_b = self._pos("p2", "AAPL", "acc-B")
         pos_null = self._pos("p3", "MSFT", None)
+        all_positions = [pos_a, pos_b, pos_null]
 
-        supa, _ = self._build_supa_mock_with_positions([pos_a, pos_b, pos_null])
+        supa, _ = self._build_supa_mock_with_positions(all_positions)
 
         with patch("services.vault_snapshot.get_supabase_service", return_value=supa):
-            with patch("services.vault_snapshot.price_cache.get_price",
-                       side_effect=lambda t: self._price(t)):
+            with patch("services.vault_snapshot.price_cache.get_prices_batch",
+                       return_value=self._prices_batch_for(all_positions)):
                 with patch("services.vault_snapshot.get_forex_rates", return_value={}):
                     from services.vault_snapshot import get_vault_snapshot
                     result = get_vault_snapshot("user-1", account_id=None)
@@ -374,16 +375,17 @@ class TestAccountFilter:
         acc_id = "acc-default"
         pos_default = self._pos("p1", "VOW3.DE", acc_id)
         pos_null = self._pos("p2", "AAPL", None)
+        positions = [pos_default, pos_null]
 
-        supa, acc_table = self._build_supa_mock_with_positions([pos_default, pos_null])
+        supa, acc_table = self._build_supa_mock_with_positions(positions)
         # Set up accounts query to return acc_id as default (is_default=True)
         acc_table.select.return_value.eq.return_value.order.return_value.execute.return_value = MagicMock(
             data=[{"id": acc_id, "created_at": "2026-01-01T00:00:00Z", "is_default": True}]
         )
 
         with patch("services.vault_snapshot.get_supabase_service", return_value=supa):
-            with patch("services.vault_snapshot.price_cache.get_price",
-                       side_effect=lambda t: self._price(t)):
+            with patch("services.vault_snapshot.price_cache.get_prices_batch",
+                       return_value=self._prices_batch_for(positions)):
                 with patch("services.vault_snapshot.get_forex_rates", return_value={}):
                     from services.vault_snapshot import get_vault_snapshot
                     get_vault_snapshot("user-1", account_id=acc_id)
@@ -400,17 +402,16 @@ class TestAccountFilter:
         """S1-C: account_id=non-default → strict .eq(), no NULL positions."""
         default_id = "acc-default"
         other_id = "acc-other"
+        positions = [self._pos("p2", "AAPL", other_id)]
 
-        supa, acc_table = self._build_supa_mock_with_positions([
-            self._pos("p2", "AAPL", other_id)
-        ])
+        supa, acc_table = self._build_supa_mock_with_positions(positions)
         acc_table.select.return_value.eq.return_value.order.return_value.execute.return_value = MagicMock(
             data=[{"id": default_id, "created_at": "2026-01-01T00:00:00Z", "is_default": True}]
         )
 
         with patch("services.vault_snapshot.get_supabase_service", return_value=supa):
-            with patch("services.vault_snapshot.price_cache.get_price",
-                       side_effect=lambda t: self._price(t)):
+            with patch("services.vault_snapshot.price_cache.get_prices_batch",
+                       return_value=self._prices_batch_for(positions)):
                 with patch("services.vault_snapshot.get_forex_rates", return_value={}):
                     from services.vault_snapshot import get_vault_snapshot
                     get_vault_snapshot("user-1", account_id=other_id)
@@ -425,15 +426,16 @@ class TestAccountFilter:
     def test_zero_accounts_falls_back_to_all(self):
         """Edge: 0 accounts → get_vault_snapshot falls back to no filter (account_id=None path)."""
         pos_null = self._pos("p1", "AAPL", None)
+        positions = [pos_null]
 
-        supa, acc_table = self._build_supa_mock_with_positions([pos_null])
+        supa, acc_table = self._build_supa_mock_with_positions(positions)
         acc_table.select.return_value.eq.return_value.order.return_value.execute.return_value = MagicMock(
             data=[]  # no accounts
         )
 
         with patch("services.vault_snapshot.get_supabase_service", return_value=supa):
-            with patch("services.vault_snapshot.price_cache.get_price",
-                       side_effect=lambda t: self._price(t)):
+            with patch("services.vault_snapshot.price_cache.get_prices_batch",
+                       return_value=self._prices_batch_for(positions)):
                 with patch("services.vault_snapshot.get_forex_rates", return_value={}):
                     from services.vault_snapshot import get_vault_snapshot
                     result = get_vault_snapshot("user-1", account_id="acc-nonexistent")
@@ -509,7 +511,7 @@ class TestFxSpotAccessor:
         live_rates = {"USDEUR": 0.875, "USDCHF": 0.885}
 
         with patch("services.vault_snapshot.get_supabase_service", return_value=_make_supabase_mock([pos])):
-            with patch("services.vault_snapshot.price_cache.get_price", return_value=price_info):
+            with patch("services.vault_snapshot.price_cache.get_prices_batch", return_value={"AAPL": price_info}):
                 with patch("services.vault_snapshot.get_forex_rates", return_value=live_rates):
                     from services.vault_snapshot import get_vault_snapshot
                     result = get_vault_snapshot(user_id="user-fx", base_currency="EUR")
@@ -532,13 +534,78 @@ class TestFxSpotAccessor:
         price_info = _price_data("AAPL", price=180.0, prev=175.0, currency="USD")
 
         with patch("services.vault_snapshot.get_supabase_service", return_value=_make_supabase_mock([pos])):
-            with patch("services.vault_snapshot.price_cache.get_price", return_value=price_info):
+            with patch("services.vault_snapshot.price_cache.get_prices_batch", return_value={"AAPL": price_info}):
                 with patch("services.vault_snapshot.get_forex_rates", return_value={}):
                     from services.vault_snapshot import get_vault_snapshot
                     result = get_vault_snapshot(user_id="user-fallback", base_currency="EUR")
 
         # Falls back to _FX_FALLBACK["USD"] = 0.92
         assert result["total"] == pytest.approx(1656.0, abs=TOLERANCE)  # 10 * 180 * 0.92
+
+
+# ── T2.3: get_vault_snapshot uses get_prices_batch (perf) ───────────────────
+
+
+class TestBatchPriceFetch:
+    """get_vault_snapshot must call get_prices_batch once, not N get_price calls (T2.3)."""
+
+    def _pos(self, ticker: str, account_id=None) -> dict:
+        return {
+            "id": f"pos-{ticker}",
+            "ticker": ticker,
+            "shares": 10.0,
+            "buy_price": 100.0,
+            "currency": "USD",
+            "purchase_base_rate": None,
+            "account_id": account_id,
+            "exclude_from_totals": False,
+        }
+
+    def test_single_batch_call_not_n_get_price_calls(self):
+        """200-ticker portfolio → get_prices_batch called exactly once, not 200 times."""
+        tickers = [f"TICK{i}" for i in range(200)]
+        positions = [self._pos(t) for t in tickers]
+
+        prices = {
+            t: {
+                "ticker": t, "price": 100.0, "currency": "USD",
+                "previous_close": 99.0, "change_pct_day": 1.0, "source": "cache",
+            }
+            for t in tickers
+        }
+
+        mock_supa = MagicMock()
+        # positions query
+        mock_supa.table.return_value.select.return_value.eq.return_value.execute.return_value = MagicMock(data=positions)
+
+        with patch("services.vault_snapshot.get_supabase_service", return_value=mock_supa):
+            with patch("services.vault_snapshot.price_cache.get_prices_batch", return_value=prices) as mock_batch:
+                with patch("services.vault_snapshot.get_forex_rates", return_value={"USDEUR": 0.875}):
+                    from services.vault_snapshot import get_vault_snapshot
+                    result = get_vault_snapshot("user-batch", account_id=None)
+
+        # Exactly ONE batch call, not 200 individual get_price calls
+        mock_batch.assert_called_once()
+        assert result["position_count"] == 200
+
+    def test_none_price_uses_buy_price_fallback(self):
+        """Position where batch returns None → buy_price fallback, no exception."""
+        pos = self._pos("BROKEN")
+
+        prices = {"BROKEN": None}  # fetch failed
+
+        mock_supa = MagicMock()
+        mock_supa.table.return_value.select.return_value.eq.return_value.execute.return_value = MagicMock(data=[pos])
+
+        with patch("services.vault_snapshot.get_supabase_service", return_value=mock_supa):
+            with patch("services.vault_snapshot.price_cache.get_prices_batch", return_value=prices):
+                with patch("services.vault_snapshot.get_forex_rates", return_value={}):
+                    from services.vault_snapshot import get_vault_snapshot
+                    result = get_vault_snapshot("user-fallback-batch", account_id=None)
+
+        assert result["position_count"] == 1
+        # total = 10 * 100 (buy_price) * 0.92 (_FX_FALLBACK USD) = 920
+        assert result["total"] == pytest.approx(920.0, abs=0.01)
 
 
 # ── Edge case 7: purchase_base_rate=None → current FX fallback ───────────────
@@ -568,7 +635,7 @@ def test_missing_purchase_base_rate_falls_back_to_current_fx():
     price_info = _price_data("TSLA", price=220.0, prev=210.0, currency="USD")
 
     with patch("services.vault_snapshot.get_supabase_service", return_value=_make_supabase_mock([pos])):
-        with patch("services.vault_snapshot.price_cache.get_price", return_value=price_info):
+        with patch("services.vault_snapshot.price_cache.get_prices_batch", return_value={"TSLA": price_info}):
             with patch("services.vault_snapshot.get_forex_rates", return_value={}):
                 from services.vault_snapshot import get_vault_snapshot
                 result = get_vault_snapshot(user_id="user-7", base_currency="EUR")

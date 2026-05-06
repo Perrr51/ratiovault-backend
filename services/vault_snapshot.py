@@ -179,6 +179,10 @@ def get_vault_snapshot(
             "get_vault_snapshot: forex rates empty, snapshot will use _FX_FALLBACK"
         )
 
+    # Batch price fetch — single IN query + parallel miss-fetch (T2.3 / S4)
+    open_tickers = [p["ticker"] for p in open_positions]
+    prices_batch = price_cache.get_prices_batch(open_tickers)
+
     total_value = 0.0
     total_pnl = 0.0
     total_day_pnl = 0.0
@@ -195,8 +199,8 @@ def get_vault_snapshot(
             float(pos["purchase_base_rate"]) if pos.get("purchase_base_rate") is not None else None
         )
 
-        # -- Fetch current price --
-        price_data = price_cache.get_price(ticker)
+        # -- Resolve current price from batch result --
+        price_data = prices_batch.get(ticker)
 
         if price_data is not None:
             current_price: float = float(price_data["price"])
@@ -207,7 +211,7 @@ def get_vault_snapshot(
             )
             price_currency: str = price_data.get("currency") or pos_currency
         else:
-            # 3-level fallback: yfinance → Stooq → buyPrice (mirrors frontend)
+            # Fallback: yfinance → Stooq → buyPrice (mirrors frontend)
             logger.debug("price_cache returned None for %s — using buy_price fallback", ticker)
             current_price = buy_price
             prev_close = None
