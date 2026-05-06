@@ -108,8 +108,8 @@ def test_webhook_correct_secret_empty_body_returns_200(client):
 # ── T12: /start ───────────────────────────────────────────────────────────────
 
 
-def test_start_no_token_replies_welcome(client):
-    """/start with no token → welcome message."""
+def test_start_no_arg_replies_welcome(client):
+    """/start with no argument → welcome message (S4-A)."""
     update = _make_message("/start")
     mock_cls, mock_instance = _httpx_mock_client()
 
@@ -118,79 +118,127 @@ def test_start_no_token_replies_welcome(client):
 
     assert r.status_code == 200
     payload = mock_instance.post.call_args[1]["json"]
-    assert "Bienvenido" in payload["text"] or "Ajustes" in payload["text"]
+    assert "Bienvenido" in payload["text"] or "bienvenido" in payload["text"].lower()
 
 
-def test_start_valid_token_calls_consume_and_replies_success(client):
-    """/start <token> → consume_link_token called → success reply."""
-    update = _make_message("/start abc-token-123")
+def test_start_with_any_arg_replies_tombstone(client):
+    """/start <any_arg> → tombstone reply, no binding (S4-B)."""
+    update = _make_message("/start abc123")
     mock_cls, mock_instance = _httpx_mock_client()
-    mock_consume = MagicMock(return_value={"user_id": "user-uuid", "locale": "es"})
+
+    with patch("routers.telegram_bot.httpx.Client", mock_cls):
+        r = client.post("/telegram/webhook", headers=_secret_header(), json=update)
+
+    assert r.status_code == 200
+    payload = mock_instance.post.call_args[1]["json"]
+    # Must mention /vincular as the new way
+    assert "/vincular" in payload["text"]
+
+
+# ── /vincular ─────────────────────────────────────────────────────────────────
+
+
+def test_vincular_happy_path(client):
+    """/vincular 123456789 → link_by_code called, success reply (S3-A)."""
+    from services.telegram_link import link_by_code as _real
+
+    update = _make_message("/vincular 123456789")
+    mock_cls, mock_instance = _httpx_mock_client()
+    mock_link = MagicMock(return_value={"user_id": "u1", "locale": "es"})
 
     with (
-        patch("routers.telegram_bot.consume_link_token", mock_consume),
+        patch("routers.telegram_bot.link_by_code", mock_link),
         patch("routers.telegram_bot.httpx.Client", mock_cls),
     ):
         r = client.post("/telegram/webhook", headers=_secret_header(), json=update)
 
     assert r.status_code == 200
-    mock_consume.assert_called_once_with(token="abc-token-123", chat_id="123", locale="es")
+    mock_link.assert_called_once_with(code="123456789", chat_id="123", locale="es")
     payload = mock_instance.post.call_args[1]["json"]
-    assert "Vinculado" in payload["text"]
+    assert "Vinculado" in payload["text"] or "vinculado" in payload["text"].lower()
 
 
-def test_start_token_expired_replies_error(client):
-    """/start with expired token → expired message."""
-    from services.telegram_link import TokenInvalidOrExpired
+def test_vincular_dashes_stripped(client):
+    """/vincular 123-456-789 → dashes stripped before lookup (S3-B)."""
+    update = _make_message("/vincular 123-456-789")
+    mock_cls, mock_instance = _httpx_mock_client()
+    mock_link = MagicMock(return_value={"user_id": "u1", "locale": "es"})
 
-    update = _make_message("/start bad-token")
+    with (
+        patch("routers.telegram_bot.link_by_code", mock_link),
+        patch("routers.telegram_bot.httpx.Client", mock_cls),
+    ):
+        r = client.post("/telegram/webhook", headers=_secret_header(), json=update)
+
+    assert r.status_code == 200
+    mock_link.assert_called_once_with(code="123456789", chat_id="123", locale="es")
+
+
+def test_vincular_no_arg_replies_usage(client):
+    """/vincular with no code → usage hint (S3-F)."""
+    update = _make_message("/vincular")
+    mock_cls, mock_instance = _httpx_mock_client()
+
+    with patch("routers.telegram_bot.httpx.Client", mock_cls):
+        r = client.post("/telegram/webhook", headers=_secret_header(), json=update)
+
+    assert r.status_code == 200
+    payload = mock_instance.post.call_args[1]["json"]
+    assert "/ajustes" in payload["text"] or "código" in payload["text"].lower()
+
+
+def test_vincular_code_not_found(client):
+    """/vincular <bad_code> → CodeNotFound → error reply (S3-C)."""
+    from services.telegram_link import CodeNotFound
+
+    update = _make_message("/vincular 000000000")
     mock_cls, mock_instance = _httpx_mock_client()
 
     with (
-        patch("routers.telegram_bot.consume_link_token", side_effect=TokenInvalidOrExpired()),
+        patch("routers.telegram_bot.link_by_code", side_effect=CodeNotFound()),
         patch("routers.telegram_bot.httpx.Client", mock_cls),
     ):
         r = client.post("/telegram/webhook", headers=_secret_header(), json=update)
 
     assert r.status_code == 200
     payload = mock_instance.post.call_args[1]["json"]
-    assert "caducado" in payload["text"].lower() or "nuevo" in payload["text"].lower()
+    assert "incorrecto" in payload["text"].lower() or "Verifica" in payload["text"]
 
 
-def test_start_user_already_linked_replies_error(client):
-    """/start raises UserAlreadyLinked → correct error reply."""
+def test_vincular_user_already_linked(client):
+    """/vincular when user already linked → reply S3-D."""
     from services.telegram_link import UserAlreadyLinked
 
-    update = _make_message("/start some-token")
+    update = _make_message("/vincular 123456789")
     mock_cls, mock_instance = _httpx_mock_client()
 
     with (
-        patch("routers.telegram_bot.consume_link_token", side_effect=UserAlreadyLinked()),
+        patch("routers.telegram_bot.link_by_code", side_effect=UserAlreadyLinked()),
         patch("routers.telegram_bot.httpx.Client", mock_cls),
     ):
         r = client.post("/telegram/webhook", headers=_secret_header(), json=update)
 
     assert r.status_code == 200
     payload = mock_instance.post.call_args[1]["json"]
-    assert "ya está vinculada" in payload["text"] or "desvincular" in payload["text"].lower()
+    assert "Ya vinculado" in payload["text"] or "desvincular" in payload["text"].lower()
 
 
-def test_start_chat_already_linked_replies_error(client):
-    """/start raises ChatAlreadyLinked → correct error reply."""
+def test_vincular_chat_already_linked(client):
+    """/vincular when chat belongs to another account → reply S3-E."""
     from services.telegram_link import ChatAlreadyLinked
 
-    update = _make_message("/start some-token")
+    update = _make_message("/vincular 123456789")
     mock_cls, mock_instance = _httpx_mock_client()
 
     with (
-        patch("routers.telegram_bot.consume_link_token", side_effect=ChatAlreadyLinked()),
+        patch("routers.telegram_bot.link_by_code", side_effect=ChatAlreadyLinked()),
         patch("routers.telegram_bot.httpx.Client", mock_cls),
     ):
         r = client.post("/telegram/webhook", headers=_secret_header(), json=update)
 
     assert r.status_code == 200
     payload = mock_instance.post.call_args[1]["json"]
-    assert "Telegram" in payload["text"] and "vinculad" in payload["text"].lower()
+    assert "otra cuenta" in payload["text"].lower() or "Telegram" in payload["text"]
 
 
 # ── T13: /vault ───────────────────────────────────────────────────────────────

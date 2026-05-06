@@ -19,10 +19,10 @@ from fastapi import APIRouter, Header, HTTPException, Request
 from config import settings
 from services.telegram_link import (
     ChatAlreadyLinked,
-    TokenInvalidOrExpired,
+    CodeNotFound,
     UserAlreadyLinked,
-    consume_link_token,
     delete_link,
+    link_by_code,
     resolve_user_by_chat,
     update_locale,
 )
@@ -46,8 +46,9 @@ _HELP_TEXT = (
     "/vault — Ver resumen de tu cartera\n"
     "/watchlist — Ver tu watchlist\n"
     "/precio AAPL — Precio de un ticker de tu watchlist\n"
-    "/idioma es|en|de|fr|it — Cambiar idioma del bot\n"
+    "/vincular 123456789 — Vincular este Telegram a tu cuenta\n"
     "/desvincular — Desvincular este Telegram de tu cuenta\n"
+    "/idioma es|en|de|fr|it — Cambiar idioma del bot\n"
     "/help — Mostrar esta ayuda"
 )
 
@@ -156,6 +157,8 @@ def _handle_message(message: dict) -> None:
 
     if text.startswith("/start"):
         _handle_start(message, text, chat_id)
+    elif text.startswith("/vincular"):
+        _handle_vincular(message, text, chat_id)
     elif text.startswith("/vault"):
         _handle_vault(chat_id)
     elif text.startswith("/watchlist"):
@@ -180,44 +183,72 @@ def _handle_message(message: dict) -> None:
 
 
 def _handle_start(message: dict, text: str, chat_id: str | int | None) -> None:
-    """T12: Handle /start [token]."""
+    """Handle /start — welcome for no-arg, tombstone for any arg (S4-A / S4-B)."""
     parts = text.strip().split(None, 1)
     if len(parts) < 2 or not parts[1].strip():
+        # S4-A: plain /start → welcome
         _tg_send(
             chat_id,
             "¡Bienvenido a RatioVault! 👋\n\n"
-            "Para vincular tu cuenta, genera un enlace en <b>RatioVault → Ajustes → Telegram</b> "
-            "y ábrelo desde este chat.",
+            "Para vincular tu cuenta, escribe <b>/vincular</b> seguido de tu código de 9 dígitos "
+            "(encuéntralo en <b>RatioVault → Ajustes → Telegram</b>).",
         )
         return
 
-    token = parts[1].strip()
+    # S4-B: any argument → tombstone (deep-link flow retired)
+    logger.info("telegram: /start with arg (tombstone) for chat_id=%s", chat_id)
+    _tg_send(
+        chat_id,
+        "Este enlace ya no es válido. Usa /vincular seguido de tu código.",
+    )
+
+
+# ── /vincular ──────────────────────────────────────────────────────────────────
+
+import re as _re  # noqa: E402 — needed here to avoid top-level import changes
+
+_VINCULAR_RE = _re.compile(r"^/vincular(?:@\w+)?(?:\s+(.+))?$", _re.IGNORECASE)
+
+
+def _handle_vincular(message: dict, text: str, chat_id: str | int | None) -> None:
+    """Handle /vincular <code> — link Telegram to account via 9-digit code (S3).
+
+    The code argument may include dashes (e.g. 123-456-789); they are stripped.
+    Rate-limited via the existing telegram_rate_limit sliding window (no quota consumed).
+    """
+    m = _VINCULAR_RE.match(text.strip())
+    raw_arg = m.group(1).strip() if (m and m.group(1)) else None
+
+    if not raw_arg:
+        # S3-F: no argument
+        _tg_send(chat_id, "Uso: /vincular 123456789 (encuentra tu código en /ajustes).")
+        return
+
+    # Strip dashes and whitespace (S3-B)
+    code = raw_arg.replace("-", "").replace(" ", "")
+
     user = message.get("from", {})
     lang = (user.get("language_code") or "en").split("-")[0].lower()
     locale = lang if lang in _VALID_LOCALES else "en"
 
     try:
-        result = consume_link_token(token=token, chat_id=str(chat_id), locale=locale)
-        logger.info("telegram: link consumed for user_id=%s chat_id=%s", result.get("user_id"), chat_id)
+        result = link_by_code(code=code, chat_id=str(chat_id), locale=locale)
+        logger.info("telegram: /vincular linked user_id=%s chat_id=%s", result.get("user_id"), chat_id)
         _tg_send(
             chat_id,
             "✓ Vinculado. Envía /vault para ver tu cartera, o /help para comandos.",
         )
-    except TokenInvalidOrExpired:
-        logger.info("telegram: /start token invalid/expired for chat_id=%s", chat_id)
-        _tg_send(chat_id, "Enlace caducado o ya usado. Genera uno nuevo en /ajustes.")
+    except CodeNotFound:
+        logger.info("telegram: /vincular code not found for chat_id=%s", chat_id)
+        _tg_send(chat_id, "Código incorrecto. Verifica en RatioVault → Ajustes.")
     except UserAlreadyLinked:
-        logger.info("telegram: /start user already linked for chat_id=%s", chat_id)
-        _tg_send(
-            chat_id,
-            "Tu cuenta RatioVault ya está vinculada a otro Telegram. "
-            "Envía /desvincular desde el chat anterior primero.",
-        )
+        logger.info("telegram: /vincular user already linked for chat_id=%s", chat_id)
+        _tg_send(chat_id, "Ya vinculado. /desvincular primero.")
     except ChatAlreadyLinked:
-        logger.info("telegram: /start chat already linked for chat_id=%s", chat_id)
-        _tg_send(chat_id, "Este Telegram ya está vinculado a otra cuenta RatioVault.")
+        logger.info("telegram: /vincular chat already linked for chat_id=%s", chat_id)
+        _tg_send(chat_id, "Este Telegram pertenece a otra cuenta.")
     except Exception as exc:  # noqa: BLE001
-        logger.error("telegram: /start unexpected error for chat_id=%s: %s", chat_id, exc)
+        logger.error("telegram: /vincular unexpected error for chat_id=%s: %s", chat_id, exc)
         _tg_send(chat_id, "❌ Error interno. Inténtalo de nuevo más tarde.")
 
 
