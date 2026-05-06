@@ -29,6 +29,7 @@ from services.telegram_link import (
 from services import telegram_rate_limit
 from services.vault_snapshot import get_vault_snapshot
 from services.price_cache import get_price
+from services import price_cache
 from supabase_client import get_supabase_service
 
 logger = logging.getLogger(__name__)
@@ -620,13 +621,18 @@ def _handle_callback_query(callback_query: dict) -> None:
     chat_id = from_chat.get("id")
     message_id = callback_query.get("message", {}).get("message_id")
 
-    # Acknowledge to Telegram
-    if callback_id:
-        _tg_answer_callback(callback_id)
-
     if not data or not chat_id:
         return
 
+    # vault_refresh handler manages its own answerCallbackQuery (with text/alert)
+    # For all other callbacks: acknowledge silently here before dispatch
+    if data.startswith("vault_refresh:"):
+        scope = data[len("vault_refresh:"):]
+        _handle_vault_refresh_callback(chat_id, message_id, scope, callback_id or "")
+        return
+    # For non-refresh callbacks: silent ack first
+    if callback_id:
+        _tg_answer_callback(callback_id)
     if data.startswith("vault:"):
         account_id_str = data[len("vault:"):]
         _handle_vault_callback(chat_id, message_id, account_id_str)
@@ -663,6 +669,93 @@ def _handle_vault_callback(chat_id: int, message_id: int | None, account_id_str:
 
     account_id = None if account_id_str == "all" else account_id_str
     scope = account_id_str  # keep "all" or the UUID for the refresh button
+    snapshot = get_vault_snapshot(user_id, account_id=account_id, base_currency=base_currency)
+    text = _format_vault(snapshot)
+    keyboard = _vault_refresh_keyboard(scope)
+
+    if message_id:
+        _tg_edit_message(chat_id, message_id, text, reply_markup=keyboard)
+    else:
+        _tg_send(chat_id, text, reply_markup=keyboard)
+
+
+def _handle_vault_refresh_callback(
+    chat_id: int,
+    message_id: int | None,
+    scope: str,
+    callback_id: str,
+) -> None:
+    """Handle vault_refresh:<scope> callback (T2.5 / S5 I5.3-I5.6).
+
+    Flow:
+    1. Resolve user from chat.
+    2. Quota check via should_serve(user_id, chat_id, 'vault_refresh').
+    3. If quota exceeded → answerCallbackQuery with limit message, return.
+    4. answerCallbackQuery("Actualizando precios…") — dismiss loading spinner.
+    5. Fetch positions for scope, collect tickers.
+    6. invalidate_prices(tickers) — force cache miss on next snapshot.
+    7. get_vault_snapshot(user_id, account_id) — fresh prices fetched via get_prices_batch.
+    8. editMessageText with updated snapshot + refresh keyboard.
+    """
+    user_info = resolve_user_by_chat(str(chat_id))
+    if user_info is None:
+        _tg_answer_callback(callback_id, text="No vinculado. Usa /vincular.")
+        return
+
+    user_id = user_info["user_id"]
+
+    # Quota check (Free: 5/ISO-week; Pro/Founder: bypass)
+    ok, reason = telegram_rate_limit.should_serve(user_id, int(chat_id), "vault_refresh")
+    if not ok:
+        if reason == "plan_exceeded":
+            _tg_answer_callback(
+                callback_id,
+                text="Has alcanzado el límite de actualizaciones (5/semana). Mejora a Pro para refresh ilimitado.",
+                show_alert=True,
+            )
+        else:
+            _tg_answer_callback(callback_id, text="Espera un momento.")
+        return
+
+    # Ack immediately to dismiss Telegram loading spinner
+    _tg_answer_callback(callback_id, text="Actualizando precios…")
+
+    account_id = None if scope == "all" else scope
+
+    # Resolve base_currency
+    supa = get_supabase_service()
+    base_currency = "EUR"
+    try:
+        us_resp = (
+            supa.table("user_settings")
+            .select("base_currency")
+            .eq("user_id", user_id)
+            .limit(1)
+            .execute()
+        )
+        if us_resp.data:
+            base_currency = us_resp.data[0].get("base_currency") or "EUR"
+    except Exception as exc:
+        logger.warning("vault_refresh: failed to fetch user_settings for %s: %s", user_id, exc)
+
+    # Collect tickers for the current scope
+    try:
+        q = supa.table("positions").select("ticker,shares").eq("user_id", user_id)
+        if account_id is not None:
+            q = q.eq("account_id", account_id)
+        pos_resp = q.execute()
+        positions = pos_resp.data or []
+    except Exception as exc:
+        logger.warning("vault_refresh: failed to fetch positions for %s: %s", user_id, exc)
+        positions = []
+
+    tickers = list({p["ticker"] for p in positions if (p.get("shares") or 0) > 0})
+
+    # Invalidate cache for these tickers
+    deleted = price_cache.invalidate_prices(tickers)
+    logger.info("vault_refresh: invalidated %d cache rows for user %s scope=%s", deleted, user_id, scope)
+
+    # Re-compute snapshot (will trigger fresh batch fetch via get_prices_batch)
     snapshot = get_vault_snapshot(user_id, account_id=account_id, base_currency=base_currency)
     text = _format_vault(snapshot)
     keyboard = _vault_refresh_keyboard(scope)

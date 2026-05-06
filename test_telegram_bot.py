@@ -529,6 +529,164 @@ class TestVaultRefreshButton:
         assert refresh_found, "vault_refresh:acc-1 button not found in any Telegram call"
 
 
+# ── T2.5: _handle_vault_refresh_callback ──────────────────────────────────────
+
+
+class TestVaultRefreshCallback:
+    """_handle_vault_refresh_callback: quota, invalidate, re-snapshot, edit (T2.5 / S5)."""
+
+    def _make_supa_with_positions(self, positions: list) -> MagicMock:
+        mock = MagicMock()
+        mock.table.return_value.select.return_value.eq.return_value.limit.return_value.execute.return_value.data = [
+            {"base_currency": "EUR"}
+        ]
+        mock.table.return_value.select.return_value.eq.return_value.execute.return_value.data = positions
+        return mock
+
+    def test_happy_path_all_scope(self, client):
+        """vault_refresh:all → quota OK → invalidate all tickers → snapshot → edit message."""
+        update = _make_callback("vault_refresh:all")
+        mock_cls, mock_instance = _httpx_mock_client()
+
+        positions = [
+            {"ticker": "AAPL", "shares": 10, "buy_price": 100, "currency": "USD", "account_id": None, "exclude_from_totals": False},
+            {"ticker": "MSFT", "shares": 5, "buy_price": 200, "currency": "USD", "account_id": None, "exclude_from_totals": False},
+        ]
+        mock_snapshot = {
+            "total": 5000.0, "pnl_total": 100.0, "pnl_day": 10.0,
+            "top_up": None, "top_down": None, "position_count": 2, "base_currency": "EUR",
+        }
+
+        mock_invalidate = MagicMock(return_value=2)
+        mock_snap = MagicMock(return_value=mock_snapshot)
+
+        with (
+            patch("routers.telegram_bot.resolve_user_by_chat", return_value={"user_id": "u1", "locale": "es"}),
+            patch("routers.telegram_bot.telegram_rate_limit.should_serve", return_value=(True, None)),
+            patch("routers.telegram_bot.get_supabase_service", return_value=self._make_supa_with_positions(positions)),
+            patch("routers.telegram_bot.price_cache.invalidate_prices", mock_invalidate),
+            patch("routers.telegram_bot.get_vault_snapshot", mock_snap),
+            patch("routers.telegram_bot.httpx.Client", mock_cls),
+        ):
+            r = client.post("/telegram/webhook", headers=_secret_header(), json=update)
+
+        assert r.status_code == 200
+        # invalidate_prices called with the tickers
+        mock_invalidate.assert_called_once()
+        tickers_arg = mock_invalidate.call_args[0][0]
+        assert set(tickers_arg) == {"AAPL", "MSFT"}
+        # get_vault_snapshot called with account_id=None for "all"
+        mock_snap.assert_called_once()
+        _, kwargs = mock_snap.call_args
+        assert kwargs.get("account_id") is None
+        # editMessageText should have been called
+        calls = mock_instance.post.call_args_list
+        urls = [c[0][0] for c in calls]
+        assert any("editMessageText" in u for u in urls)
+
+    def test_quota_exceeded_no_edit(self, client):
+        """vault_refresh when quota exhausted → answerCallbackQuery with limit, NO edit (S5-B)."""
+        update = _make_callback("vault_refresh:all")
+        mock_cls, mock_instance = _httpx_mock_client()
+
+        with (
+            patch("routers.telegram_bot.resolve_user_by_chat", return_value={"user_id": "u1", "locale": "es"}),
+            patch("routers.telegram_bot.telegram_rate_limit.should_serve", return_value=(False, "plan_exceeded")),
+            patch("routers.telegram_bot.httpx.Client", mock_cls),
+        ):
+            r = client.post("/telegram/webhook", headers=_secret_header(), json=update)
+
+        assert r.status_code == 200
+        calls = mock_instance.post.call_args_list
+        urls = [c[0][0] for c in calls]
+        # editMessageText must NOT have been called
+        assert not any("editMessageText" in u for u in urls)
+        # answerCallbackQuery must have been called with a limit message
+        answer_calls = [c for c in calls if "answerCallbackQuery" in c[0][0]]
+        assert answer_calls, "answerCallbackQuery not called"
+        answer_payload = answer_calls[0][1]["json"]
+        assert "text" in answer_payload  # limit message present
+
+    def test_specific_account_scope(self, client):
+        """vault_refresh:<uuid> → only that account's tickers invalidated, account_id passed."""
+        update = _make_callback("vault_refresh:acc-uuid-1234")
+        mock_cls, mock_instance = _httpx_mock_client()
+
+        positions = [
+            {"ticker": "VWCE.DE", "shares": 20, "buy_price": 90, "currency": "EUR",
+             "account_id": "acc-uuid-1234", "exclude_from_totals": False},
+        ]
+        mock_snapshot = {
+            "total": 2000.0, "pnl_total": 0.0, "pnl_day": 0.0,
+            "top_up": None, "top_down": None, "position_count": 1, "base_currency": "EUR",
+        }
+
+        mock_invalidate = MagicMock(return_value=1)
+        mock_snap = MagicMock(return_value=mock_snapshot)
+
+        with (
+            patch("routers.telegram_bot.resolve_user_by_chat", return_value={"user_id": "u1", "locale": "es"}),
+            patch("routers.telegram_bot.telegram_rate_limit.should_serve", return_value=(True, None)),
+            patch("routers.telegram_bot.get_supabase_service", return_value=self._make_supa_with_positions(positions)),
+            patch("routers.telegram_bot.price_cache.invalidate_prices", mock_invalidate),
+            patch("routers.telegram_bot.get_vault_snapshot", mock_snap),
+            patch("routers.telegram_bot.httpx.Client", mock_cls),
+        ):
+            r = client.post("/telegram/webhook", headers=_secret_header(), json=update)
+
+        assert r.status_code == 200
+        mock_invalidate.assert_called_once()
+        # get_vault_snapshot called with the specific account_id
+        _, kwargs = mock_snap.call_args
+        assert kwargs.get("account_id") == "acc-uuid-1234"
+
+    def test_edit_failure_graceful(self, client):
+        """If editMessageText fails, no exception propagates (graceful, S5 edge)."""
+        update = _make_callback("vault_refresh:all")
+
+        # Make httpx raise on editMessageText
+        mock_instance = MagicMock()
+        mock_response = MagicMock()
+        mock_response.is_success = True
+        mock_instance.post.return_value = mock_response
+
+        def post_side_effect(url, **kwargs):
+            if "editMessageText" in url:
+                raise RuntimeError("message too old")
+            return mock_response
+
+        mock_instance.post.side_effect = post_side_effect
+        mock_cls = MagicMock()
+        mock_cls.return_value.__enter__ = MagicMock(return_value=mock_instance)
+        mock_cls.return_value.__exit__ = MagicMock(return_value=False)
+
+        positions = [{"ticker": "AAPL", "shares": 5, "buy_price": 100, "currency": "USD",
+                      "account_id": None, "exclude_from_totals": False}]
+        mock_snapshot = {
+            "total": 1000.0, "pnl_total": 0.0, "pnl_day": 0.0,
+            "top_up": None, "top_down": None, "position_count": 1, "base_currency": "EUR",
+        }
+
+        with (
+            patch("routers.telegram_bot.resolve_user_by_chat", return_value={"user_id": "u1", "locale": "es"}),
+            patch("routers.telegram_bot.telegram_rate_limit.should_serve", return_value=(True, None)),
+            patch("routers.telegram_bot.get_supabase_service", return_value=self._make_supa_with_positions(positions)),
+            patch("routers.telegram_bot.price_cache.invalidate_prices", return_value=1),
+            patch("routers.telegram_bot.get_vault_snapshot", return_value=mock_snapshot),
+            patch("routers.telegram_bot.httpx.Client", mock_cls),
+        ):
+            # Must not raise
+            from fastapi.testclient import TestClient
+            from main import app
+            from config import settings as s
+            s.telegram_webhook_secret = SECRET
+            s.telegram_bot_token = "fake-token"
+            tc = TestClient(app)
+            r = tc.post("/telegram/webhook", headers=_secret_header(), json=update)
+
+        assert r.status_code == 200  # webhook always returns 200
+
+
 # ── T14: /watchlist ───────────────────────────────────────────────────────────
 
 
