@@ -303,7 +303,7 @@ def resolve_user_by_chat(chat_id: str) -> dict | None:
         result = (
             supa.table("notification_channels")
             .select("user_id,locale")
-            .eq("channel_id", str(chat_id))
+            .eq("external_id", str(chat_id))
             .eq("channel", "telegram")
             .limit(1)
             .execute()
