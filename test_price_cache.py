@@ -210,6 +210,85 @@ def test_yfinance_raises_falls_back_to_stooq(mock_yf, mock_stooq, mock_supa):
     assert result["source"] == "stooq"
 
 
+# ── T1.4: _STOOQ_CURRENCY_BY_SUFFIX + _fetch_stooq currency inference ─────────
+
+
+class TestStooqCurrency:
+    """Stooq _fetch_stooq must infer currency from ticker suffix (T1.4 / S3)."""
+
+    def _run_fetch_stooq(self, ticker: str, raw_quote: dict | None):
+        """Patch fetch_stooq_quote and call _fetch_stooq; return result."""
+        with patch("services.price_cache.fetch_stooq_quote", return_value=raw_quote):
+            from services.price_cache import _fetch_stooq
+            return _fetch_stooq(ticker)
+
+    def test_constant_exists_and_has_de(self):
+        """_STOOQ_CURRENCY_BY_SUFFIX must be importable and map .DE → EUR."""
+        from services.price_cache import _STOOQ_CURRENCY_BY_SUFFIX
+        assert ".DE" in _STOOQ_CURRENCY_BY_SUFFIX
+        assert _STOOQ_CURRENCY_BY_SUFFIX[".DE"] == "EUR"
+
+    def test_vwce_de_returns_eur(self):
+        """S3-A: VWCE.DE → currency=EUR."""
+        raw = {"price": 110.0}
+        result = self._run_fetch_stooq("VWCE.DE", raw)
+        assert result is not None
+        assert result["currency"] == "EUR"
+
+    def test_aapl_no_suffix_returns_usd(self):
+        """S3-B: AAPL (no dot) → currency=USD."""
+        raw = {"price": 180.0}
+        result = self._run_fetch_stooq("AAPL", raw)
+        assert result is not None
+        assert result["currency"] == "USD"
+
+    def test_nesn_sw_returns_chf(self):
+        """S3-C: NESN.SW → currency=CHF."""
+        raw = {"price": 105.0}
+        result = self._run_fetch_stooq("NESN.SW", raw)
+        assert result is not None
+        assert result["currency"] == "CHF"
+
+    def test_unknown_suffix_returns_usd(self, caplog):
+        """S3-D: FOO.XY unknown suffix → USD + WARNING logged."""
+        import logging
+        raw = {"price": 50.0}
+        with caplog.at_level(logging.WARNING, logger="services.price_cache"):
+            result = self._run_fetch_stooq("FOO.XY", raw)
+        assert result is not None
+        assert result["currency"] == "USD"
+        assert any("XY" in r.message or "unknown suffix" in r.message.lower() for r in caplog.records)
+
+    def test_brk_b_last_dot_suffix(self):
+        """BRK.B → suffix 'B' not in map → USD (last-dot rule)."""
+        raw = {"price": 400.0}
+        result = self._run_fetch_stooq("BRK.B", raw)
+        assert result is not None
+        assert result["currency"] == "USD"
+
+    def test_gbp_suffix_l(self):
+        """BARC.L → currency=GBP (Stooq .L is GBP, not GBX)."""
+        raw = {"price": 200.0}
+        result = self._run_fetch_stooq("BARC.L", raw)
+        assert result is not None
+        assert result["currency"] == "GBP"
+
+    def test_none_raw_returns_none(self):
+        """fetch_stooq_quote returns None → _fetch_stooq returns None."""
+        result = self._run_fetch_stooq("VWCE.DE", None)
+        assert result is None
+
+    @pytest.mark.parametrize("suffix,expected", [
+        (".PA", "EUR"), (".MI", "EUR"), (".AS", "EUR"), (".MC", "EUR"),
+        (".SW", "CHF"), (".TO", "CAD"), (".AX", "AUD"), (".T", "JPY"),
+    ])
+    def test_suffix_map_spot_checks(self, suffix, expected):
+        ticker = f"TEST{suffix}"
+        raw = {"price": 100.0}
+        result = self._run_fetch_stooq(ticker, raw)
+        assert result["currency"] == expected
+
+
 # ── Test 7: change_pct_day calculation ────────────────────────────────────────
 
 
