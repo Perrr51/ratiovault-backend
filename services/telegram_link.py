@@ -56,16 +56,22 @@ def consume_link_token(token: str, chat_id: str, locale: str = "es") -> dict:
             {"p_token": token, "p_chat_id": str(chat_id), "p_locale": locale},
         ).execute()
     except APIError as exc:
+        # APIError may carry the Postgres errcode in any of: .code, .details, .hint,
+        # .message, args, or the str() repr. Concatenate everything searchable.
         code = getattr(exc, "code", "") or ""
-        msg = str(exc)
-        # APIError may carry the Postgres errcode in .code or in the message.
-        if "P0002" in code or "P0002" in msg or "TOKEN_INVALID_OR_EXPIRED" in msg:
+        details = getattr(exc, "details", "") or ""
+        hint = getattr(exc, "hint", "") or ""
+        message_attr = getattr(exc, "message", "") or ""
+        args_str = " ".join(str(a) for a in getattr(exc, "args", []) or [])
+        haystack = " ".join([code, details, hint, message_attr, args_str, str(exc)])
+        logger.warning("consume_telegram_link_token RPC error haystack: %s", haystack)
+        if "P0002" in haystack or "TOKEN_INVALID_OR_EXPIRED" in haystack:
             raise TokenInvalidOrExpired("Token is invalid, expired or already consumed") from exc
-        if "P0003" in code or "P0003" in msg or "USER_ALREADY_LINKED" in msg:
+        if "P0003" in haystack or "USER_ALREADY_LINKED" in haystack:
             raise UserAlreadyLinked("User already has a linked Telegram channel") from exc
-        if "P0004" in code or "P0004" in msg or "CHAT_ALREADY_LINKED" in msg:
+        if "P0004" in haystack or "CHAT_ALREADY_LINKED" in haystack:
             raise ChatAlreadyLinked("Chat ID is already linked to another user") from exc
-        logger.error("consume_telegram_link_token RPC failed: %s", exc)
+        logger.error("consume_telegram_link_token RPC failed (no errcode match): %s", exc)
         raise RuntimeError("DB error consuming link token") from exc
 
     data = result.data
