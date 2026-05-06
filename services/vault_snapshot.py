@@ -19,6 +19,7 @@ from typing import Optional
 
 from supabase_client import get_supabase_service
 from services import price_cache
+from deps import get_forex_rates
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +111,13 @@ def get_vault_snapshot(
             "base_currency": base_currency,
         }
 
+    # Fetch forex rates once for the whole snapshot (S2-D: freshness parity)
+    _rates = get_forex_rates()
+    if not _rates:
+        logger.warning(
+            "get_vault_snapshot: forex rates empty, snapshot will use _FX_FALLBACK"
+        )
+
     total_value = 0.0
     total_pnl = 0.0
     total_day_pnl = 0.0
@@ -147,7 +155,7 @@ def get_vault_snapshot(
         # -- FX spot rate for current value --
         # Use price_currency (what yfinance returns) as the source currency.
         # This is correct: yfinance returns price in the instrument's native currency.
-        spot_fx = _fx_spot(price_currency, base_currency)
+        spot_fx = _fx_spot(price_currency, base_currency, _rates=_rates)
 
         # -- Cost basis in base_currency --
         if purchase_base_rate is not None:
@@ -155,7 +163,7 @@ def get_vault_snapshot(
             cost_base = shares * buy_price * purchase_base_rate
         else:
             # Fallback: convert via current FX (less precise, mirrors frontend fallback)
-            cost_base = shares * buy_price * _fx_spot(pos_currency, base_currency)
+            cost_base = shares * buy_price * _fx_spot(pos_currency, base_currency, _rates=_rates)
 
         # -- Current value in base_currency --
         current_value_base = current_price * shares * spot_fx
@@ -165,7 +173,7 @@ def get_vault_snapshot(
 
         # -- Day P&L --
         if prev_close is not None and prev_close > 0:
-            day_pnl_base = (current_price - prev_close) * shares * spot_fx
+            day_pnl_base = (current_price - prev_close) * shares * spot_fx  # spot_fx already uses _rates
             day_change_pct = ((current_price - prev_close) / prev_close) * 100
             movers.append({"ticker": ticker, "change_pct": day_change_pct})
         else:
@@ -197,19 +205,63 @@ def get_vault_snapshot(
     }
 
 
-def _fx_spot(from_currency: str, to_currency: str) -> float:
+def _fx_spot(from_currency: str, to_currency: str, _rates: dict[str, float] | None = None) -> float:
     """Return spot FX multiplier to convert 1 unit of from_currency to to_currency.
 
-    Uses hardcoded fallback table (EUR-centric). TODO: wire to live forex service.
+    Primary source: live rates from deps.get_forex_rates() (USD-pivot, 30-min TTL).
+    Last resort: _FX_FALLBACK hardcoded dict — used only when live rates are empty.
+
+    USD-pivot formula (mirrors frontend convertPrice):
+      from_in_eur = from_amount * (USDEUR / USD{from_currency})
+    where USD{from_currency} = units of from_currency per 1 USD.
+
+    Args:
+        _rates: pre-fetched rates dict (pass to avoid repeated get_forex_rates() calls
+                within a single snapshot; None = fetch from accessor).
     """
     if from_currency == to_currency:
         return 1.0
+
+    if _rates is None:
+        _rates = get_forex_rates()
+
+    # Try live USD-pivot rates first
+    if _rates and to_currency == "EUR":
+        # USDEUR is how many EUR per 1 USD
+        usd_eur = _rates.get("USDEUR")
+        if from_currency == "USD" and usd_eur:
+            return usd_eur
+        # USD{from} = how many from_currency units per 1 USD
+        usd_from_key = f"USD{from_currency.upper()}"
+        usd_from = _rates.get(usd_from_key)
+        if usd_eur and usd_from and usd_from != 0:
+            # 1 unit from_currency = (1/usd_from) USD = (1/usd_from) * usd_eur EUR
+            return usd_eur / usd_from
+
+    if _rates and from_currency == "EUR":
+        usd_eur = _rates.get("USDEUR")
+        usd_to_key = f"USD{to_currency.upper()}"
+        usd_to = _rates.get(usd_to_key)
+        if usd_eur and usd_eur != 0 and usd_to:
+            return usd_to / usd_eur
+
+    # Fallback: log warning and use _FX_FALLBACK
+    if not _rates:
+        logger.warning(
+            "forex rates unavailable from deps.get_forex_rates(); using _FX_FALLBACK for %s→%s",
+            from_currency, to_currency,
+        )
+    else:
+        logger.warning(
+            "forex rate key missing for %s→%s; using _FX_FALLBACK",
+            from_currency, to_currency,
+        )
+
     if to_currency == "EUR":
         return _FX_FALLBACK.get(from_currency.upper(), 1.0)
     if from_currency == "EUR":
         rate_to_eur = _FX_FALLBACK.get(to_currency.upper(), 1.0)
         return 1.0 / rate_to_eur if rate_to_eur != 0 else 1.0
-    # Cross via EUR
     from_to_eur = _FX_FALLBACK.get(from_currency.upper(), 1.0)
     to_to_eur = _FX_FALLBACK.get(to_currency.upper(), 1.0)
     return from_to_eur / to_to_eur if to_to_eur != 0 else from_to_eur
