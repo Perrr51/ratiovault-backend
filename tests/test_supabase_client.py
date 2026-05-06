@@ -9,7 +9,7 @@ import pytest
 
 
 ROUTERS_DIR = Path(__file__).parent.parent / "routers"
-ALLOWED = {"webhooks.py", "checkout.py", "portal.py", "internal.py"}
+ALLOWED = {"webhooks.py", "checkout.py", "portal.py", "internal.py", "telegram_bot.py"}
 
 
 def test_service_client_is_singleton(monkeypatch):
