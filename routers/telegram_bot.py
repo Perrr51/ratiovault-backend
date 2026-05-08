@@ -1,4 +1,16 @@
-"""Telegram webhook receiver — T12-T17 full command dispatcher.
+"""Telegram webhook receiver — full command dispatcher.
+
+PR1 (T0–T4): snapshot cache, top_movers extension, dispatch refactor.
+PR2 (T5–T12): /forex, /movers, /cuentas, /dividendos handlers + quota registration.
+
+ADR references (design doc §6):
+  ADR-1: standalone snapshot_cache module
+  ADR-2: all-accounts snapshot; in-memory partition for /cuentas
+  ADR-5: dispatch dict at module level, no decorator framework
+  ADR-6: uniform Handler = (chat_id, user_id, raw_text, args) signature
+  ADR-8: NULL-amount dividend rows render as '—', excluded from totals
+  ADR-9: /forex copy locked without delta; butler explanation included
+  ADR-10: sentiment selection for /movers, /dividendos, /forex
 
 # TODO T18: extract strings to i18n with locale lookup per chat.
 # All Spanish strings are hardcoded here for now.
@@ -15,7 +27,7 @@ import html
 import logging
 import random
 import types
-from datetime import datetime
+from datetime import date as _date_type, datetime, timezone
 from typing import Callable, Literal
 from zoneinfo import ZoneInfo
 
@@ -35,9 +47,11 @@ from services.telegram_link import (
 )
 from services import telegram_rate_limit
 from services.vault_snapshot import get_vault_snapshot
+from services.snapshot_cache import get_cached_snapshot
 from services.price_cache import get_price
 from services import price_cache
 from supabase_client import get_supabase_service
+from deps import get_forex_rates
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +68,10 @@ _HELP_TEXT = (
     "/vault — Ver resumen de tu cartera\n"
     "/watchlist — Ver tu watchlist\n"
     "/precio AAPL — Precio de un ticker de tu watchlist\n"
+    "/forex — Tipos de cambio EUR/USD, EUR/CHF, EUR/GBP\n"
+    "/movers — Los que más suben y bajan hoy en tu cartera\n"
+    "/cuentas — Desglose de tu cartera por cuentas\n"
+    "/dividendos — Resumen de cobros de dividendos\n"
     "/vincular 123456789 — Vincular este Telegram a tu cuenta\n"
     "/desvincular — Desvincular este Telegram de tu cuenta\n"
     "/idioma es|en|de|fr|it — Cambiar idioma del bot\n"
@@ -862,26 +880,454 @@ def _handle_help(chat_id: str | int) -> None:
     _tg_send(chat_id, _HELP_TEXT)
 
 
-# ── New command stubs (PR1 placeholder — real implementations ship in PR2) ─────
+# ── /forex (T5) ───────────────────────────────────────────────────────────────
 
 def _handle_forex(chat_id: int, user_id: str, raw_text: str, args: list[str]) -> None:
-    """Stub for /forex — implemented in PR2 (T5)."""
-    raise NotImplementedError("_handle_forex not yet implemented (PR2)")
+    """T5: Show current EUR/USD, EUR/CHF, EUR/GBP exchange rates.
 
+    ADR-9: No delta comparison — butler copy explains the absence transparently.
+    Quota-gated via QUOTA_COMMANDS. Falls back gracefully if get_forex_rates raises.
+    """
+    # user_id is empty string from dispatch — resolve here
+    user_info = resolve_user_by_chat(str(chat_id))
+    if user_info is None:
+        _tg_send(chat_id, "No vinculado. Genera enlace en /ajustes web.")
+        return
+
+    uid = user_info["user_id"]
+    ok, reason = telegram_rate_limit.should_serve(uid, int(chat_id), "forex")
+    if not ok:
+        if reason == "plan_exceeded":
+            _tg_send(
+                chat_id,
+                "Has agotado tus 5 consultas semanales gratis. "
+                "Hazte Pro: https://ratiovault.com/ajustes#subscription-heading",
+            )
+        else:
+            _tg_send(chat_id, "Espera un momento, estás enviando demasiados mensajes.")
+        return
+
+    try:
+        rates = get_forex_rates()
+        if not rates:
+            raise ValueError("empty rates dict")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("forex: get_forex_rates failed for user %s: %s", uid, exc)
+        bucket = _hour_bucket(datetime.now(_TZ_MADRID).hour)
+        greeting = _pick_greeting(bucket, "flat", random)
+        _tg_send(
+            chat_id,
+            f"{greeting}\n\nNo he podido obtener los tipos de cambio en este momento. "
+            "Vuelve a probar en unos minutos, por favor.",
+        )
+        return
+
+    now_utc = datetime.now(timezone.utc)
+    _tg_send(chat_id, _format_forex(rates, now=now_utc, rng=random))
+
+
+def _eur_cross(usd_eur: float | None, usd_quote: float | None) -> float | None:
+    """Return EUR/<quote> from USD-pivot rates.
+
+    USDEUR = EUR per 1 USD. USD<quote> = <quote> per 1 USD.
+    EUR/<quote> = USD<quote> / USDEUR.
+    For EUR/USD pass usd_quote=1.0 → returns 1/USDEUR.
+    """
+    if not usd_eur or usd_quote is None:
+        return None
+    return usd_quote / usd_eur
+
+
+def _format_forex(
+    rates: dict[str, float],
+    *,
+    now: datetime,
+    rng: random.Random | types.ModuleType,
+) -> str:
+    """Format forex rates as HTML string. ADR-9: butler copy, no delta.
+
+    rates dict uses USD-pivot keys (e.g. USDEUR, USDCHF, USDGBP).
+    EUR-based display: EUR/USD = 1/USDEUR, EUR/CHF = (1/USDEUR)/(1/USDCHF) = USDCHF/USDEUR,
+    EUR/GBP = USDGBP/USDEUR.
+
+    Design §4.1 locked copy (Spanish peninsular, tuteo, butler narrative).
+    """
+    bucket = _hour_bucket(now.hour)
+    greeting = _pick_greeting(bucket, "flat", rng)
+
+    usd_eur = rates.get("USDEUR")
+    usd_chf = rates.get("USDCHF")
+    usd_gbp = rates.get("USDGBP")
+
+    eur_usd = _eur_cross(usd_eur, 1.0)  # EUR/USD = 1/USDEUR
+    eur_chf = _eur_cross(usd_eur, usd_chf)  # EUR/CHF = USDCHF/USDEUR
+    eur_gbp = _eur_cross(usd_eur, usd_gbp)  # EUR/GBP = USDGBP/USDEUR
+
+    def _rate_line(label: str, val: float | None) -> str:
+        if val is None:
+            return f"{label}: —"
+        return f"{label}: {val:.4f}"
+
+    lines = [
+        greeting,
+        "",
+        f"Tipo de cambio ahora mismo (UTC {now.strftime('%H:%M')}):",
+        _rate_line("EUR/USD", eur_usd),
+        _rate_line("EUR/CHF", eur_chf),
+        _rate_line("EUR/GBP", eur_gbp),
+        "",
+        "Aún no llevamos histórico de divisas, así que solo te puedo entregar la foto del momento. "
+        "Cuando tengamos serie diaria te apuntaré también el delta del día.",
+    ]
+    return "\n".join(lines)
+
+
+# ── /movers (T6) ──────────────────────────────────────────────────────────────
 
 def _handle_movers(chat_id: int, user_id: str, raw_text: str, args: list[str]) -> None:
-    """Stub for /movers — implemented in PR2 (T6)."""
-    raise NotImplementedError("_handle_movers not yet implemented (PR2)")
+    """T6: Show top 5 gainers and top 5 losers from cached portfolio snapshot.
 
+    ADR-2: uses all-accounts snapshot (cache key = (user_id, None)).
+    Quota-gated.
+    """
+    user_info = resolve_user_by_chat(str(chat_id))
+    if user_info is None:
+        _tg_send(chat_id, "No vinculado. Genera enlace en /ajustes web.")
+        return
+
+    uid = user_info["user_id"]
+    ok, reason = telegram_rate_limit.should_serve(uid, int(chat_id), "movers")
+    if not ok:
+        if reason == "plan_exceeded":
+            _tg_send(
+                chat_id,
+                "Has agotado tus 5 consultas semanales gratis. "
+                "Hazte Pro: https://ratiovault.com/ajustes#subscription-heading",
+            )
+        else:
+            _tg_send(chat_id, "Espera un momento, estás enviando demasiados mensajes.")
+        return
+
+    supa = get_supabase_service()
+    try:
+        snapshot = get_cached_snapshot(supa, uid, account_id=None)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("movers: snapshot fetch failed for user %s: %s", uid, exc)
+        _tg_send(chat_id, "No pude obtener los datos de tu cartera. Inténtalo de nuevo.")
+        return
+
+    _tg_send(chat_id, _format_movers(snapshot, rng=random))
+
+
+def _format_movers(
+    snapshot: dict,
+    *,
+    rng: random.Random | types.ModuleType,
+) -> str:
+    """Format top-5 movers as HTML string. Design §4.2 locked copy.
+
+    Reads snapshot['top_movers']['up'] and ['down'] (max 5 each).
+    All names HTML-escaped via name_map. Sentiment selected from net direction.
+    """
+    top_movers = snapshot.get("top_movers") or {"up": [], "down": []}
+    up_list = top_movers.get("up") or []
+    down_list = top_movers.get("down") or []
+    name_map = snapshot.get("name_map") or {}
+
+    def _name(ticker: str) -> str:
+        raw = name_map.get(ticker, ticker)
+        return html.escape(raw)
+
+    # ADR-10: sentiment based on net direction
+    if len(up_list) > len(down_list):
+        sentiment = "green"
+    elif len(down_list) > len(up_list):
+        sentiment = "red"
+    else:
+        sentiment = "flat"
+
+    bucket = _hour_bucket(datetime.now(_TZ_MADRID).hour)
+    greeting = _pick_greeting(bucket, sentiment, rng)
+
+    if not up_list and not down_list:
+        return (
+            f"{greeting}\n\nMercado tranquilo hoy: ninguna posición se mueve "
+            "por encima del ruido habitual."
+        )
+
+    parts = [greeting, ""]
+
+    if up_list:
+        parts.append("Los que tiran hoy:")
+        for item in up_list:
+            parts.append(f"• <b>{_name(item['ticker'])}</b>  {_fmt_pct(item['change_pct'])}")
+    else:
+        parts.append("Nadie sube hoy.")
+
+    parts.append("")
+
+    if down_list:
+        parts.append("Los que pesan hoy:")
+        for item in down_list:
+            parts.append(f"• <b>{_name(item['ticker'])}</b>  {_fmt_pct(item['change_pct'])}")
+    else:
+        parts.append("Nadie cae hoy.")
+
+    return "\n".join(parts)
+
+
+# ── /cuentas (T7) ─────────────────────────────────────────────────────────────
 
 def _handle_cuentas(chat_id: int, user_id: str, raw_text: str, args: list[str]) -> None:
-    """Stub for /cuentas — implemented in PR2 (T7)."""
-    raise NotImplementedError("_handle_cuentas not yet implemented (PR2)")
+    """T7: Show per-account portfolio breakdown from a single cached snapshot.
 
+    ADR-2: single all-accounts snapshot; in-memory partition by account_id.
+    ADR-13: always shows full breakdown, no per-account arg.
+    Orphan positions (account_id=NULL) grouped under 'Sin cuenta'.
+    """
+    user_info = resolve_user_by_chat(str(chat_id))
+    if user_info is None:
+        _tg_send(chat_id, "No vinculado. Genera enlace en /ajustes web.")
+        return
+
+    uid = user_info["user_id"]
+    ok, reason = telegram_rate_limit.should_serve(uid, int(chat_id), "cuentas")
+    if not ok:
+        if reason == "plan_exceeded":
+            _tg_send(
+                chat_id,
+                "Has agotado tus 5 consultas semanales gratis. "
+                "Hazte Pro: https://ratiovault.com/ajustes#subscription-heading",
+            )
+        else:
+            _tg_send(chat_id, "Espera un momento, estás enviando demasiados mensajes.")
+        return
+
+    supa = get_supabase_service()
+
+    # Single snapshot call — partition in-memory (ADR-2, C5 invariant)
+    try:
+        snapshot = get_cached_snapshot(supa, uid, account_id=None)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("cuentas: snapshot fetch failed for user %s: %s", uid, exc)
+        _tg_send(chat_id, "No pude obtener los datos de tu cartera. Inténtalo de nuevo.")
+        return
+
+    # Load account names (single SELECT)
+    try:
+        acc_resp = (
+            supa.table("accounts")
+            .select("id,name")
+            .eq("user_id", uid)
+            .execute()
+        )
+        accounts_data = acc_resp.data or []
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("cuentas: accounts fetch failed for user %s: %s", uid, exc)
+        accounts_data = []
+
+    acc_name_map = {a["id"]: a["name"] for a in accounts_data}
+
+    # Partition positions by account_id
+    positions = snapshot.get("positions") or []
+    by_account: dict[str | None, list[dict]] = {}
+    for pos in positions:
+        key = pos.get("account_id")
+        by_account.setdefault(key, []).append(pos)
+
+    base_currency = snapshot.get("base_currency", "EUR")
+    _tg_send(chat_id, _format_cuentas(by_account, acc_name_map, base_currency, rng=random))
+
+
+def _format_cuentas(
+    by_account: dict,
+    acc_name_map: dict[str, str],
+    base_currency: str,
+    *,
+    rng: random.Random | types.ModuleType,
+) -> str:
+    """Format per-account breakdown as HTML. Design §4.3 locked copy.
+
+    by_account: {account_id | None: [position_dicts]}
+    acc_name_map: {account_id: display_name}
+    Orphans (key=None) shown as 'Sin cuenta'.
+    All account names HTML-escaped.
+    """
+    bucket = _hour_bucket(datetime.now(_TZ_MADRID).hour)
+    greeting = _pick_greeting(bucket, "flat", rng)
+
+    # Check empty state — no positions at all
+    total_positions = sum(len(v) for v in by_account.values())
+    if total_positions == 0:
+        return (
+            f"{greeting}\n\n"
+            "Aún no tienes cuentas configuradas ni posiciones huérfanas. "
+            "Cuando registres alguna te haré un desglose."
+        )
+
+    parts = [greeting, "", "Tu cartera repartida por cuentas:"]
+    grand_total = 0.0
+
+    # Named accounts first (sorted by name), then orphans
+    named_keys = [k for k in by_account if k is not None]
+    named_keys_sorted = sorted(named_keys, key=lambda k: acc_name_map.get(k, k))
+
+    for acc_id in named_keys_sorted:
+        pos_list = by_account[acc_id]
+        name_raw = acc_name_map.get(acc_id, acc_id or "Cuenta desconocida")
+        name_escaped = html.escape(name_raw)
+        total = sum(p.get("current_value", 0.0) or 0.0 for p in pos_list)
+        day_delta = sum(p.get("pnl_day", 0.0) or 0.0 for p in pos_list)
+        n = len(pos_list)
+        grand_total += total
+
+        parts += [
+            "",
+            f"<b>{name_escaped}</b>  ({n} {'posición' if n == 1 else 'posiciones'})",
+            f"  Total: {_fmt_currency(total, base_currency)} · {_fmt_signed(day_delta, base_currency)} hoy",
+        ]
+
+    # Orphans (account_id = NULL)
+    if None in by_account:
+        orphans = by_account[None]
+        total = sum(p.get("current_value", 0.0) or 0.0 for p in orphans)
+        day_delta = sum(p.get("pnl_day", 0.0) or 0.0 for p in orphans)
+        n = len(orphans)
+        grand_total += total
+        parts += [
+            "",
+            f"<b>Sin cuenta</b>  ({n} {'posición' if n == 1 else 'posiciones'})",
+            f"  Total: {_fmt_currency(total, base_currency)} · {_fmt_signed(day_delta, base_currency)} hoy",
+        ]
+
+    parts += ["", f"Total general: <b>{_fmt_currency(grand_total, base_currency)}</b>"]
+    return "\n".join(parts)
+
+
+# ── /dividendos (T8) ──────────────────────────────────────────────────────────
 
 def _handle_dividendos(chat_id: int, user_id: str, raw_text: str, args: list[str]) -> None:
-    """Stub for /dividendos — implemented in PR2 (T8)."""
-    raise NotImplementedError("_handle_dividendos not yet implemented (PR2)")
+    """T8: Show dividend summary: current-month total, YTD total, last 5 rows.
+
+    NULL-amount rows excluded from totals but shown in list as '—'.
+    ADR-8: NULL rows render with em-dash, excluded from sums.
+    """
+    user_info = resolve_user_by_chat(str(chat_id))
+    if user_info is None:
+        _tg_send(chat_id, "No vinculado. Genera enlace en /ajustes web.")
+        return
+
+    uid = user_info["user_id"]
+    ok, reason = telegram_rate_limit.should_serve(uid, int(chat_id), "dividendos")
+    if not ok:
+        if reason == "plan_exceeded":
+            _tg_send(
+                chat_id,
+                "Has agotado tus 5 consultas semanales gratis. "
+                "Hazte Pro: https://ratiovault.com/ajustes#subscription-heading",
+            )
+        else:
+            _tg_send(chat_id, "Espera un momento, estás enviando demasiados mensajes.")
+        return
+
+    supa = get_supabase_service()
+    try:
+        resp = (
+            supa.table("transactions")
+            .select("date,ticker,amount,withholding,currency")
+            .eq("user_id", uid)
+            .eq("type", "dividend")
+            .order("date", desc=True)
+            .execute()
+        )
+        rows = resp.data or []
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("dividendos: transactions fetch failed for user %s: %s", uid, exc)
+        _tg_send(chat_id, "No pude consultar tus dividendos. Inténtalo de nuevo.")
+        return
+
+    if not rows:
+        bucket = _hour_bucket(datetime.now(_TZ_MADRID).hour)
+        greeting = _pick_greeting(bucket, "flat", random)
+        _tg_send(
+            chat_id,
+            f"{greeting}\n\n"
+            "Aún no tengo cobros de dividendos registrados. "
+            "En cuanto tu broker reporte el primero, lo verás aquí.",
+        )
+        return
+
+    today = datetime.now(_TZ_MADRID).date()
+    base_currency = "EUR"
+
+    # Compute totals (NULL amounts excluded per spec / ADR-8)
+    month_total = 0.0
+    ytd_total = 0.0
+    for row in rows:
+        amt = row.get("amount")
+        if amt is None:
+            continue
+        row_date_str = row.get("date", "")
+        try:
+            row_date = _date_type.fromisoformat(row_date_str[:10])
+        except (ValueError, TypeError):
+            continue
+        if row_date.year == today.year:
+            ytd_total += float(amt)
+        if row_date.year == today.year and row_date.month == today.month:
+            month_total += float(amt)
+
+    last_5 = rows[:5]
+    _tg_send(chat_id, _format_dividendos(last_5, month_total, ytd_total, base_currency, rng=random))
+
+
+def _format_dividendos(
+    rows: list[dict],
+    month_total: float,
+    ytd_total: float,
+    base_currency: str,
+    *,
+    rng: random.Random | types.ModuleType,
+) -> str:
+    """Format dividend summary as HTML. Design §4.4 locked copy.
+
+    ADR-8: NULL-amount rows render as '—', excluded from totals.
+    ADR-10: month_total > 0 → 'green' greeting; else 'neutral' (no red).
+    """
+    sentiment = "green" if month_total > 0 else "flat"
+    bucket = _hour_bucket(datetime.now(_TZ_MADRID).hour)
+    greeting = _pick_greeting(bucket, sentiment, rng)
+
+    parts = [
+        greeting,
+        "",
+        "Pulso de dividendos:",
+        f"Este mes: <b>{_fmt_currency(month_total, base_currency)}</b>",
+        f"Acumulado del año: <b>{_fmt_currency(ytd_total, base_currency)}</b>",
+        "",
+        "Últimos cobros:",
+    ]
+
+    for row in rows:
+        date_str = (row.get("date") or "")[:10]
+        ticker = html.escape(row.get("ticker") or "—")
+        amt = row.get("amount")
+        withholding = row.get("withholding")
+        ccy = row.get("currency") or base_currency
+
+        if amt is None:
+            amt_str = "—   (importe no disponible)"
+        else:
+            amt_str = _fmt_currency(float(amt), ccy)
+
+        if withholding is not None:
+            ret_str = f"  (ret. {_fmt_currency(float(withholding), ccy)})"
+        else:
+            ret_str = ""
+
+        parts.append(f"• {date_str}  {ticker}  {amt_str}{ret_str}")
+
+    return "\n".join(parts)
 
 
 # ── Dispatch infrastructure (ADR-5: plain dict, no decorator framework) ────────
