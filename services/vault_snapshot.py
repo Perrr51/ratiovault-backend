@@ -59,10 +59,11 @@ def _build_positions_query(supa, user_id: str, account_id: Optional[str]):
             "id,ticker,shares,buy_price,currency,purchase_base_rate,account_id,exclude_from_totals"
         )
         .eq("user_id", user_id)
+        .eq("status", "open")  # telegram-totals-regression-v2: exclude closed positions
     )
 
     if account_id is None:
-        return base_query  # all positions, including NULL account_id
+        return base_query  # all open positions, including NULL account_id
 
     # Strict equality — SUPERSEDES telegram-vault-parity D2 (or_ with IS NULL).
     return base_query.eq("account_id", account_id)
@@ -79,6 +80,7 @@ def _count_unassigned(supa, user_id: str) -> tuple[int, float]:
             supa.table("positions")
             .select("shares,buy_price,currency,exclude_from_totals")
             .eq("user_id", user_id)
+            .eq("status", "open")  # telegram-totals-regression-v2: exclude closed positions
             .is_("account_id", "null")
             .execute()
         )
