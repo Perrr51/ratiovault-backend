@@ -11,7 +11,13 @@ POST /telegram/webhook
 """
 from __future__ import annotations
 
+import html
 import logging
+import random
+import types
+from datetime import datetime
+from typing import Callable, Literal
+from zoneinfo import ZoneInfo
 
 import httpx
 from fastapi import APIRouter, Header, HTTPException, Request
@@ -352,7 +358,7 @@ def _handle_vault(chat_id: str | int) -> None:
             user_id, account_id=account_id, base_currency=base_currency,
             include_unassigned_footer=(account_id is not None),
         )
-        _tg_send(chat_id, _format_vault(snapshot), reply_markup=_vault_refresh_keyboard(scope))
+        _tg_send(chat_id, _format_vault(snapshot, now=None, rng=None), reply_markup=_vault_refresh_keyboard(scope))
     else:
         # Multi-account: send inline keyboard with account picker + refresh button
         buttons = [[{"text": acc["name"], "callback_data": f"vault:{acc['id']}"}] for acc in accounts]
@@ -381,12 +387,233 @@ def _vault_refresh_keyboard(scope: str) -> dict:
     }
 
 
-def _format_vault(snapshot: dict) -> str:
-    """Format vault snapshot as HTML string."""
+# ── Voice-tone greeting system ─────────────────────────────────────────────────
+
+_TZ_MADRID = ZoneInfo("Europe/Madrid")
+_FLAT_THRESHOLD = 0.001  # ADR-5: 0.1% relative
+
+# Greeting table: (hour_bucket, sentiment) → list[str] — ADR-7: copy locked in design.
+_GREETINGS: dict[tuple[str, str], list[str]] = {  # ADR-7
+    ("morning", "green"): [
+        "Buenos días. Empezamos con el pie derecho hoy.",
+        "Buenos días, parece que el mercado te sonríe.",
+    ],
+    ("morning", "red"): [
+        "Buenos días. La sesión arranca en rojo, paciencia.",
+        "Buenos días, hoy toca aguantar el chaparrón.",
+    ],
+    ("morning", "flat"): [
+        "Buenos días. Mercado tranquilo, sin sobresaltos.",
+        "Buenos días, todo en su sitio por ahora.",
+    ],
+    ("afternoon", "green"): [
+        "Buenas tardes. Las cosas van bien hoy.",
+        "Buenas tardes, la cartera respira con calma.",
+    ],
+    ("afternoon", "red"): [
+        "Buenas tardes. Día complicado, pero sin drama.",
+        "Buenas tardes, hoy el mercado va a contracorriente.",
+    ],
+    ("afternoon", "flat"): [
+        "Buenas tardes. Sin grandes movimientos por ahora.",
+        "Buenas tardes, jornada sosegada en los mercados.",
+    ],
+    ("evening", "green"): [
+        "Buenas noches. Cerramos el día con buen sabor.",
+        "Buenas noches, hoy te vas a dormir contento.",
+    ],
+    ("evening", "red"): [
+        "Buenas noches. Hoy no ha sido el día, mañana más.",
+        "Buenas noches, toca encajar y seguir.",
+    ],
+    ("evening", "flat"): [
+        "Buenas noches. Día plano, sin sustos.",
+        "Buenas noches, el mercado se ha portado discreto.",
+    ],
+    ("night", "green"): [
+        "A estas horas y aún en verde — descansa tranquilo.",
+        "Aún despierto. Las cifras siguen sonriéndote.",
+    ],
+    ("night", "red"): [
+        "A estas horas conviene no obsesionarse con el rojo.",
+        "Aún despierto. El día fue duro, mañana se ve mejor.",
+    ],
+    ("night", "flat"): [
+        "A estas horas todo está quieto. Descansa.",
+        "Aún despierto. Mercado en calma, deberías dormir.",
+    ],
+}
+
+
+def _hour_bucket(hour: int) -> Literal["morning", "afternoon", "evening", "night"]:
+    """Map a 0–23 hour to a named time bucket."""
+    if 6 <= hour <= 11:
+        return "morning"
+    if 12 <= hour <= 19:
+        return "afternoon"
+    if 20 <= hour <= 23:
+        return "evening"
+    return "night"
+
+
+def _sentiment(pnl_total: float, total: float) -> Literal["green", "red", "flat"]:
+    """Classify P&L sentiment relative to portfolio size. ADR-5: 0.1% threshold."""
+    relative = abs(pnl_total) / max(abs(total), 1.0)
+    if relative < _FLAT_THRESHOLD:
+        return "flat"
+    return "green" if pnl_total > 0 else "red"
+
+
+def _pick_greeting(
+    bucket: str,
+    sentiment: str,
+    rng: random.Random | types.ModuleType,
+) -> str:
+    """Return a greeting string from the locked table for (bucket, sentiment)."""
+    options = _GREETINGS.get((bucket, sentiment), ["Hola."])
+    return rng.choice(options)
+
+
+def _movers_narrative(snapshot: dict, name_map: dict[str, str]) -> str:
+    """Return sentence-form mover line. Empty string when no movers.
+
+    Names HTML-escaped via html.escape on name_map[ticker] before insertion.
+    Falls back to ticker when name_map missing the key. ADR-1 (no Jinja2).
+    """
+    top_up = snapshot.get("top_up")
+    top_down = snapshot.get("top_down")
+
+    def _name(ticker: str) -> str:
+        raw = name_map.get(ticker, ticker)
+        return html.escape(raw)
+
+    if top_up and top_down:
+        name_up = _name(top_up["ticker"])
+        name_down = _name(top_down["ticker"])
+        return (
+            f"Hoy tira de la cartera <b>{name_up}</b> ({_fmt_pct(top_up['change_pct'])}), "
+            f"mientras que <b>{name_down}</b> sufre ({_fmt_pct(top_down['change_pct'])})."
+        )
+    if top_up:
+        name_up = _name(top_up["ticker"])
+        return f"Hoy destaca <b>{name_up}</b> con {_fmt_pct(top_up['change_pct'])}."
+    if top_down:
+        name_down = _name(top_down["ticker"])
+        return f"El lastre de hoy es <b>{name_down}</b> con {_fmt_pct(top_down['change_pct'])}."
+    return ""
+
+
+def _delta_line(
+    pnl_yesterday: float | None,
+    total: float,
+    pnl_day: float,
+) -> str | None:
+    """Spanish peninsular tuteo sentence, or None when pnl_yesterday is None.
+
+    Format: 'Ayer cerraste con {signed_amount}, hoy vas en {signed_today_pct}.'
+    """
+    if pnl_yesterday is None:
+        return None
+    base = "EUR"  # resolved by caller; default acceptable here — caller passes base
+    pct_day = (pnl_day / (total - pnl_day) * 100) if (total - pnl_day) != 0 else 0.0
+    return f"Ayer cerraste con {_fmt_signed(pnl_yesterday, base)}, hoy vas en {_fmt_pct(pct_day)}."
+
+
+def _footer_line(
+    unassigned_count: int,
+    unassigned_approx: float,
+    base: str,
+) -> str | None:
+    """Existing footer logic, extracted for testability. None when count == 0."""
+    if unassigned_count <= 0:
+        return None
+    return (
+        f"\n⚠️ {unassigned_count} posición(es) sin cuenta "
+        f"(~{_fmt_currency(unassigned_approx, base)}) no incluida(s) en el total."
+    )
+
+
+# Four templates. Each takes (greeting, total_line, pnl_lines, movers, delta, footer, n)
+# and returns an HTML string. ADR-1, ADR-6.
+
+def _tpl_classic(greeting: str, total_line: str, pnl_lines: str,
+                 movers: str, delta: str | None, footer: str | None, n: int) -> str:
+    parts = [greeting, "", total_line, pnl_lines]
+    if movers:
+        parts += ["", movers]
+    if delta:
+        parts.append(delta)
+    parts += ["", f"Posiciones abiertas: {n}"]
+    if footer:
+        parts.append(footer)
+    return "\n".join(parts)
+
+
+def _tpl_narrative(greeting: str, total_line: str, pnl_lines: str,
+                   movers: str, delta: str | None, footer: str | None, n: int) -> str:
+    intro = f"{greeting} {total_line}, con {pnl_lines}."
+    parts = [intro]
+    if movers:
+        parts += ["", movers]
+    if delta:
+        parts.append(delta)
+    parts += ["", f"Posiciones abiertas: {n}"]
+    if footer:
+        parts.append(footer)
+    return "\n".join(parts)
+
+
+def _tpl_letter(greeting: str, total_line: str, pnl_lines: str,
+                movers: str, delta: str | None, footer: str | None, n: int) -> str:
+    parts = [
+        "Señor,",
+        "",
+        f"{greeting} Hoy la cartera vale {total_line}, {pnl_lines}.",
+    ]
+    if movers:
+        parts += ["", movers]
+    if delta:
+        parts.append(delta)
+    parts += ["", f"Quedan {n} posiciones abiertas."]
+    if footer:
+        parts.append(footer)
+    return "\n".join(parts)
+
+
+def _tpl_brief(greeting: str, total_line: str, pnl_lines: str,
+               movers: str, delta: str | None, footer: str | None, n: int) -> str:
+    parts = [greeting, "", f"{total_line} · {pnl_lines}"]
+    if movers:
+        parts.append(movers)
+    if delta:
+        parts.append(delta)
+    parts += ["", f"{n} posiciones."]
+    if footer:
+        parts.append(footer)
+    return "\n".join(parts)
+
+
+_TEMPLATES: list[Callable[..., str]] = [  # ADR-1, ADR-6
+    _tpl_classic, _tpl_narrative, _tpl_letter, _tpl_brief
+]
+
+
+def _format_vault(
+    snapshot: dict,
+    *,
+    now: datetime | None = None,
+    rng: random.Random | types.ModuleType | None = None,
+) -> str:
+    """Format vault snapshot as HTML string. ADR-8: now + rng as keyword-only args."""
     base = snapshot.get("base_currency", "EUR")
 
     if snapshot.get("position_count", 0) == 0:
         return "Tu Vault está vacío. Importa CSV o añade posiciones desde /portfolio."
+
+    if rng is None:
+        rng = random
+    if now is None:
+        now = datetime.now(_TZ_MADRID)
 
     total = snapshot["total"]
     pnl_total = snapshot["pnl_total"]
@@ -394,36 +621,34 @@ def _format_vault(snapshot: dict) -> str:
     pct_total = (pnl_total / (total - pnl_total) * 100) if (total - pnl_total) != 0 else 0.0
     pct_day = (pnl_day / (total - pnl_day) * 100) if (total - pnl_day) != 0 else 0.0
 
-    lines = [
-        "📊 <b>Tu Vault</b>",
-        "",
-        f"Total: {_fmt_currency(total, base)}",
-        f"P&amp;L Total: {_fmt_signed(pnl_total, base)} ({_fmt_pct(pct_total)})",
-        f"P&amp;L Día: {_fmt_signed(pnl_day, base)} ({_fmt_pct(pct_day)})",
-    ]
+    bucket = _hour_bucket(now.hour)
+    sent = _sentiment(pnl_total, total)
+    greeting = _pick_greeting(bucket, sent, rng)
 
-    top_up = snapshot.get("top_up")
-    top_down = snapshot.get("top_down")
-    if top_up or top_down:
-        lines.append("")
-        if top_up:
-            lines.append(f"📈 Mejor: {top_up['ticker']} ({_fmt_pct(top_up['change_pct'])})")
-        if top_down:
-            lines.append(f"📉 Peor: {top_down['ticker']} ({_fmt_pct(top_down['change_pct'])})")
+    name_map = snapshot.get("name_map") or {}
+    movers = _movers_narrative(snapshot, name_map)
+    delta = _delta_line(snapshot.get("pnl_yesterday"), total, pnl_day)
 
-    lines.append("")
-    lines.append(f"Posiciones abiertas: {snapshot['position_count']}")
-
-    # R3: surface unassigned-account positions without inflating the total
-    unassigned_count = snapshot.get("unassigned_count", 0)
-    if unassigned_count > 0:
-        unassigned_approx = snapshot.get("unassigned_approx", 0.0)
-        lines.append(
-            f"\n⚠️ {unassigned_count} posición(es) sin cuenta "
-            f"(~{_fmt_currency(unassigned_approx, base)}) no incluida(s) en el total."
+    # Pass base to _delta_line — we rebuild it with correct base here
+    if delta is not None:
+        pct_day_val = pct_day
+        delta = (
+            f"Ayer cerraste con {_fmt_signed(snapshot['pnl_yesterday'], base)}, "
+            f"hoy vas en {_fmt_pct(pct_day_val)}."
         )
 
-    return "\n".join(lines)
+    footer = _footer_line(
+        snapshot.get("unassigned_count", 0),
+        snapshot.get("unassigned_approx", 0.0),
+        base,
+    )
+    n = snapshot["position_count"]
+
+    total_line = f"Total: {_fmt_currency(total, base)}"
+    pnl_lines = f"P&amp;L Total: {_fmt_signed(pnl_total, base)} ({_fmt_pct(pct_total)}), P&amp;L Día: {_fmt_signed(pnl_day, base)} ({_fmt_pct(pct_day)})"
+
+    idx = rng.randrange(len(_TEMPLATES))
+    return _TEMPLATES[idx](greeting, total_line, pnl_lines, movers, delta, footer, n)
 
 
 # ── /watchlist ──────────────────────────────────────────────────────────────────
@@ -697,7 +922,7 @@ def _handle_vault_callback(chat_id: int, message_id: int | None, account_id_str:
         user_id, account_id=account_id, base_currency=base_currency,
         include_unassigned_footer=(account_id is not None),
     )
-    text = _format_vault(snapshot)
+    text = _format_vault(snapshot, now=None, rng=None)
     keyboard = _vault_refresh_keyboard(scope)
 
     if message_id:
@@ -794,7 +1019,7 @@ def _handle_vault_refresh_callback(
         user_id, account_id=account_id, base_currency=base_currency,
         include_unassigned_footer=(account_id is not None),
     )
-    text = _format_vault(snapshot)
+    text = _format_vault(snapshot, now=None, rng=None)
     keyboard = _vault_refresh_keyboard(scope)
 
     if message_id:
