@@ -5,6 +5,9 @@ Covers:
   - T2: R4b     — GBX fallback safety net in _FX_FALLBACK
   - T3: R5      — cash position short-circuit (no price fetch, buy_price used)
   - T4: R6      — D1 forex accessor + D3 Stooq currency map invariants
+  - S1: snapshot includes name_map and pnl_yesterday keys (telegram-bot-voice-tone)
+  - S2–S7: _resolve_names priority chain + _get_pnl_yesterday helpers
+  - S8: existing keys preserved after adding name_map/pnl_yesterday
 """
 from __future__ import annotations
 
@@ -848,3 +851,291 @@ class TestRefreshCallbackTickerCollection:
         calls = supa.table.call_args_list
         pos_table_calls = [c for c in calls if c[0][0] == "positions"]
         assert len(pos_table_calls) >= 1, "positions table must be queried at least once"
+
+
+# ---------------------------------------------------------------------------
+# S1 — snapshot includes name_map and pnl_yesterday keys (telegram-bot-voice-tone)
+# S8 — existing keys preserved
+# ---------------------------------------------------------------------------
+
+def _make_supa_voice_tone(positions_data: list, extra_table_handlers: dict | None = None):
+    """Supabase mock for voice-tone tests.
+
+    Handles positions query (with status filter) plus optional per-table handlers
+    for positions (custom_name), ticker_memory and portfolio_history queries.
+    """
+    mock = MagicMock()
+    positions_result = MagicMock(data=positions_data)
+
+    def table_side_effect(name):
+        if extra_table_handlers and name in extra_table_handlers:
+            return extra_table_handlers[name]()
+        if name == "positions":
+            t = MagicMock()
+            sel = MagicMock()
+            t.select.return_value = sel
+            eq_uid = MagicMock()
+            sel.eq.return_value = eq_uid
+            eq_status = MagicMock()
+            eq_uid.eq.return_value = eq_status
+            eq_account = MagicMock()
+            eq_status.eq.return_value = eq_account
+            eq_account.execute.return_value = positions_result
+            eq_status.execute.return_value = positions_result
+            is_mock = MagicMock()
+            eq_status.is_.return_value = is_mock
+            is_mock.execute.return_value = MagicMock(data=[])
+            return t
+        # default: return empty
+        t = MagicMock()
+        t.select.return_value.eq.return_value.execute.return_value = MagicMock(data=[])
+        return t
+
+    mock.table.side_effect = table_side_effect
+    return mock
+
+
+_VOICE_TONE_POSITIONS = [
+    {
+        "id": "p1", "ticker": "VWCE.DE", "shares": 10.0,
+        "buy_price": 100.0, "currency": "EUR",
+        "purchase_base_rate": 1.0, "account_id": "acc-1",
+        "exclude_from_totals": False,
+    }
+]
+
+_VOICE_TONE_PRICES = {
+    "VWCE.DE": {
+        "ticker": "VWCE.DE", "price": 110.0, "currency": "EUR",
+        "previous_close": 109.0, "change_pct_day": 0.92,
+    }
+}
+
+
+class TestSnapshotNewKeys:
+    """S1 — get_vault_snapshot returns name_map and pnl_yesterday keys."""
+
+    def test_snapshot_includes_name_map_and_pnl_yesterday_keys(self):
+        """S1: Both name_map and pnl_yesterday keys must be present in the snapshot."""
+        supa = _make_supa_voice_tone(_VOICE_TONE_POSITIONS)
+
+        with patch("services.vault_snapshot.get_supabase_service", return_value=supa):
+            with patch("services.vault_snapshot.price_cache.get_prices_batch",
+                       return_value=_VOICE_TONE_PRICES):
+                with patch("services.vault_snapshot.get_forex_rates", return_value=_FOREX_EUR):
+                    from services.vault_snapshot import get_vault_snapshot
+                    snap = get_vault_snapshot(
+                        user_id="user-1",
+                        account_id="acc-1",
+                        base_currency="EUR",
+                        include_unassigned_footer=False,
+                    )
+
+        assert "name_map" in snap, "snapshot must include name_map key"
+        assert "pnl_yesterday" in snap, "snapshot must include pnl_yesterday key"
+
+    def test_existing_keys_preserved(self):
+        """S8: All previously-existing keys must still be present and have correct types."""
+        supa = _make_supa_voice_tone(_VOICE_TONE_POSITIONS)
+
+        with patch("services.vault_snapshot.get_supabase_service", return_value=supa):
+            with patch("services.vault_snapshot.price_cache.get_prices_batch",
+                       return_value=_VOICE_TONE_PRICES):
+                with patch("services.vault_snapshot.get_forex_rates", return_value=_FOREX_EUR):
+                    from services.vault_snapshot import get_vault_snapshot
+                    snap = get_vault_snapshot(
+                        user_id="user-1",
+                        account_id="acc-1",
+                        base_currency="EUR",
+                        include_unassigned_footer=False,
+                    )
+
+        assert isinstance(snap["total"], float), "total must be float"
+        assert isinstance(snap["pnl_total"], float), "pnl_total must be float"
+        assert isinstance(snap["pnl_day"], float), "pnl_day must be float"
+        assert isinstance(snap["position_count"], int), "position_count must be int"
+        assert isinstance(snap["base_currency"], str), "base_currency must be str"
+        assert isinstance(snap["unassigned_count"], int), "unassigned_count must be int"
+        assert isinstance(snap["unassigned_approx"], float), "unassigned_approx must be float"
+
+    def test_snapshot_wires_helpers_real_values(self):
+        """S1-integration: get_vault_snapshot calls helpers and puts real values in dict."""
+        supa = _make_supa_voice_tone(_VOICE_TONE_POSITIONS)
+
+        with patch("services.vault_snapshot.get_supabase_service", return_value=supa):
+            with patch("services.vault_snapshot.price_cache.get_prices_batch",
+                       return_value=_VOICE_TONE_PRICES):
+                with patch("services.vault_snapshot.get_forex_rates", return_value=_FOREX_EUR):
+                    with patch("services.vault_snapshot._resolve_names",
+                               return_value={"VWCE.DE": "Vanguard FTSE"}) as mock_names:
+                        with patch("services.vault_snapshot._get_pnl_yesterday",
+                                   return_value=42.5) as mock_pnl:
+                            from services.vault_snapshot import get_vault_snapshot
+                            snap = get_vault_snapshot(
+                                user_id="user-1",
+                                account_id="acc-1",
+                                base_currency="EUR",
+                                include_unassigned_footer=False,
+                            )
+
+        assert snap["name_map"] == {"VWCE.DE": "Vanguard FTSE"}, (
+            f"name_map must reflect _resolve_names output; got {snap['name_map']}"
+        )
+        assert snap["pnl_yesterday"] == 42.5, (
+            f"pnl_yesterday must reflect _get_pnl_yesterday output; got {snap['pnl_yesterday']}"
+        )
+        mock_names.assert_called_once()
+        mock_pnl.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# S2–S7 — _resolve_names and _get_pnl_yesterday helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_positions_custom_name_supa(positions_custom_names: list, ticker_memory_rows: list):
+    """Build a supa mock that serves custom_name queries for _resolve_names.
+
+    positions_custom_names: rows from positions (ticker, custom_name)
+    ticker_memory_rows: rows from ticker_memory (original_ticker, custom_name)
+    """
+    mock = MagicMock()
+
+    def table_side_effect(name):
+        if name == "positions":
+            t = MagicMock()
+            # _resolve_names calls: .table("positions").select("ticker,custom_name")
+            #   .eq("user_id", ...).in_("ticker", ...).not_.is_("custom_name","null").execute()
+            chain = MagicMock()
+            t.select.return_value = chain
+            chain.eq.return_value = chain
+            chain.in_.return_value = chain
+            chain.not_ = MagicMock()
+            chain.not_.is_.return_value = chain
+            chain.execute.return_value = MagicMock(data=positions_custom_names)
+            return t
+        if name == "ticker_memory":
+            t = MagicMock()
+            chain = MagicMock()
+            t.select.return_value = chain
+            chain.eq.return_value = chain
+            chain.in_.return_value = chain
+            chain.not_ = MagicMock()
+            chain.not_.is_.return_value = chain
+            chain.execute.return_value = MagicMock(data=ticker_memory_rows)
+            return t
+        t = MagicMock()
+        t.select.return_value.eq.return_value.execute.return_value = MagicMock(data=[])
+        return t
+
+    mock.table.side_effect = table_side_effect
+    return mock
+
+
+def _make_portfolio_history_supa(history_rows: list, raises: bool = False):
+    """Build a supa mock for _get_pnl_yesterday."""
+    mock = MagicMock()
+
+    def table_side_effect(name):
+        if name == "portfolio_history":
+            t = MagicMock()
+            if raises:
+                t.select.side_effect = Exception("DB error")
+            else:
+                chain = MagicMock()
+                t.select.return_value = chain
+                chain.eq.return_value = chain
+                chain.in_.return_value = chain
+                chain.order.return_value = chain
+                chain.limit.return_value = chain
+                chain.execute.return_value = MagicMock(data=history_rows)
+            return t
+        t = MagicMock()
+        t.select.return_value.eq.return_value.execute.return_value = MagicMock(data=[])
+        return t
+
+    mock.table.side_effect = table_side_effect
+    return mock
+
+
+class TestResolveNames:
+    """S2–S4 — _resolve_names priority chain."""
+
+    def test_name_map_resolves_positions_custom_name_first(self):
+        """S2: positions.custom_name takes priority over ticker_memory.custom_name."""
+        supa = _make_positions_custom_name_supa(
+            positions_custom_names=[{"ticker": "VWCE.DE", "custom_name": "My ETF"}],
+            ticker_memory_rows=[{"original_ticker": "VWCE.DE", "custom_name": "Memory ETF"}],
+        )
+        with patch("services.vault_snapshot.get_supabase_service", return_value=supa):
+            from services.vault_snapshot import _resolve_names
+            result = _resolve_names(supa, "user-1", ["VWCE.DE"])
+
+        assert result["VWCE.DE"] == "My ETF", (
+            f"positions.custom_name must win; got {result['VWCE.DE']!r}"
+        )
+
+    def test_name_map_falls_back_to_ticker_memory(self):
+        """S3: When positions.custom_name is NULL, use ticker_memory.custom_name."""
+        supa = _make_positions_custom_name_supa(
+            positions_custom_names=[],  # no custom_name in positions
+            ticker_memory_rows=[{"original_ticker": "VWCE.DE", "custom_name": "Memory ETF"}],
+        )
+        with patch("services.vault_snapshot.get_supabase_service", return_value=supa):
+            from services.vault_snapshot import _resolve_names
+            result = _resolve_names(supa, "user-1", ["VWCE.DE"])
+
+        assert result["VWCE.DE"] == "Memory ETF", (
+            f"ticker_memory.custom_name must be used as fallback; got {result['VWCE.DE']!r}"
+        )
+
+    def test_name_map_final_fallback_is_ticker(self):
+        """S4: When both custom_name sources are NULL, fallback is the raw ticker."""
+        supa = _make_positions_custom_name_supa(
+            positions_custom_names=[],
+            ticker_memory_rows=[],
+        )
+        with patch("services.vault_snapshot.get_supabase_service", return_value=supa):
+            from services.vault_snapshot import _resolve_names
+            result = _resolve_names(supa, "user-1", ["VWCE.DE"])
+
+        assert result["VWCE.DE"] == "VWCE.DE", (
+            f"raw ticker must be final fallback; got {result['VWCE.DE']!r}"
+        )
+
+
+class TestGetPnlYesterday:
+    """S5–S7 — _get_pnl_yesterday."""
+
+    def test_pnl_yesterday_returns_float_when_history_present(self):
+        """S5: Returns float diff when two portfolio_history rows are present."""
+        # t-1 row: total_value=10100, t-2 row: total_value=10000 → diff=100.0
+        history_rows = [
+            {"date": "2026-05-07", "total_value": 10100.0},
+            {"date": "2026-05-06", "total_value": 10000.0},
+        ]
+        supa = _make_portfolio_history_supa(history_rows)
+        with patch("services.vault_snapshot.get_supabase_service", return_value=supa):
+            from services.vault_snapshot import _get_pnl_yesterday
+            result = _get_pnl_yesterday(supa, "user-1", "EUR")
+
+        assert isinstance(result, float), f"expected float, got {type(result)}"
+        assert abs(result - 100.0) < 0.01, f"expected 100.0, got {result}"
+
+    def test_pnl_yesterday_returns_none_when_history_absent(self):
+        """S6: Returns None when no portfolio_history rows exist."""
+        supa = _make_portfolio_history_supa([])
+        with patch("services.vault_snapshot.get_supabase_service", return_value=supa):
+            from services.vault_snapshot import _get_pnl_yesterday
+            result = _get_pnl_yesterday(supa, "user-1", "EUR")
+
+        assert result is None, f"expected None, got {result}"
+
+    def test_pnl_yesterday_returns_none_on_db_exception(self):
+        """S7: Returns None and does not propagate when DB raises an exception."""
+        supa = _make_portfolio_history_supa([], raises=True)
+        with patch("services.vault_snapshot.get_supabase_service", return_value=supa):
+            from services.vault_snapshot import _get_pnl_yesterday
+            result = _get_pnl_yesterday(supa, "user-1", "EUR")
+
+        assert result is None, f"expected None on exception, got {result}"
