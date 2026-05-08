@@ -2,6 +2,7 @@
 
 PR1 (T0–T4): snapshot cache, top_movers extension, dispatch refactor.
 PR2 (T5–T12): /forex, /movers, /cuentas, /dividendos handlers + quota registration.
+PR3 (telegram-bot-fire-flow): /fire stateful FIRE-calc conversational flow + /cancel.
 
 ADR references (design doc §6):
   ADR-1: standalone snapshot_cache module
@@ -46,6 +47,7 @@ from services.telegram_link import (
     update_locale,
 )
 from services import telegram_rate_limit
+from services import telegram_fire_session
 from services.vault_snapshot import get_vault_snapshot
 from services.snapshot_cache import get_cached_snapshot
 from services.price_cache import get_price
@@ -72,6 +74,8 @@ _HELP_TEXT = (
     "/movers — Los que más suben y bajan hoy en tu cartera\n"
     "/cuentas — Desglose de tu cartera por cuentas\n"
     "/dividendos — Resumen de cobros de dividendos\n"
+    "/fire — Calcula tu plan FIRE (6 preguntas)\n"
+    "/cancel — Cancelar el flujo en curso\n"
     "/vincular 123456789 — Vincular este Telegram a tu cuenta\n"
     "/desvincular — Desvincular este Telegram de tu cuenta\n"
     "/idioma es|en|de|fr|it — Cambiar idioma del bot\n"
@@ -208,11 +212,31 @@ def _handle_message(message: dict) -> None:
 
     ADR-5: uses _COMMAND_DISPATCH dict instead of elif chain.
     Unknown commands and non-command text fall through to _HELP_TEXT (T17).
+    PR3: FIRE-flow intercept added before the non-command fallback.
     """
     chat_id = message.get("chat", {}).get("id")
     text: str = (message.get("text") or "").strip()
 
     logger.info("telegram message from chat_id=%s text=%r", chat_id, text[:80])
+
+    # ── FIRE-flow intercept (PR3) ─────────────────────────────────────────────
+    if telegram_fire_session.has_active_session(int(chat_id)):
+        if text == "/cancel":
+            # META command: cancel session + ack. No quota consumed.
+            telegram_fire_session.cancel_session(int(chat_id))
+            _tg_send(chat_id, telegram_fire_session.CANCEL_ACK)
+            return
+        if text.startswith("/"):
+            # Other /command mid-flow → silent clear, fall through to dispatch.
+            # ADR-D7: no extra quota consumed, no extra message.
+            telegram_fire_session.clear_session(int(chat_id))
+            # Fall through to normal command dispatch below.
+        else:
+            # Plain text answer for current step
+            step = telegram_fire_session.submit_answer(int(chat_id), text)
+            _emit_session_step(chat_id, step)
+            return
+    # ── end FIRE intercept ────────────────────────────────────────────────────
 
     if not text.startswith("/"):
         # T17 fallback — non-command text
@@ -235,6 +259,24 @@ def _handle_message(message: dict) -> None:
     # Handlers that need user_id resolve it themselves via resolve_user_by_chat.
     # The uniform Handler signature receives user_id="" for commands that self-resolve.
     handler(chat_id, "", text, args)
+
+
+def _emit_session_step(chat_id: int | str, step: telegram_fire_session.SessionStep) -> None:
+    """Send a session step result to the user via _tg_send.
+
+    Handles QUESTION, RESULT, ERROR, and EXPIRED kinds.
+    NOT_ACTIVE is a defensive no-op (should be unreachable when caller checked
+    has_active_session first).
+    """
+    if step.kind in (
+        telegram_fire_session.StepKind.QUESTION,
+        telegram_fire_session.StepKind.RESULT,
+        telegram_fire_session.StepKind.ERROR,
+        telegram_fire_session.StepKind.EXPIRED,
+    ):
+        _tg_send(chat_id, step.text)
+    elif step.kind == telegram_fire_session.StepKind.NOT_ACTIVE:
+        logger.warning("submit_answer NOT_ACTIVE for chat_id=%s — defensive path", chat_id)
 
 
 # ── /start ─────────────────────────────────────────────────────────────────────
@@ -1378,6 +1420,67 @@ def _wrap_idioma(fn: Callable) -> Handler:
     return adapter
 
 
+# ── /fire (PR3) ────────────────────────────────────────────────────────────────
+
+
+def _handle_fire(chat_id: int, user_id: str, raw_text: str, args: list[str]) -> None:
+    """Start a FIRE conversational session.
+
+    Quota consumed once here. Subsequent plain-text answers go through the
+    FIRE-flow intercept in _handle_message — they never call should_serve.
+    (spec §Quota Registration: quota MUST be consumed exactly once at /fire start)
+
+    ADR-D6: butler greeting prepended here (router layer), not in state module,
+    to avoid circular import with _pick_greeting.
+    """
+    user_info = resolve_user_by_chat(str(chat_id))
+    if user_info is None:
+        _tg_send(chat_id, "Vincula primero tu cuenta con /vincular.")
+        return
+
+    uid = user_info["user_id"]
+    ok, reason = telegram_rate_limit.should_serve(uid, int(chat_id), "fire")
+    if not ok:
+        if reason == "plan_exceeded":
+            _tg_send(
+                chat_id,
+                "Has alcanzado el límite semanal del plan Free. "
+                "/ajustes para upgrade.",
+            )
+        else:
+            _tg_send(chat_id, "Espera un momento, estás enviando demasiados mensajes.")
+        return
+
+    question = telegram_fire_session.start_session(int(chat_id))
+    # Prepend butler greeting (ADR-D6: state module returns Q1 raw prompt without greeting)
+    bucket = _hour_bucket(datetime.now(_TZ_MADRID).hour)
+    greeting = _pick_greeting(bucket, "flat", random)
+    _tg_send(chat_id, f"{greeting}\n\n{question.text}")
+
+
+# ── /cancel (PR3) ──────────────────────────────────────────────────────────────
+
+
+def _handle_cancel(chat_id: int, user_id: str, raw_text: str, args: list[str]) -> None:
+    """Idempotent cancel — META command, no quota consumed.
+
+    Two paths:
+    - Active session: send CANCEL_ACK.
+    - No session: send neutral "nothing to cancel" ack.
+
+    NOTE: /cancel during an active session also goes through the FIRE-flow
+    intercept in _handle_message (which returns early). This handler is only
+    reached when there is NO active session (the intercept already handled the
+    active-session case). It is still registered in _COMMAND_DISPATCH for the
+    no-session case and to appear in help text.
+    """
+    was_active = telegram_fire_session.cancel_session(int(chat_id))
+    if was_active:
+        _tg_send(chat_id, telegram_fire_session.CANCEL_ACK)
+    else:
+        _tg_send(chat_id, "No hay nada que cancelar.")
+
+
 # ADR-5: dict at module level, post-handler-definition, no decorator weight.
 # ADR-6: uniform Handler signature; existing handlers wrapped via shims.
 _COMMAND_DISPATCH: dict[str, Handler] = {
@@ -1389,11 +1492,14 @@ _COMMAND_DISPATCH: dict[str, Handler] = {
     "/vault":        _wrap_simple(_handle_vault),
     "/watchlist":    _wrap_simple(_handle_watchlist),
     "/precio":       _wrap_precio(_handle_precio),
-    # PR2 handlers (stubs until T5–T8 are implemented)
+    # PR2 handlers
     "/forex":        _handle_forex,
     "/movers":       _handle_movers,
     "/cuentas":      _handle_cuentas,
     "/dividendos":   _handle_dividendos,
+    # PR3 handlers
+    "/fire":         _handle_fire,
+    "/cancel":       _handle_cancel,
 }
 
 
