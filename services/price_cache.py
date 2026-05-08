@@ -60,6 +60,13 @@ def _fetch_yfinance(symbol: str) -> Optional[dict]:
             logger.debug("yfinance: missing price or prev for %s", symbol)
             return None
 
+        # R4a: GBX (London pence) normalization at boundary.
+        # yfinance returns price in pence for .L tickers; downstream wants GBP.
+        if (currency or "").upper() == "GBX":
+            price = price / 100.0
+            prev = prev / 100.0
+            currency = "GBP"
+
         change_pct_day = ((price - prev) / prev) * 100 if prev > 0 else None
 
         return {
