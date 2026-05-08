@@ -40,40 +40,6 @@ _FX_FALLBACK: dict[str, float] = {
 }
 
 
-def _resolve_default_account_id(supa, user_id: str) -> Optional[str]:
-    """Return the user's default account id or None if no accounts exist.
-
-    Default account resolution (D2 / S1):
-      1. If _HAS_IS_DEFAULT: prefer the account with is_default=True.
-      2. Fallback to the earliest account by created_at ASC (deterministic).
-      3. If no accounts: return None (get_vault_snapshot falls back to all-positions).
-    """
-    try:
-        select_cols = "id, created_at, is_default" if _HAS_IS_DEFAULT else "id, created_at"
-        resp = (
-            supa.table("accounts")
-            .select(select_cols)
-            .eq("user_id", user_id)
-            .order("created_at")
-            .execute()
-        )
-        accounts = resp.data or []
-    except Exception as e:
-        logger.warning("_resolve_default_account_id: accounts query failed: %s", e)
-        return None
-
-    if not accounts:
-        return None
-
-    if _HAS_IS_DEFAULT:
-        for acc in accounts:
-            if acc.get("is_default"):
-                return acc["id"]
-
-    # Fallback: first by created_at (already ordered)
-    return accounts[0]["id"]
-
-
 # Account filter contract (telegram-totals-regression, supersedes telegram-vault-parity D2):
 #   account_id=None     → no filter (all-accounts aggregate, includes NULL-account rows)
 #   account_id=<value>  → strict .eq() equality, EXCLUDES NULL-account rows

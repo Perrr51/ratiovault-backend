@@ -773,7 +773,11 @@ def _handle_vault_refresh_callback(
     logger.info("vault_refresh: invalidated %d cache rows for user %s scope=%s", deleted, user_id, scope)
 
     # Re-compute snapshot (will trigger fresh batch fetch via get_prices_batch)
-    snapshot = get_vault_snapshot(user_id, account_id=account_id, base_currency=base_currency)
+    # include_unassigned_footer mirrors _handle_vault and _handle_vault_callback (W2 fix)
+    snapshot = get_vault_snapshot(
+        user_id, account_id=account_id, base_currency=base_currency,
+        include_unassigned_footer=(account_id is not None),
+    )
     text = _format_vault(snapshot)
     keyboard = _vault_refresh_keyboard(scope)
 
