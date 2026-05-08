@@ -112,3 +112,69 @@ class TestQuotaExhaustedBlocksDividendos:
                         _handle_message({"chat": {"id": 1}, "text": "/dividendos"})
 
         mock_supa.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Q4 — quota exhausted blocks /movers
+# ---------------------------------------------------------------------------
+
+class TestQuotaExhaustedBlocksMovers:
+    """Q4: quota exhausted → /movers returns quota-exceeded; no snapshot fetched."""
+
+    def test_movers_quota_exceeded_message_sent(self):
+        with patch("routers.telegram_bot.resolve_user_by_chat", return_value={"user_id": "u1"}):
+            with patch("routers.telegram_bot.telegram_rate_limit.should_serve",
+                       return_value=(False, "plan_exceeded")):
+                with patch("routers.telegram_bot._tg_send") as mock_send:
+                    from routers.telegram_bot import _handle_message
+                    _handle_message({"chat": {"id": 1}, "text": "/movers"})
+
+        mock_send.assert_called_once()
+        text = mock_send.call_args[0][1].lower()
+        assert any(p in text for p in ["agotado", "límite", "semanal", "pro", "consultas"]), (
+            f"Quota-exceeded message expected for /movers, got: {mock_send.call_args[0][1]!r}"
+        )
+
+    def test_movers_quota_exceeded_does_not_call_snapshot(self):
+        with patch("routers.telegram_bot.resolve_user_by_chat", return_value={"user_id": "u1"}):
+            with patch("routers.telegram_bot.telegram_rate_limit.should_serve",
+                       return_value=(False, "plan_exceeded")):
+                with patch("routers.telegram_bot.get_cached_snapshot") as mock_snap:
+                    with patch("routers.telegram_bot._tg_send"):
+                        from routers.telegram_bot import _handle_message
+                        _handle_message({"chat": {"id": 1}, "text": "/movers"})
+
+        mock_snap.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Q5 — quota exhausted blocks /cuentas
+# ---------------------------------------------------------------------------
+
+class TestQuotaExhaustedBlocksCuentas:
+    """Q5: quota exhausted → /cuentas returns quota-exceeded; no snapshot/account fetch."""
+
+    def test_cuentas_quota_exceeded_message_sent(self):
+        with patch("routers.telegram_bot.resolve_user_by_chat", return_value={"user_id": "u1"}):
+            with patch("routers.telegram_bot.telegram_rate_limit.should_serve",
+                       return_value=(False, "plan_exceeded")):
+                with patch("routers.telegram_bot._tg_send") as mock_send:
+                    from routers.telegram_bot import _handle_message
+                    _handle_message({"chat": {"id": 1}, "text": "/cuentas"})
+
+        mock_send.assert_called_once()
+        text = mock_send.call_args[0][1].lower()
+        assert any(p in text for p in ["agotado", "límite", "semanal", "pro", "consultas"]), (
+            f"Quota-exceeded message expected for /cuentas, got: {mock_send.call_args[0][1]!r}"
+        )
+
+    def test_cuentas_quota_exceeded_does_not_call_snapshot(self):
+        with patch("routers.telegram_bot.resolve_user_by_chat", return_value={"user_id": "u1"}):
+            with patch("routers.telegram_bot.telegram_rate_limit.should_serve",
+                       return_value=(False, "plan_exceeded")):
+                with patch("routers.telegram_bot.get_cached_snapshot") as mock_snap:
+                    with patch("routers.telegram_bot._tg_send"):
+                        from routers.telegram_bot import _handle_message
+                        _handle_message({"chat": {"id": 1}, "text": "/cuentas"})
+
+        mock_snap.assert_not_called()

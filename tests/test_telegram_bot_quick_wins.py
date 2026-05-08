@@ -153,6 +153,64 @@ class TestForexHappyPath:
         )
 
 
+class TestForexCrossRateMath:
+    """F1b: cross-rate values mathematically correct (regression test for verify-pr2 CRITICAL)."""
+
+    def test_eur_cross_helper_returns_correct_values(self):
+        from routers.telegram_bot import _eur_cross
+        # USDEUR=0.92, USDCHF=0.88, USDGBP=0.79
+        assert _eur_cross(0.92, 1.0) == pytest.approx(1 / 0.92, rel=1e-6)  # EUR/USD ~1.0870
+        assert _eur_cross(0.92, 0.88) == pytest.approx(0.88 / 0.92, rel=1e-6)  # EUR/CHF ~0.9565
+        assert _eur_cross(0.92, 0.79) == pytest.approx(0.79 / 0.92, rel=1e-6)  # EUR/GBP ~0.8587
+
+    def test_eur_cross_returns_none_on_missing(self):
+        from routers.telegram_bot import _eur_cross
+        assert _eur_cross(None, 0.88) is None
+        assert _eur_cross(0.92, None) is None
+        assert _eur_cross(0, 0.88) is None  # falsy USDEUR
+
+    def test_forex_output_contains_correct_eur_chf(self):
+        """EUR/CHF must be ~0.9565, NOT ~1.136 (the bug)."""
+        rates = {"USDEUR": 0.92, "USDCHF": 0.88, "USDGBP": 0.79}
+        with patch("routers.telegram_bot.resolve_user_by_chat", return_value=_linked_user()):
+            with patch("routers.telegram_bot.telegram_rate_limit.should_serve",
+                       return_value=(True, None)):
+                with patch("routers.telegram_bot.get_forex_rates", return_value=rates):
+                    with patch("routers.telegram_bot._tg_send") as mock_send:
+                        from routers.telegram_bot import _handle_message
+                        _handle_message({"chat": {"id": 1}, "text": "/forex"})
+        text = mock_send.call_args[0][1]
+        assert "0.9565" in text, f"EUR/CHF must be ~0.9565 in output, got: {text!r}"
+        assert "1.1364" not in text, "EUR/CHF must NOT be 1/USDCHF (the bug)"
+
+    def test_forex_output_contains_correct_eur_gbp(self):
+        """EUR/GBP must be ~0.8587, NOT ~1.2658 (the bug)."""
+        rates = {"USDEUR": 0.92, "USDCHF": 0.88, "USDGBP": 0.79}
+        with patch("routers.telegram_bot.resolve_user_by_chat", return_value=_linked_user()):
+            with patch("routers.telegram_bot.telegram_rate_limit.should_serve",
+                       return_value=(True, None)):
+                with patch("routers.telegram_bot.get_forex_rates", return_value=rates):
+                    with patch("routers.telegram_bot._tg_send") as mock_send:
+                        from routers.telegram_bot import _handle_message
+                        _handle_message({"chat": {"id": 1}, "text": "/forex"})
+        text = mock_send.call_args[0][1]
+        assert "0.8587" in text, f"EUR/GBP must be ~0.8587 in output, got: {text!r}"
+        assert "1.2658" not in text, "EUR/GBP must NOT be 1/USDGBP (the bug)"
+
+    def test_forex_output_contains_correct_eur_usd(self):
+        """EUR/USD must be ~1.0870 (this was already correct, regression guard)."""
+        rates = {"USDEUR": 0.92, "USDCHF": 0.88, "USDGBP": 0.79}
+        with patch("routers.telegram_bot.resolve_user_by_chat", return_value=_linked_user()):
+            with patch("routers.telegram_bot.telegram_rate_limit.should_serve",
+                       return_value=(True, None)):
+                with patch("routers.telegram_bot.get_forex_rates", return_value=rates):
+                    with patch("routers.telegram_bot._tg_send") as mock_send:
+                        from routers.telegram_bot import _handle_message
+                        _handle_message({"chat": {"id": 1}, "text": "/forex"})
+        text = mock_send.call_args[0][1]
+        assert "1.0870" in text, f"EUR/USD must be ~1.0870 in output, got: {text!r}"
+
+
 class TestForexNoDelta:
     """F2: /forex output must NOT contain Δ or reference to 'ayer' as a comparison."""
 

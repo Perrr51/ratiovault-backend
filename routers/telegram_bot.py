@@ -926,6 +926,18 @@ def _handle_forex(chat_id: int, user_id: str, raw_text: str, args: list[str]) ->
     _tg_send(chat_id, _format_forex(rates, now=now_utc, rng=random))
 
 
+def _eur_cross(usd_eur: float | None, usd_quote: float | None) -> float | None:
+    """Return EUR/<quote> from USD-pivot rates.
+
+    USDEUR = EUR per 1 USD. USD<quote> = <quote> per 1 USD.
+    EUR/<quote> = USD<quote> / USDEUR.
+    For EUR/USD pass usd_quote=1.0 → returns 1/USDEUR.
+    """
+    if not usd_eur or usd_quote is None:
+        return None
+    return usd_quote / usd_eur
+
+
 def _format_forex(
     rates: dict[str, float],
     *,
@@ -947,20 +959,22 @@ def _format_forex(
     usd_chf = rates.get("USDCHF")
     usd_gbp = rates.get("USDGBP")
 
+    eur_usd = _eur_cross(usd_eur, 1.0)  # EUR/USD = 1/USDEUR
+    eur_chf = _eur_cross(usd_eur, usd_chf)  # EUR/CHF = USDCHF/USDEUR
+    eur_gbp = _eur_cross(usd_eur, usd_gbp)  # EUR/GBP = USDGBP/USDEUR
+
     def _rate_line(label: str, val: float | None) -> str:
-        if val is None or val == 0:
+        if val is None:
             return f"{label}: —"
-        # Invert to get EUR-based rate: EUR/USD = 1/USDEUR, etc.
-        eur_rate = 1.0 / val
-        return f"{label}: {eur_rate:.4f}"
+        return f"{label}: {val:.4f}"
 
     lines = [
         greeting,
         "",
         f"Tipo de cambio ahora mismo (UTC {now.strftime('%H:%M')}):",
-        _rate_line("EUR/USD", usd_eur),
-        _rate_line("EUR/CHF", usd_chf),
-        _rate_line("EUR/GBP", usd_gbp),
+        _rate_line("EUR/USD", eur_usd),
+        _rate_line("EUR/CHF", eur_chf),
+        _rate_line("EUR/GBP", eur_gbp),
         "",
         "Aún no llevamos histórico de divisas, así que solo te puedo entregar la foto del momento. "
         "Cuando tengamos serie diaria te apuntaré también el delta del día.",
