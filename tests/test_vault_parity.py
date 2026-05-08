@@ -98,11 +98,14 @@ def clear_supabase_cache():
 
 
 def _make_positions_supa(positions: list) -> MagicMock:
-    """Supabase mock that returns positions list for any table().select().eq().execute()."""
+    """Supabase mock that returns positions list for the positions query chain.
+
+    After telegram-totals-regression-v2 the chain includes .eq('status','open'):
+      table("positions").select(...).eq("user_id", uid).eq("status","open").execute()
+    """
     mock = MagicMock()
-    # The query chain used by get_vault_snapshot with account_id=None:
-    # supa.table("positions").select(...).eq("user_id", uid).execute()
-    mock.table.return_value.select.return_value.eq.return_value.execute.return_value = MagicMock(
+    # .eq("user_id") → .eq("status","open") → .execute()
+    mock.table.return_value.select.return_value.eq.return_value.eq.return_value.execute.return_value = MagicMock(
         data=positions
     )
     return mock
