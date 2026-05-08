@@ -536,11 +536,36 @@ class TestVaultRefreshCallback:
     """_handle_vault_refresh_callback: quota, invalidate, re-snapshot, edit (T2.5 / S5)."""
 
     def _make_supa_with_positions(self, positions: list) -> MagicMock:
+        """Supabase mock for the refresh callback.
+
+        Two tables are queried:
+          user_settings: select.eq(user_id).limit.execute → base_currency
+          positions:     select.eq(user_id).eq(status).execute → tickers
+                         select.eq(user_id).eq(status).eq(account_id).execute → tickers
+
+        After telegram-totals-regression-v2 the positions chain gains .eq('status','open').
+        """
         mock = MagicMock()
-        mock.table.return_value.select.return_value.eq.return_value.limit.return_value.execute.return_value.data = [
-            {"base_currency": "EUR"}
-        ]
-        mock.table.return_value.select.return_value.eq.return_value.execute.return_value.data = positions
+
+        def table_side_effect(name):
+            t = MagicMock()
+            if name == "user_settings":
+                t.select.return_value.eq.return_value.limit.return_value.execute.return_value.data = [
+                    {"base_currency": "EUR"}
+                ]
+            else:
+                # positions table: eq(user_id).eq(status).execute or .eq(account_id).execute
+                sel = MagicMock()
+                t.select.return_value = sel
+                eq_uid = MagicMock()
+                sel.eq.return_value = eq_uid
+                eq_status = MagicMock()
+                eq_uid.eq.return_value = eq_status
+                eq_status.execute.return_value = MagicMock(data=positions)
+                eq_status.eq.return_value.execute.return_value = MagicMock(data=positions)
+            return t
+
+        mock.table.side_effect = table_side_effect
         return mock
 
     def test_happy_path_all_scope(self, client):

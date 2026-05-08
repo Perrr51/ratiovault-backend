@@ -765,9 +765,15 @@ def _handle_vault_refresh_callback(
     except Exception as exc:
         logger.warning("vault_refresh: failed to fetch user_settings for %s: %s", user_id, exc)
 
-    # Collect tickers for the current scope
+    # Collect tickers for the current scope — open positions only
+    # telegram-totals-regression-v2: filter status='open' to avoid re-pricing closed positions
     try:
-        q = supa.table("positions").select("ticker,shares").eq("user_id", user_id)
+        q = (
+            supa.table("positions")
+            .select("ticker,shares")
+            .eq("user_id", user_id)
+            .eq("status", "open")
+        )
         if account_id is not None:
             q = q.eq("account_id", account_id)
         pos_resp = q.execute()

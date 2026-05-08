@@ -54,14 +54,23 @@ def approx(value: float) -> float:
 
 
 def _make_supabase_mock(rows: list) -> MagicMock:
-    """Build a Supabase mock that returns `rows` for table().select().eq().execute()."""
+    """Build a Supabase mock that returns `rows` for the positions query chain.
+
+    After telegram-totals-regression-v2, the chain includes .eq('status','open'):
+      table("positions").select(...).eq("user_id").eq("status","open")
+        .execute()                    ← no account_id filter
+        .eq("account_id").execute()   ← with account_id filter
+    """
     mock = MagicMock()
-    # Chain: .table().select().eq().execute() — handle optional second .eq() for account_id
     select_chain = mock.table.return_value.select.return_value
-    eq_chain = select_chain.eq.return_value
-    # Support optional second .eq() call (account_id filter)
-    eq_chain.eq.return_value.execute.return_value = MagicMock(data=rows)
-    eq_chain.execute.return_value = MagicMock(data=rows)
+    # .eq("user_id", ...) → eq_user
+    eq_user = select_chain.eq.return_value
+    # .eq("status", "open") → eq_status  (NEW step)
+    eq_status = eq_user.eq.return_value
+    # no account filter: .execute() directly after status filter
+    eq_status.execute.return_value = MagicMock(data=rows)
+    # with account filter: .eq("account_id").execute()
+    eq_status.eq.return_value.execute.return_value = MagicMock(data=rows)
     return mock
 
 
@@ -318,19 +327,24 @@ class TestAccountFilter:
         )
 
     def _build_supa_mock_with_positions(self, positions: list):
-        """Build a supa mock that returns positions on table('positions') queries."""
+        """Build a supa mock that returns positions on table('positions') queries.
+
+        After telegram-totals-regression-v2 the chain includes .eq('status','open'):
+          select().eq(user_id).eq(status).execute()          ← no account filter
+          select().eq(user_id).eq(status).eq(account_id).execute()  ← with account
+        """
         mock = MagicMock()
         pos_table = MagicMock()
 
-        # positions table chain: select().eq().execute() or select().eq().or_().execute()
         pos_select = pos_table.select.return_value
+        # .eq("user_id", ...) → pos_eq_user
         pos_eq_user = pos_select.eq.return_value
-        # No account filter (account_id=None path)
-        pos_eq_user.execute.return_value = MagicMock(data=positions)
-        # With .or_() (default account path)
-        pos_eq_user.or_.return_value.execute.return_value = MagicMock(data=positions)
-        # With second .eq() (strict non-default path)
-        pos_eq_user.eq.return_value.execute.return_value = MagicMock(data=positions)
+        # .eq("status", "open") → pos_eq_status  (NEW step)
+        pos_eq_status = pos_eq_user.eq.return_value
+        # No account filter: direct .execute()
+        pos_eq_status.execute.return_value = MagicMock(data=positions)
+        # With account filter: .eq("account_id").execute()
+        pos_eq_status.eq.return_value.execute.return_value = MagicMock(data=positions)
 
         # accounts table chain
         acc_table = MagicMock()
@@ -370,18 +384,17 @@ class TestAccountFilter:
 
         assert result["position_count"] == 3
 
-    def test_default_account_uses_or_filter(self):
-        """S1-D: account_id=default → .or_() filter applied (includes NULL positions)."""
-        acc_id = "acc-default"
-        pos_default = self._pos("p1", "VOW3.DE", acc_id)
-        pos_null = self._pos("p2", "AAPL", None)
-        positions = [pos_default, pos_null]
+    def test_account_id_uses_strict_eq_not_or(self):
+        """telegram-totals-regression: any account_id uses strict .eq(), never .or_().
 
-        supa, acc_table = self._build_supa_mock_with_positions(positions)
-        # Set up accounts query to return acc_id as default (is_default=True)
-        acc_table.select.return_value.eq.return_value.order.return_value.execute.return_value = MagicMock(
-            data=[{"id": acc_id, "created_at": "2026-01-01T00:00:00Z", "is_default": True}]
-        )
+        The old S1-D .or_() behavior was superseded by telegram-totals-regression.
+        All account_id-scoped queries now use .eq('account_id') exclusively.
+        NULL-account positions are surfaced via _count_unassigned(), not folded in.
+        """
+        acc_id = "acc-default"
+        positions = [self._pos("p1", "VOW3.DE", acc_id)]
+
+        supa, _ = self._build_supa_mock_with_positions(positions)
 
         with patch("services.vault_snapshot.get_supabase_service", return_value=supa):
             with patch("services.vault_snapshot.price_cache.get_prices_batch",
@@ -390,24 +403,22 @@ class TestAccountFilter:
                     from services.vault_snapshot import get_vault_snapshot
                     get_vault_snapshot("user-1", account_id=acc_id)
 
-        # Assert .or_() was called on the positions query chain
+        # .or_() must NEVER be called — strict eq only
         pos_table = supa.table("positions")
         pos_eq_user = pos_table.select.return_value.eq.return_value
-        pos_eq_user.or_.assert_called_once()
-        call_arg = pos_eq_user.or_.call_args[0][0]
-        assert acc_id in call_arg
-        assert "null" in call_arg.lower()
+        pos_eq_user.or_.assert_not_called()
+        # .eq() after user_id filter must be called first with 'status' then with account_id
+        pos_status_call = pos_eq_user.eq.call_args
+        assert pos_status_call[0][0] == "status", (
+            f"First .eq() after user_id must be 'status', got {pos_status_call[0][0]!r}"
+        )
 
     def test_non_default_account_uses_strict_eq(self):
-        """S1-C: account_id=non-default → strict .eq(), no NULL positions."""
-        default_id = "acc-default"
+        """Any account_id → strict .eq('account_id') after .eq('status','open')."""
         other_id = "acc-other"
         positions = [self._pos("p2", "AAPL", other_id)]
 
-        supa, acc_table = self._build_supa_mock_with_positions(positions)
-        acc_table.select.return_value.eq.return_value.order.return_value.execute.return_value = MagicMock(
-            data=[{"id": default_id, "created_at": "2026-01-01T00:00:00Z", "is_default": True}]
-        )
+        supa, _ = self._build_supa_mock_with_positions(positions)
 
         with patch("services.vault_snapshot.get_supabase_service", return_value=supa):
             with patch("services.vault_snapshot.price_cache.get_prices_batch",
@@ -418,10 +429,11 @@ class TestAccountFilter:
 
         pos_table = supa.table("positions")
         pos_eq_user = pos_table.select.return_value.eq.return_value
-        # .or_() must NOT have been called for a non-default account
+        # .or_() must NOT have been called
         pos_eq_user.or_.assert_not_called()
-        # .eq() must have been called with the non-default account_id (strict filter)
-        pos_eq_user.eq.assert_called_with("account_id", other_id)
+        # After status filter, account_id filter must be applied via .eq()
+        pos_eq_status = pos_eq_user.eq.return_value
+        pos_eq_status.eq.assert_called_with("account_id", other_id)
 
     def test_zero_accounts_falls_back_to_all(self):
         """Edge: 0 accounts → get_vault_snapshot falls back to no filter (account_id=None path)."""
@@ -575,8 +587,8 @@ class TestBatchPriceFetch:
         }
 
         mock_supa = MagicMock()
-        # positions query
-        mock_supa.table.return_value.select.return_value.eq.return_value.execute.return_value = MagicMock(data=positions)
+        # positions query chain: select.eq(user_id).eq(status).execute() for account_id=None
+        mock_supa.table.return_value.select.return_value.eq.return_value.eq.return_value.execute.return_value = MagicMock(data=positions)
 
         with patch("services.vault_snapshot.get_supabase_service", return_value=mock_supa):
             with patch("services.vault_snapshot.price_cache.get_prices_batch", return_value=prices) as mock_batch:
@@ -595,7 +607,8 @@ class TestBatchPriceFetch:
         prices = {"BROKEN": None}  # fetch failed
 
         mock_supa = MagicMock()
-        mock_supa.table.return_value.select.return_value.eq.return_value.execute.return_value = MagicMock(data=[pos])
+        # positions query chain: select.eq(user_id).eq(status).execute() for account_id=None
+        mock_supa.table.return_value.select.return_value.eq.return_value.eq.return_value.execute.return_value = MagicMock(data=[pos])
 
         with patch("services.vault_snapshot.get_supabase_service", return_value=mock_supa):
             with patch("services.vault_snapshot.price_cache.get_prices_batch", return_value=prices):
