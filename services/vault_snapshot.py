@@ -264,10 +264,13 @@ def get_vault_snapshot(
             "pnl_day": 0.0,
             "top_up": None,
             "top_down": None,
+            "top_movers": {"up": [], "down": []},
             "position_count": 0,
             "base_currency": base_currency,
             "unassigned_count": unassigned_count,
             "unassigned_approx": unassigned_approx,
+            "name_map": {},
+            "pnl_yesterday": None,
         }
 
     # Fetch forex rates once for the whole snapshot (S2-D: freshness parity)
@@ -356,7 +359,7 @@ def get_vault_snapshot(
         total_pnl += unrealized_pnl
         total_day_pnl += day_pnl_base
 
-    # -- Top movers --
+    # -- Top movers (legacy single-entry) --
     top_up = None
     top_down = None
     if movers:
@@ -366,6 +369,20 @@ def get_vault_snapshot(
             top_up = best
         if worst["change_pct"] < 0:
             top_down = worst
+
+    # -- Top movers v2 (telegram-bot-quick-wins ADR-7: tiebreak ticker ASC) --
+    # Each item shape: {"ticker": str, "change_pct": float}
+    # Positions with no prev_close are excluded (not in movers list at all).
+    top_movers = {
+        "up": sorted(
+            [m for m in movers if m["change_pct"] > 0],
+            key=lambda m: (-m["change_pct"], m["ticker"]),
+        )[:5],
+        "down": sorted(
+            [m for m in movers if m["change_pct"] < 0],
+            key=lambda m: (m["change_pct"], m["ticker"]),
+        )[:5],
+    }
 
     # ADR-3: resolve names for ALL open tickers (not just movers).
     tickers = [p["ticker"] for p in open_positions]
@@ -378,6 +395,7 @@ def get_vault_snapshot(
         "pnl_day": round(total_day_pnl, 2),
         "top_up": top_up,
         "top_down": top_down,
+        "top_movers": top_movers,
         "position_count": len(open_positions),
         "base_currency": base_currency,
         "unassigned_count": unassigned_count,
