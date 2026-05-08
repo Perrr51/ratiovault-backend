@@ -337,7 +337,11 @@ def _handle_vault(chat_id: str | int) -> None:
     if len(accounts) <= 1:
         account_id = accounts[0]["id"] if accounts else None
         scope = account_id or "all"
-        snapshot = get_vault_snapshot(user_id, account_id=account_id, base_currency=base_currency)
+        # include_unassigned_footer=True on default-account view (R3)
+        snapshot = get_vault_snapshot(
+            user_id, account_id=account_id, base_currency=base_currency,
+            include_unassigned_footer=(account_id is not None),
+        )
         _tg_send(chat_id, _format_vault(snapshot), reply_markup=_vault_refresh_keyboard(scope))
     else:
         # Multi-account: send inline keyboard with account picker + refresh button
@@ -399,6 +403,15 @@ def _format_vault(snapshot: dict) -> str:
 
     lines.append("")
     lines.append(f"Posiciones abiertas: {snapshot['position_count']}")
+
+    # R3: surface unassigned-account positions without inflating the total
+    unassigned_count = snapshot.get("unassigned_count", 0)
+    if unassigned_count > 0:
+        unassigned_approx = snapshot.get("unassigned_approx", 0.0)
+        lines.append(
+            f"\n⚠️ {unassigned_count} posición(es) sin cuenta "
+            f"(~{_fmt_currency(unassigned_approx, base)}) no incluida(s) en el total."
+        )
 
     return "\n".join(lines)
 
@@ -669,7 +682,11 @@ def _handle_vault_callback(chat_id: int, message_id: int | None, account_id_str:
 
     account_id = None if account_id_str == "all" else account_id_str
     scope = account_id_str  # keep "all" or the UUID for the refresh button
-    snapshot = get_vault_snapshot(user_id, account_id=account_id, base_currency=base_currency)
+    # include_unassigned_footer=True when viewing a specific account (not "all") (R3)
+    snapshot = get_vault_snapshot(
+        user_id, account_id=account_id, base_currency=base_currency,
+        include_unassigned_footer=(account_id is not None),
+    )
     text = _format_vault(snapshot)
     keyboard = _vault_refresh_keyboard(scope)
 
