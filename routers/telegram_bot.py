@@ -17,6 +17,7 @@ import httpx
 from fastapi import APIRouter, Header, HTTPException, Request
 
 from config import settings
+from services import telegram_notify
 from services.telegram_link import (
     ChatAlreadyLinked,
     CodeNotFound,
@@ -57,20 +58,29 @@ _HELP_TEXT = (
 def _tg_send(chat_id: str | int, text: str, reply_markup: dict | None = None) -> None:
     """Fire-and-forget sendMessage via httpx.
 
+    Delegates plain sends to services.telegram_notify.send_message (single transport
+    code path). Handles reply_markup inline for button-rich webhook replies.
     Logs on failure but does NOT raise — webhook always returns 200.
     """
-    if not settings.telegram_bot_token:
-        logger.debug("telegram_bot_token not set; skipping sendMessage to %s", chat_id)
-        return
-    url = f"{_TG_API_BASE}/bot{settings.telegram_bot_token}/sendMessage"
-    payload: dict = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
     if reply_markup is not None:
-        payload["reply_markup"] = reply_markup
+        # reply_markup requires extra payload fields; use raw httpx path for now.
+        if not settings.telegram_bot_token:
+            logger.debug("telegram_bot_token not set; skipping sendMessage to %s", chat_id)
+            return
+        url = f"{_TG_API_BASE}/bot{settings.telegram_bot_token}/sendMessage"
+        payload: dict = {"chat_id": chat_id, "text": text, "parse_mode": "HTML", "reply_markup": reply_markup}
+        try:
+            with httpx.Client(timeout=8.0) as client:
+                resp = client.post(url, json=payload)
+                if not resp.is_success:
+                    logger.warning("sendMessage failed: %s %s", resp.status_code, resp.text)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("sendMessage exception: %s", exc)
+        return
+
+    # Plain text send — delegate to shared transport (used by alerts_scheduler too).
     try:
-        with httpx.Client(timeout=8.0) as client:
-            resp = client.post(url, json=payload)
-            if not resp.is_success:
-                logger.warning("sendMessage failed: %s %s", resp.status_code, resp.text)
+        telegram_notify.send_message(chat_id, text)
     except Exception as exc:  # noqa: BLE001
         logger.warning("sendMessage exception: %s", exc)
 
