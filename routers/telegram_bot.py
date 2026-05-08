@@ -186,33 +186,37 @@ def handle_update(update: dict) -> None:
 
 
 def _handle_message(message: dict) -> None:
+    """Route a Telegram message update to the appropriate command handler.
+
+    ADR-5: uses _COMMAND_DISPATCH dict instead of elif chain.
+    Unknown commands and non-command text fall through to _HELP_TEXT (T17).
+    """
     chat_id = message.get("chat", {}).get("id")
-    text: str = message.get("text", "") or ""
+    text: str = (message.get("text") or "").strip()
 
     logger.info("telegram message from chat_id=%s text=%r", chat_id, text[:80])
 
-    if text.startswith("/start"):
-        _handle_start(message, text, chat_id)
-    elif text.startswith("/vincular"):
-        _handle_vincular(message, text, chat_id)
-    elif text.startswith("/vault"):
-        _handle_vault(chat_id)
-    elif text.startswith("/watchlist"):
-        _handle_watchlist(chat_id)
-    elif text.startswith("/precio"):
-        _handle_precio(message, text, chat_id)
-    elif text.startswith("/desvincular"):
-        _handle_desvincular(chat_id)
-    elif text.startswith("/idioma"):
-        _handle_idioma(message, text, chat_id)
-    elif text.startswith("/help"):
-        _handle_help(chat_id)
-    elif text.startswith("/"):
-        # T17 fallback — unknown command
-        _tg_send(chat_id, _HELP_TEXT)
-    else:
+    if not text.startswith("/"):
         # T17 fallback — non-command text
         _tg_send(chat_id, _HELP_TEXT)
+        return
+
+    parts = text.split(maxsplit=1)
+    cmd = parts[0].lower()
+    raw_args = parts[1] if len(parts) > 1 else ""
+    args = raw_args.split() if raw_args else []
+
+    handler = _COMMAND_DISPATCH.get(cmd)
+    if handler is None:
+        # T17 fallback — unknown command (spec scenario "Unknown command falls through to help")
+        _tg_send(chat_id, _HELP_TEXT)
+        return
+
+    # Resolve user_id for non-meta commands. /start, /vincular, /help are handled
+    # inside their own handlers (they don't need a pre-resolved user_id here).
+    # Handlers that need user_id resolve it themselves via resolve_user_by_chat.
+    # The uniform Handler signature receives user_id="" for commands that self-resolve.
+    handler(chat_id, "", text, args)
 
 
 # ── /start ─────────────────────────────────────────────────────────────────────
@@ -856,6 +860,95 @@ def _handle_idioma(message: dict, text: str, chat_id: str | int) -> None:
 def _handle_help(chat_id: str | int) -> None:
     """T16: Static help text."""
     _tg_send(chat_id, _HELP_TEXT)
+
+
+# ── New command stubs (PR1 placeholder — real implementations ship in PR2) ─────
+
+def _handle_forex(chat_id: int, user_id: str, raw_text: str, args: list[str]) -> None:
+    """Stub for /forex — implemented in PR2 (T5)."""
+    raise NotImplementedError("_handle_forex not yet implemented (PR2)")
+
+
+def _handle_movers(chat_id: int, user_id: str, raw_text: str, args: list[str]) -> None:
+    """Stub for /movers — implemented in PR2 (T6)."""
+    raise NotImplementedError("_handle_movers not yet implemented (PR2)")
+
+
+def _handle_cuentas(chat_id: int, user_id: str, raw_text: str, args: list[str]) -> None:
+    """Stub for /cuentas — implemented in PR2 (T7)."""
+    raise NotImplementedError("_handle_cuentas not yet implemented (PR2)")
+
+
+def _handle_dividendos(chat_id: int, user_id: str, raw_text: str, args: list[str]) -> None:
+    """Stub for /dividendos — implemented in PR2 (T8)."""
+    raise NotImplementedError("_handle_dividendos not yet implemented (PR2)")
+
+
+# ── Dispatch infrastructure (ADR-5: plain dict, no decorator framework) ────────
+
+# Handler type: (chat_id, user_id, raw_text, args) → None
+# ADR-6: uniform 4-arg signature. Existing simpler handlers wrapped via _wrap_simple.
+Handler = Callable[[int, str, str, list[str]], None]
+
+
+def _wrap_simple(fn: Callable[[int], None]) -> Handler:
+    """Wrap a (chat_id,)-only handler into the uniform 4-arg Handler signature."""
+    def adapter(chat_id: int, user_id: str, raw_text: str, args: list[str]) -> None:
+        return fn(chat_id)
+    return adapter
+
+
+def _wrap_start(fn: Callable) -> Handler:
+    """Wrap _handle_start (message, text, chat_id) into uniform Handler."""
+    def adapter(chat_id: int, user_id: str, raw_text: str, args: list[str]) -> None:
+        # Reconstruct a minimal message dict for _handle_start
+        message = {"chat": {"id": chat_id}, "text": raw_text}
+        return fn(message, raw_text, chat_id)
+    return adapter
+
+
+def _wrap_vincular(fn: Callable) -> Handler:
+    """Wrap _handle_vincular (message, text, chat_id) into uniform Handler."""
+    def adapter(chat_id: int, user_id: str, raw_text: str, args: list[str]) -> None:
+        message = {"chat": {"id": chat_id}, "text": raw_text,
+                   "from": {"language_code": "es"}}
+        return fn(message, raw_text, chat_id)
+    return adapter
+
+
+def _wrap_precio(fn: Callable) -> Handler:
+    """Wrap _handle_precio (message, text, chat_id) into uniform Handler."""
+    def adapter(chat_id: int, user_id: str, raw_text: str, args: list[str]) -> None:
+        message = {"chat": {"id": chat_id}, "text": raw_text}
+        return fn(message, raw_text, chat_id)
+    return adapter
+
+
+def _wrap_idioma(fn: Callable) -> Handler:
+    """Wrap _handle_idioma (message, text, chat_id) into uniform Handler."""
+    def adapter(chat_id: int, user_id: str, raw_text: str, args: list[str]) -> None:
+        message = {"chat": {"id": chat_id}, "text": raw_text}
+        return fn(message, raw_text, chat_id)
+    return adapter
+
+
+# ADR-5: dict at module level, post-handler-definition, no decorator weight.
+# ADR-6: uniform Handler signature; existing handlers wrapped via shims.
+_COMMAND_DISPATCH: dict[str, Handler] = {
+    "/start":        _wrap_start(_handle_start),
+    "/vincular":     _wrap_vincular(_handle_vincular),
+    "/desvincular":  _wrap_simple(_handle_desvincular),
+    "/idioma":       _wrap_idioma(_handle_idioma),
+    "/help":         _wrap_simple(_handle_help),
+    "/vault":        _wrap_simple(_handle_vault),
+    "/watchlist":    _wrap_simple(_handle_watchlist),
+    "/precio":       _wrap_precio(_handle_precio),
+    # PR2 handlers (stubs until T5–T8 are implemented)
+    "/forex":        _handle_forex,
+    "/movers":       _handle_movers,
+    "/cuentas":      _handle_cuentas,
+    "/dividendos":   _handle_dividendos,
+}
 
 
 # ── callback_query handler ─────────────────────────────────────────────────────
