@@ -18,6 +18,7 @@ from fastapi import APIRouter, Header, HTTPException, Request
 
 from config import settings
 from deps import logger
+from services import alerts_scheduler
 from supabase_client import get_supabase_service
 
 router = APIRouter(tags=["internal"])
@@ -55,6 +56,25 @@ def prune_events(request: Request, authorization: str = Header(None)):
     deleted = len(resp.data or [])
     logger.info("prune-events cutoff=%s deleted=%d", cutoff.isoformat(), deleted)
     return {"deleted": deleted}
+
+
+@router.post("/internal/cron/evaluate-alerts")
+def evaluate_alerts_cron(request: Request, authorization: str = Header(None)) -> dict:
+    """Evaluate all active price alerts and send Telegram notifications.
+
+    Called by VPS cron every 15 minutes. Requires the same bearer token
+    as the other internal cron endpoints (settings.internal_cron_token).
+
+    Returns:
+        {"evaluated": int, "fired": int, "skipped": int, "errors": int}
+        Invariant: evaluated == fired + skipped + errors (R12).
+
+    Cron entry (VPS, founder responsibility post-deploy):
+        */15 * * * * curl -s -X POST https://api.ratiovault.com/internal/cron/evaluate-alerts \\
+          -H "Authorization: Bearer $INTERNAL_CRON_TOKEN" >> /var/log/ratiovault-alerts-cron.log 2>&1
+    """
+    _authorize(request, authorization)
+    return alerts_scheduler.evaluate_active_alerts()
 
 
 @router.post("/internal/cron/prune-telegram-tokens")

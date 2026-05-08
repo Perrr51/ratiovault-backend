@@ -34,51 +34,24 @@ _HAS_IS_DEFAULT: bool = True
 _FX_FALLBACK: dict[str, float] = {
     "USD": 0.92,    # USDEUR
     "GBP": 1.17,    # GBPEUR
+    "GBX": 0.0117,  # R4b: GBP/100 (defense-in-depth; never reached if R4a fires)
     "CHF": 1.05,    # CHFEUR
     "EUR": 1.0,
 }
 
 
-def _resolve_default_account_id(supa, user_id: str) -> Optional[str]:
-    """Return the user's default account id or None if no accounts exist.
-
-    Default account resolution (D2 / S1):
-      1. If _HAS_IS_DEFAULT: prefer the account with is_default=True.
-      2. Fallback to the earliest account by created_at ASC (deterministic).
-      3. If no accounts: return None (get_vault_snapshot falls back to all-positions).
-    """
-    try:
-        select_cols = "id, created_at, is_default" if _HAS_IS_DEFAULT else "id, created_at"
-        resp = (
-            supa.table("accounts")
-            .select(select_cols)
-            .eq("user_id", user_id)
-            .order("created_at")
-            .execute()
-        )
-        accounts = resp.data or []
-    except Exception as e:
-        logger.warning("_resolve_default_account_id: accounts query failed: %s", e)
-        return None
-
-    if not accounts:
-        return None
-
-    if _HAS_IS_DEFAULT:
-        for acc in accounts:
-            if acc.get("is_default"):
-                return acc["id"]
-
-    # Fallback: first by created_at (already ordered)
-    return accounts[0]["id"]
-
-
+# Account filter contract (telegram-totals-regression, supersedes telegram-vault-parity D2):
+#   account_id=None     → no filter (all-accounts aggregate, includes NULL-account rows)
+#   account_id=<value>  → strict .eq() equality, EXCLUDES NULL-account rows
+# Frontend useFilteredPortfolio uses === strict equality; backend now mirrors it.
+# NULL-account positions are surfaced separately via _count_unassigned() — never
+# silently folded into a specific-account total.
 def _build_positions_query(supa, user_id: str, account_id: Optional[str]):
-    """Build the positions Supabase query with correct account filter (D2 / S1).
+    """Build the positions Supabase query with correct account filter.
 
-    account_id=None  → no filter (all-accounts aggregate, S1 I1.1)
-    account_id=default → .or_(eq + is.null) to include legacy NULL positions (S1 I1.2)
-    account_id=other   → strict .eq() only (S1 I1.2)
+    account_id=None    → no filter (all-accounts aggregate, includes NULL-account rows)
+    account_id=<value> → strict .eq() equality; mirrors frontend === strict equality.
+                         NULL-account rows are EXCLUDED and surfaced via _count_unassigned().
     """
     base_query = (
         supa.table("positions")
@@ -91,18 +64,34 @@ def _build_positions_query(supa, user_id: str, account_id: Optional[str]):
     if account_id is None:
         return base_query  # all positions, including NULL account_id
 
-    default_id = _resolve_default_account_id(supa, user_id)
-
-    if default_id is None:
-        # No accounts in DB — treat every account_id as if it's the default
-        return base_query.or_(f"account_id.eq.{account_id},account_id.is.null")
-
-    if account_id == default_id:
-        # Default account: include legacy NULL-account positions
-        return base_query.or_(f"account_id.eq.{account_id},account_id.is.null")
-
-    # Non-default account: strict equality, exclude NULLs
+    # Strict equality — SUPERSEDES telegram-vault-parity D2 (or_ with IS NULL).
     return base_query.eq("account_id", account_id)
+
+
+def _count_unassigned(supa, user_id: str) -> tuple[int, float]:
+    """Return (count, approx_value) for open NULL-account positions (R3).
+
+    Used only on default-account view to surface ghost positions without
+    inflating the reported total. No live price fetch — uses buy_price as approx.
+    """
+    try:
+        resp = (
+            supa.table("positions")
+            .select("shares,buy_price,currency,exclude_from_totals")
+            .eq("user_id", user_id)
+            .is_("account_id", "null")
+            .execute()
+        )
+        rows = [
+            r for r in (resp.data or [])
+            if (r.get("shares") or 0) > 0 and not r.get("exclude_from_totals")
+        ]
+        n = len(rows)
+        approx = sum(float(r["buy_price"]) * float(r["shares"]) for r in rows)
+        return n, approx
+    except Exception as e:
+        logger.warning("_count_unassigned failed: %s", e)
+        return 0, 0.0
 
 
 def _to_base(amount_in_pos_currency: float, pos_currency: str, base_currency: str) -> float:
@@ -129,13 +118,17 @@ def get_vault_snapshot(
     user_id: str,
     account_id: Optional[str] = None,
     base_currency: str = "EUR",
+    include_unassigned_footer: bool = False,
 ) -> dict:
     """Return a snapshot dict for the given user's open positions.
 
     Args:
-        user_id:       Supabase auth user UUID.
-        account_id:    Optional filter to a single account.
-        base_currency: Target currency for all monetary output (default EUR).
+        user_id:                   Supabase auth user UUID.
+        account_id:                Optional filter to a single account.
+        base_currency:             Target currency for all monetary output (default EUR).
+        include_unassigned_footer: When True (default-account view), runs a COUNT query
+                                   for NULL-account positions and returns the result in
+                                   unassigned_count / unassigned_approx fields.
 
     Returns:
         {
@@ -146,6 +139,8 @@ def get_vault_snapshot(
             "top_down": {"ticker": str, "change_pct": float} | None,
             "position_count": int,
             "base_currency": str,
+            "unassigned_count": int,   # 0 unless include_unassigned_footer=True
+            "unassigned_approx": float, # 0.0 unless include_unassigned_footer=True
         }
     """
     supa = get_supabase_service()
@@ -161,6 +156,12 @@ def get_vault_snapshot(
         if (p.get("shares") or 0) > 0 and not p.get("exclude_from_totals", False)
     ]
 
+    # R3: count NULL-account positions for footer (only on default-account view)
+    if include_unassigned_footer and account_id is not None:
+        unassigned_count, unassigned_approx = _count_unassigned(supa, user_id)
+    else:
+        unassigned_count, unassigned_approx = 0, 0.0
+
     if not open_positions:
         return {
             "total": 0.0,
@@ -170,6 +171,8 @@ def get_vault_snapshot(
             "top_down": None,
             "position_count": 0,
             "base_currency": base_currency,
+            "unassigned_count": unassigned_count,
+            "unassigned_approx": unassigned_approx,
         }
 
     # Fetch forex rates once for the whole snapshot (S2-D: freshness parity)
@@ -179,9 +182,19 @@ def get_vault_snapshot(
             "get_vault_snapshot: forex rates empty, snapshot will use _FX_FALLBACK"
         )
 
+    # R5: split investment vs cash positions.
+    # =CASH tickers have no market price; use buy_price directly (mirrors frontend).
+    investment_positions = [p for p in open_positions if not p["ticker"].endswith("=CASH")]
+    cash_positions = [p for p in open_positions if p["ticker"].endswith("=CASH")]
+
     # Batch price fetch — single IN query + parallel miss-fetch (T2.3 / S4)
-    open_tickers = [p["ticker"] for p in open_positions]
-    prices_batch = price_cache.get_prices_batch(open_tickers)
+    # Cash positions are excluded from price fetch; their None entry triggers buy_price fallback.
+    investment_tickers = [p["ticker"] for p in investment_positions]
+    prices_batch = price_cache.get_prices_batch(investment_tickers)
+
+    # Inject None for cash tickers → downstream buy_price fallback path fires.
+    for pos in cash_positions:
+        prices_batch[pos["ticker"]] = None
 
     total_value = 0.0
     total_pnl = 0.0
@@ -267,6 +280,8 @@ def get_vault_snapshot(
         "top_down": top_down,
         "position_count": len(open_positions),
         "base_currency": base_currency,
+        "unassigned_count": unassigned_count,
+        "unassigned_approx": unassigned_approx,
     }
 
 

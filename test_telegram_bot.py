@@ -404,7 +404,7 @@ def test_vault_callback_calls_snapshot_and_edits_message(client):
         r = client.post("/telegram/webhook", headers=_secret_header(), json=update)
 
     assert r.status_code == 200
-    mock_snap.assert_called_once_with("u1", account_id="acc-1", base_currency="EUR")
+    mock_snap.assert_called_once_with("u1", account_id="acc-1", base_currency="EUR", include_unassigned_footer=True)
     # editMessageText should have been called (not sendMessage)
     calls = mock_instance.post.call_args_list
     urls = [call[0][0] for call in calls]
@@ -685,6 +685,66 @@ class TestVaultRefreshCallback:
             r = tc.post("/telegram/webhook", headers=_secret_header(), json=update)
 
         assert r.status_code == 200  # webhook always returns 200
+
+    def test_refresh_specific_account_passes_include_unassigned_footer_true(self, client):
+        """vault_refresh:<uuid> → get_vault_snapshot called with include_unassigned_footer=True (W2)."""
+        update = _make_callback("vault_refresh:acc-uuid-w2")
+        mock_cls, mock_instance = _httpx_mock_client()
+
+        positions = [
+            {"ticker": "VWCE.DE", "shares": 10, "buy_price": 90, "currency": "EUR",
+             "account_id": "acc-uuid-w2", "exclude_from_totals": False},
+        ]
+        mock_snapshot = {
+            "total": 900.0, "pnl_total": 0.0, "pnl_day": 0.0,
+            "top_up": None, "top_down": None, "position_count": 1, "base_currency": "EUR",
+        }
+        mock_snap = MagicMock(return_value=mock_snapshot)
+
+        with (
+            patch("routers.telegram_bot.resolve_user_by_chat", return_value={"user_id": "u1", "locale": "es"}),
+            patch("routers.telegram_bot.telegram_rate_limit.should_serve", return_value=(True, None)),
+            patch("routers.telegram_bot.get_supabase_service", return_value=self._make_supa_with_positions(positions)),
+            patch("routers.telegram_bot.price_cache.invalidate_prices", return_value=1),
+            patch("routers.telegram_bot.get_vault_snapshot", mock_snap),
+            patch("routers.telegram_bot.httpx.Client", mock_cls),
+        ):
+            r = client.post("/telegram/webhook", headers=_secret_header(), json=update)
+
+        assert r.status_code == 200
+        _, kwargs = mock_snap.call_args
+        # When scope is a specific account, footer flag must be True (mirrors _handle_vault and _handle_vault_callback)
+        assert kwargs.get("include_unassigned_footer") is True
+
+    def test_refresh_all_scope_passes_include_unassigned_footer_false(self, client):
+        """vault_refresh:all → get_vault_snapshot called with include_unassigned_footer=False (W2)."""
+        update = _make_callback("vault_refresh:all")
+        mock_cls, mock_instance = _httpx_mock_client()
+
+        positions = [
+            {"ticker": "AAPL", "shares": 5, "buy_price": 100, "currency": "USD",
+             "account_id": None, "exclude_from_totals": False},
+        ]
+        mock_snapshot = {
+            "total": 500.0, "pnl_total": 0.0, "pnl_day": 0.0,
+            "top_up": None, "top_down": None, "position_count": 1, "base_currency": "EUR",
+        }
+        mock_snap = MagicMock(return_value=mock_snapshot)
+
+        with (
+            patch("routers.telegram_bot.resolve_user_by_chat", return_value={"user_id": "u1", "locale": "es"}),
+            patch("routers.telegram_bot.telegram_rate_limit.should_serve", return_value=(True, None)),
+            patch("routers.telegram_bot.get_supabase_service", return_value=self._make_supa_with_positions(positions)),
+            patch("routers.telegram_bot.price_cache.invalidate_prices", return_value=1),
+            patch("routers.telegram_bot.get_vault_snapshot", mock_snap),
+            patch("routers.telegram_bot.httpx.Client", mock_cls),
+        ):
+            r = client.post("/telegram/webhook", headers=_secret_header(), json=update)
+
+        assert r.status_code == 200
+        _, kwargs = mock_snap.call_args
+        # When scope is "all", footer flag must be False (account_id is None)
+        assert kwargs.get("include_unassigned_footer") is False
 
 
 # ── T14: /watchlist ───────────────────────────────────────────────────────────

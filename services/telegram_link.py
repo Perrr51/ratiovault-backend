@@ -7,6 +7,7 @@ from __future__ import annotations
 import logging
 import secrets
 import warnings
+from typing import Optional
 
 from postgrest.exceptions import APIError
 
@@ -369,3 +370,49 @@ def delete_link(user_id: str) -> None:
     except APIError as exc:
         logger.error("telegram_link_tokens delete failed for user %s: %s", user_id, exc)
         raise RuntimeError("DB error revoking link tokens") from exc
+
+
+# ── resolve_chat_by_user ──────────────────────────────────────────────────────
+
+
+def resolve_chat_by_user(user_id: str) -> Optional[tuple[str, str]]:
+    """Resolve a user's Telegram chat_id and locale from notification_channels.
+
+    Used by the alert scheduler (R8, NFR2) to find the correct Telegram destination
+    without ever reading alerts.destination (which may be stale or garbage).
+
+    Args:
+        user_id: The alert owner's auth.users UUID.
+
+    Returns:
+        (chat_id, locale) tuple if a row exists, where locale defaults to 'es'
+        when the DB value is NULL. Returns None if no row found.
+
+    Notes:
+        - Pure read; no caching this sprint.
+        - Lookup is strictly by user_id to prevent cross-user data leaks (NFR2).
+    """
+    supa = get_supabase_service()
+    try:
+        result = (
+            supa.table("notification_channels")
+            .select("external_id,locale")
+            .eq("user_id", user_id)
+            .eq("channel", "telegram")
+            .limit(1)
+            .execute()
+        )
+    except APIError as exc:
+        logger.error(
+            "notification_channels lookup failed for user_id %s: %s", user_id, exc
+        )
+        return None
+
+    rows = result.data or []
+    if not rows:
+        return None
+
+    row = rows[0]
+    chat_id: str = row["external_id"]
+    locale: str = row.get("locale") or "es"
+    return (chat_id, locale)

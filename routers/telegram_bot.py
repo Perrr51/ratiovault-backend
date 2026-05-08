@@ -17,6 +17,7 @@ import httpx
 from fastapi import APIRouter, Header, HTTPException, Request
 
 from config import settings
+from services import telegram_notify
 from services.telegram_link import (
     ChatAlreadyLinked,
     CodeNotFound,
@@ -57,20 +58,29 @@ _HELP_TEXT = (
 def _tg_send(chat_id: str | int, text: str, reply_markup: dict | None = None) -> None:
     """Fire-and-forget sendMessage via httpx.
 
+    Delegates plain sends to services.telegram_notify.send_message (single transport
+    code path). Handles reply_markup inline for button-rich webhook replies.
     Logs on failure but does NOT raise — webhook always returns 200.
     """
-    if not settings.telegram_bot_token:
-        logger.debug("telegram_bot_token not set; skipping sendMessage to %s", chat_id)
-        return
-    url = f"{_TG_API_BASE}/bot{settings.telegram_bot_token}/sendMessage"
-    payload: dict = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
     if reply_markup is not None:
-        payload["reply_markup"] = reply_markup
+        # reply_markup requires extra payload fields; use raw httpx path for now.
+        if not settings.telegram_bot_token:
+            logger.debug("telegram_bot_token not set; skipping sendMessage to %s", chat_id)
+            return
+        url = f"{_TG_API_BASE}/bot{settings.telegram_bot_token}/sendMessage"
+        payload: dict = {"chat_id": chat_id, "text": text, "parse_mode": "HTML", "reply_markup": reply_markup}
+        try:
+            with httpx.Client(timeout=8.0) as client:
+                resp = client.post(url, json=payload)
+                if not resp.is_success:
+                    logger.warning("sendMessage failed: %s %s", resp.status_code, resp.text)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("sendMessage exception: %s", exc)
+        return
+
+    # Plain text send — delegate to shared transport (used by alerts_scheduler too).
     try:
-        with httpx.Client(timeout=8.0) as client:
-            resp = client.post(url, json=payload)
-            if not resp.is_success:
-                logger.warning("sendMessage failed: %s %s", resp.status_code, resp.text)
+        telegram_notify.send_message(chat_id, text)
     except Exception as exc:  # noqa: BLE001
         logger.warning("sendMessage exception: %s", exc)
 
@@ -337,7 +347,11 @@ def _handle_vault(chat_id: str | int) -> None:
     if len(accounts) <= 1:
         account_id = accounts[0]["id"] if accounts else None
         scope = account_id or "all"
-        snapshot = get_vault_snapshot(user_id, account_id=account_id, base_currency=base_currency)
+        # include_unassigned_footer=True on default-account view (R3)
+        snapshot = get_vault_snapshot(
+            user_id, account_id=account_id, base_currency=base_currency,
+            include_unassigned_footer=(account_id is not None),
+        )
         _tg_send(chat_id, _format_vault(snapshot), reply_markup=_vault_refresh_keyboard(scope))
     else:
         # Multi-account: send inline keyboard with account picker + refresh button
@@ -399,6 +413,15 @@ def _format_vault(snapshot: dict) -> str:
 
     lines.append("")
     lines.append(f"Posiciones abiertas: {snapshot['position_count']}")
+
+    # R3: surface unassigned-account positions without inflating the total
+    unassigned_count = snapshot.get("unassigned_count", 0)
+    if unassigned_count > 0:
+        unassigned_approx = snapshot.get("unassigned_approx", 0.0)
+        lines.append(
+            f"\n⚠️ {unassigned_count} posición(es) sin cuenta "
+            f"(~{_fmt_currency(unassigned_approx, base)}) no incluida(s) en el total."
+        )
 
     return "\n".join(lines)
 
@@ -669,7 +692,11 @@ def _handle_vault_callback(chat_id: int, message_id: int | None, account_id_str:
 
     account_id = None if account_id_str == "all" else account_id_str
     scope = account_id_str  # keep "all" or the UUID for the refresh button
-    snapshot = get_vault_snapshot(user_id, account_id=account_id, base_currency=base_currency)
+    # include_unassigned_footer=True when viewing a specific account (not "all") (R3)
+    snapshot = get_vault_snapshot(
+        user_id, account_id=account_id, base_currency=base_currency,
+        include_unassigned_footer=(account_id is not None),
+    )
     text = _format_vault(snapshot)
     keyboard = _vault_refresh_keyboard(scope)
 
@@ -756,7 +783,11 @@ def _handle_vault_refresh_callback(
     logger.info("vault_refresh: invalidated %d cache rows for user %s scope=%s", deleted, user_id, scope)
 
     # Re-compute snapshot (will trigger fresh batch fetch via get_prices_batch)
-    snapshot = get_vault_snapshot(user_id, account_id=account_id, base_currency=base_currency)
+    # include_unassigned_footer mirrors _handle_vault and _handle_vault_callback (W2 fix)
+    snapshot = get_vault_snapshot(
+        user_id, account_id=account_id, base_currency=base_currency,
+        include_unassigned_footer=(account_id is not None),
+    )
     text = _format_vault(snapshot)
     keyboard = _vault_refresh_keyboard(scope)
 
