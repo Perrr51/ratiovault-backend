@@ -196,6 +196,15 @@ def _fmt_pct(value: float) -> str:
 # ── Update dispatcher ──────────────────────────────────────────────────────────
 
 
+def _has_slash_command(text: str) -> bool:
+    """Return True if any whitespace-separated token in *text* starts with '/'.
+
+    This handles emoji-prefixed panel buttons such as '💰 /vault' or '❌ /cancel'
+    that would fail a plain ``text.startswith('/')`` check.
+    """
+    return any(p.startswith("/") for p in text.split())
+
+
 def handle_update(update: dict) -> None:
     """Route an incoming Telegram update."""
     message = update.get("message")
@@ -223,14 +232,16 @@ def _handle_message(message: dict) -> None:
 
     # ── FIRE-flow intercept (PR3) ─────────────────────────────────────────────
     if telegram_fire_session.has_active_session(int(chat_id)):
-        if text == "/cancel":
+        if text == "/cancel" or next((p for p in text.split() if p == "/cancel"), None):
             # META command: cancel session + ack. No quota consumed.
+            # Handles bare '/cancel' and emoji-prefixed '❌ /cancel'.
             telegram_fire_session.cancel_session(int(chat_id))
             _tg_send(chat_id, telegram_fire_session.CANCEL_ACK)
             return
-        if text.startswith("/"):
+        if _has_slash_command(text):
             # Other /command mid-flow → silent clear, fall through to dispatch.
             # ADR-D7: no extra quota consumed, no extra message.
+            # Handles bare '/cmd' and emoji-prefixed '💰 /cmd' panel buttons.
             telegram_fire_session.clear_session(int(chat_id))
             # Fall through to normal command dispatch below.
         else:
@@ -243,13 +254,15 @@ def _handle_message(message: dict) -> None:
     # ── PRECIO-flow intercept (PR-B) ──────────────────────────────────────────
     # Checked AFTER fire — fire has higher priority (ADR-7, REQ-11).
     if telegram_precio_session.has_active_session(int(chat_id)):
-        if text == "/cancel":
+        if text == "/cancel" or next((p for p in text.split() if p == "/cancel"), None):
             # Explicit cancel — clear session, send ack (REQ-9, design Flow E).
+            # Handles bare '/cancel' and emoji-prefixed '❌ /cancel'.
             telegram_precio_session.cancel_session(int(chat_id))
             _tg_send(chat_id, "Listo, hemos parado.")
             return
-        if text.startswith("/"):
+        if _has_slash_command(text):
             # Any other /command mid-flow → silent clear, fall through to dispatch (REQ-10).
+            # Handles bare '/cmd' and emoji-prefixed '💰 /cmd' panel buttons.
             telegram_precio_session.clear_session(int(chat_id))
             # Fall through to normal command dispatch below.
         else:
