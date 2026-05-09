@@ -128,22 +128,20 @@ class TestExistingCommandsStillRoute:
         )
 
     def test_precio_command_reaches_precio_handler_with_arg(self):
-        """/precio AAPL reaches the /precio handler and checks watchlist."""
-        with patch("routers.telegram_bot.resolve_user_by_chat", return_value=self._linked_user()):
-            with patch("routers.telegram_bot.telegram_rate_limit.should_serve",
-                       return_value=(True, None)):
-                with patch("routers.telegram_bot.get_supabase_service") as mock_supa:
-                    mock_supa.return_value.table.return_value.select.return_value \
-                        .eq.return_value.execute.return_value = MagicMock(data=[])
-                    with patch("routers.telegram_bot._tg_send") as mock_send:
-                        from routers.telegram_bot import _handle_message
-                        _handle_message(_make_message("/precio AAPL"))
+        """/precio AAPL → usage message (FSM breaking change, ADR-9, REQ-7 Sc 7.2).
 
-        # Should say ticker not in watchlist (no watchlist configured)
+        The old one-shot form is removed. /precio with any arg sends the usage hint:
+        'Usa /precio sin argumentos. Te preguntaré el ticker.'
+        No session is started and no quota is consumed.
+        """
+        with patch("routers.telegram_bot._tg_send") as mock_send:
+            from routers.telegram_bot import _handle_message
+            _handle_message(_make_message("/precio AAPL"))
+
         mock_send.assert_called_once()
         sent = mock_send.call_args[0][1]
-        assert "watchlist" in sent.lower() or "seguimiento" in sent.lower() or "AAPL" in sent, (
-            f"precio handler expected, got: {sent!r}"
+        assert "sin argumentos" in sent.lower() or "Usa /precio" in sent, (
+            f"'/precio AAPL' must respond with usage hint, got: {sent!r}"
         )
 
 

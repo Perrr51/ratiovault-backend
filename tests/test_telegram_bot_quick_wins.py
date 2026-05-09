@@ -765,3 +765,108 @@ class TestDividendosButlerTone:
         assert greeting_found, (
             f"Response must contain butler greeting, got: {mock_send.call_args[0][1]!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# KB — Persistent keyboard attachment tests (PR-B, T3.1)
+# REQ-2, REQ-3, REQ-4, REQ-12
+# ---------------------------------------------------------------------------
+
+
+class TestStartKeyboardAttachment:
+    """KB1: /start attaches MAIN_PANEL keyboard (REQ-2)."""
+
+    def test_start_no_arg_sends_main_panel_keyboard(self):
+        """/start with no arg → _tg_send receives reply_markup=MAIN_PANEL."""
+        from services.telegram_keyboard import MAIN_PANEL
+        with patch("routers.telegram_bot._tg_send") as mock_send:
+            from routers.telegram_bot import _handle_message
+            _handle_message({"chat": {"id": 1}, "text": "/start"})
+
+        assert mock_send.called
+        kwargs = mock_send.call_args[1]
+        assert kwargs.get("reply_markup") == MAIN_PANEL, (
+            f"/start must pass reply_markup=MAIN_PANEL; got kwargs={kwargs!r}"
+        )
+
+    def test_start_with_arg_does_not_send_main_panel(self):
+        """/start abc123 (tombstone) → _tg_send must NOT receive reply_markup=MAIN_PANEL."""
+        from services.telegram_keyboard import MAIN_PANEL
+        with patch("routers.telegram_bot._tg_send") as mock_send:
+            from routers.telegram_bot import _handle_message
+            _handle_message({"chat": {"id": 1}, "text": "/start abc123"})
+
+        assert mock_send.called
+        kwargs = mock_send.call_args[1]
+        assert kwargs.get("reply_markup") != MAIN_PANEL, (
+            "/start <arg> must NOT attach MAIN_PANEL keyboard"
+        )
+
+
+class TestHelpKeyboardAttachment:
+    """KB2: /help attaches MAIN_PANEL keyboard (REQ-3)."""
+
+    def test_help_sends_main_panel_keyboard(self):
+        """/help → _tg_send called with reply_markup=MAIN_PANEL."""
+        from services.telegram_keyboard import MAIN_PANEL
+        with patch("routers.telegram_bot._tg_send") as mock_send:
+            from routers.telegram_bot import _handle_message
+            _handle_message({"chat": {"id": 1}, "text": "/help"})
+
+        assert mock_send.called
+        kwargs = mock_send.call_args[1]
+        assert kwargs.get("reply_markup") == MAIN_PANEL, (
+            f"/help must pass reply_markup=MAIN_PANEL; got kwargs={kwargs!r}"
+        )
+
+
+class TestDesvincularKeyboardRemoval:
+    """KB3: /desvincular happy path sends REMOVE_KEYBOARD (REQ-12)."""
+
+    def test_desvincular_success_sends_remove_keyboard(self):
+        """Successful unlink → _tg_send called with reply_markup=REMOVE_KEYBOARD."""
+        from services.telegram_keyboard import REMOVE_KEYBOARD
+        with patch("routers.telegram_bot.resolve_user_by_chat",
+                   return_value={"user_id": "u1"}):
+            with patch("routers.telegram_bot.delete_link", return_value=None):
+                with patch("routers.telegram_bot._tg_send") as mock_send:
+                    from routers.telegram_bot import _handle_message
+                    _handle_message({"chat": {"id": 1}, "text": "/desvincular"})
+
+        assert mock_send.called
+        kwargs = mock_send.call_args[1]
+        assert kwargs.get("reply_markup") == REMOVE_KEYBOARD, (
+            f"Successful /desvincular must pass reply_markup=REMOVE_KEYBOARD; got {kwargs!r}"
+        )
+
+    def test_desvincular_no_link_does_not_send_remove_keyboard(self):
+        """/desvincular when not linked → _tg_send must NOT receive REMOVE_KEYBOARD."""
+        from services.telegram_keyboard import REMOVE_KEYBOARD
+        with patch("routers.telegram_bot.resolve_user_by_chat", return_value=None):
+            with patch("routers.telegram_bot._tg_send") as mock_send:
+                from routers.telegram_bot import _handle_message
+                _handle_message({"chat": {"id": 1}, "text": "/desvincular"})
+
+        assert mock_send.called
+        kwargs = mock_send.call_args[1]
+        assert kwargs.get("reply_markup") != REMOVE_KEYBOARD, (
+            "/desvincular no-link must NOT send REMOVE_KEYBOARD"
+        )
+
+
+class TestHelpTextContent:
+    """KB4: _HELP_TEXT updated to reflect conversational /precio (REQ-4)."""
+
+    def test_help_text_does_not_contain_precio_aapl(self):
+        """/precio AAPL must NOT appear in _HELP_TEXT."""
+        from routers.telegram_bot import _HELP_TEXT
+        assert "/precio AAPL" not in _HELP_TEXT, (
+            "_HELP_TEXT must not contain '/precio AAPL' (conversational flow, REQ-4)"
+        )
+
+    def test_help_text_contains_precio_no_arg_entry(self):
+        """/precio entry without arg must be present in _HELP_TEXT."""
+        from routers.telegram_bot import _HELP_TEXT
+        assert "/precio — Precio de un ticker de tu watchlist" in _HELP_TEXT, (
+            "_HELP_TEXT must contain '/precio — Precio de un ticker de tu watchlist'"
+        )
