@@ -48,6 +48,8 @@ from services.telegram_link import (
 )
 from services import telegram_rate_limit
 from services import telegram_fire_session
+from services.telegram_keyboard import MAIN_PANEL, REMOVE_KEYBOARD
+from services import telegram_precio_session
 from services.vault_snapshot import get_vault_snapshot
 from services.snapshot_cache import get_cached_snapshot
 from services.price_cache import get_price
@@ -69,7 +71,7 @@ _HELP_TEXT = (
     "📋 <b>Comandos disponibles:</b>\n\n"
     "/vault — Ver resumen de tu cartera\n"
     "/watchlist — Ver tu watchlist\n"
-    "/precio AAPL — Precio de un ticker de tu watchlist\n"
+    "/precio — Precio de un ticker de tu watchlist\n"
     "/forex — Tipos de cambio EUR/USD, EUR/CHF, EUR/GBP\n"
     "/movers — Los que más suben y bajan hoy en tu cartera\n"
     "/cuentas — Desglose de tu cartera por cuentas\n"
@@ -238,6 +240,27 @@ def _handle_message(message: dict) -> None:
             return
     # ── end FIRE intercept ────────────────────────────────────────────────────
 
+    # ── PRECIO-flow intercept (PR-B) ──────────────────────────────────────────
+    # Checked AFTER fire — fire has higher priority (ADR-7, REQ-11).
+    if telegram_precio_session.has_active_session(int(chat_id)):
+        if text == "/cancel":
+            # Explicit cancel — clear session, send ack (REQ-9, design Flow E).
+            telegram_precio_session.cancel_session(int(chat_id))
+            _tg_send(chat_id, "Listo, hemos parado.")
+            return
+        if text.startswith("/"):
+            # Any other /command mid-flow → silent clear, fall through to dispatch (REQ-10).
+            telegram_precio_session.clear_session(int(chat_id))
+            # Fall through to normal command dispatch below.
+        else:
+            # Plain text — treat as ticker answer (REQ-8).
+            step = telegram_precio_session.submit_answer(int(chat_id), text)
+            if step.kind != telegram_precio_session.StepKind.NOT_ACTIVE:
+                _tg_send(chat_id, step.text)
+                return
+            # NOT_ACTIVE is a defensive fallthrough (should not happen here)
+    # ── end PRECIO intercept ─────────────────────────────────────────────────
+
     if not text.startswith("/"):
         # T17 fallback — non-command text
         _tg_send(chat_id, _HELP_TEXT)
@@ -286,12 +309,13 @@ def _handle_start(message: dict, text: str, chat_id: str | int | None) -> None:
     """Handle /start — welcome for no-arg, tombstone for any arg (S4-A / S4-B)."""
     parts = text.strip().split(None, 1)
     if len(parts) < 2 or not parts[1].strip():
-        # S4-A: plain /start → welcome
+        # S4-A: plain /start → welcome + persistent keyboard
         _tg_send(
             chat_id,
             "¡Bienvenido a RatioVault! 👋\n\n"
             "Para vincular tu cuenta, escribe <b>/vincular</b> seguido de tu código de 9 dígitos "
             "(encuéntralo en <b>RatioVault → Ajustes → Telegram</b>).",
+            reply_markup=MAIN_PANEL,
         )
         return
 
@@ -796,34 +820,16 @@ def _format_watchlist(watchlist: dict) -> str:
 # ── /precio ─────────────────────────────────────────────────────────────────────
 
 
-def _handle_precio(message: dict, text: str, chat_id: str | int) -> None:
-    """T15: Show price for a ticker — only if it's in user's watchlist."""
-    parts = text.strip().split(None, 1)
-    if len(parts) < 2 or not parts[1].strip():
-        _tg_send(chat_id, "Uso: /precio AAPL")
-        return
+def _format_precio_response(user_id: str, ticker: str) -> str:
+    """Format a price reply for user_id + ticker.
 
-    ticker = parts[1].strip().upper()
+    Extracted from the original _handle_precio body (ADR-8).
+    Used by both _handle_precio (FSM session start path) and
+    telegram_precio_session.submit_answer (via injected formatter).
 
-    user_info = resolve_user_by_chat(str(chat_id))
-    if user_info is None:
-        _tg_send(chat_id, "No vinculado. Genera enlace en /ajustes web.")
-        return
-
-    user_id = user_info["user_id"]
-
-    ok, reason = telegram_rate_limit.should_serve(user_id, int(chat_id), "precio")
-    if not ok:
-        if reason == "plan_exceeded":
-            _tg_send(
-                chat_id,
-                "Has agotado tus 5 consultas semanales gratis. "
-                "Hazte Pro: https://ratiovault.com/ajustes#subscription-heading",
-            )
-        else:
-            _tg_send(chat_id, "Espera un momento, estás enviando demasiados mensajes.")
-        return
-
+    Returns a ready-to-send string on success. Raises ValueError on failure
+    (ticker not in watchlist, price unavailable) — caller decides how to surface.
+    """
     # Verify ticker is in user's watchlists
     supa = get_supabase_service()
     try:
@@ -840,22 +846,60 @@ def _handle_precio(message: dict, text: str, chat_id: str | int) -> None:
 
     all_tickers = {t for wl in watchlists for t in (wl.get("tickers") or [])}
     if ticker not in all_tickers:
-        _tg_send(
-            chat_id,
-            f"{ticker} no está en tu watchlist; añádelo desde /seguimiento web.",
-        )
-        return
+        raise ValueError(f"{ticker} no está en tu watchlist; añádelo desde /seguimiento web.")
 
     price_data = get_price(ticker)
     if price_data is None:
-        _tg_send(chat_id, f"No encuentro {ticker}; verifica símbolo (ej: VWCE.DE).")
-        return
+        raise ValueError(f"No encuentro {ticker}; verifica símbolo (ej: VWCE.DE).")
 
     price = price_data["price"]
     currency = price_data.get("currency", "")
     change_pct = price_data.get("change_pct_day")
     pct_str = f" ({_fmt_pct(change_pct)})" if change_pct is not None else ""
-    _tg_send(chat_id, f"{ticker}: {price:.2f} {currency}{pct_str}")
+    return f"{ticker}: {price:.2f} {currency}{pct_str}"
+
+
+# ── /precio ─────────────────────────────────────────────────────────────────────
+
+
+def _handle_precio(chat_id: int, user_id: str, raw_text: str, args: list[str]) -> None:
+    """Start a /precio conversational session — FSM entry point (PR-B, ADR-9).
+
+    Uniform Handler signature (chat_id, user_id, raw_text, args). No _wrap_precio shim.
+
+    Flow (design §5 Flow C):
+      - args present → return usage hint (ADR-9: one-shot form removed)
+      - user not linked → send link prompt; return
+      - quota exceeded → send plan/rate-limit message; return
+      - else → start FSM session, send ask-ticker question
+    """
+    if args:
+        # ADR-9: one-shot /precio AAPL form removed; instruct to use conversational flow.
+        _tg_send(chat_id, "Usa /precio sin argumentos. Te preguntaré el ticker.")
+        return
+
+    user_info = resolve_user_by_chat(str(chat_id))
+    if user_info is None:
+        _tg_send(chat_id, "No vinculado. Genera enlace en /ajustes web.")
+        return
+
+    uid = user_info["user_id"]
+
+    ok, reason = telegram_rate_limit.should_serve(uid, int(chat_id), "precio")
+    if not ok:
+        if reason == "plan_exceeded":
+            _tg_send(
+                chat_id,
+                "Has agotado tus 5 consultas semanales gratis. "
+                "Hazte Pro: https://ratiovault.com/ajustes#subscription-heading",
+            )
+        else:
+            _tg_send(chat_id, "Espera un momento, estás enviando demasiados mensajes.")
+        return
+
+    # Start FSM session — quota consumed above, never re-consumed at answer time (ADR-4).
+    step = telegram_precio_session.start_session(int(chat_id), uid)
+    _tg_send(chat_id, step.text)
 
 
 # ── /desvincular ───────────────────────────────────────────────────────────────
@@ -871,7 +915,8 @@ def _handle_desvincular(chat_id: str | int) -> None:
     user_id = user_info["user_id"]
     try:
         delete_link(user_id)
-        _tg_send(chat_id, "✓ Desvinculado. Datos Telegram borrados.")
+        # Dismiss the persistent keyboard panel on successful unlink (REQ-12).
+        _tg_send(chat_id, "✓ Desvinculado. Datos Telegram borrados.", reply_markup=REMOVE_KEYBOARD)
     except Exception as exc:
         logger.error("telegram: /desvincular failed for user %s: %s", user_id, exc)
         _tg_send(chat_id, "❌ Error al desvincular. Inténtalo de nuevo más tarde.")
@@ -918,8 +963,8 @@ def _handle_idioma(message: dict, text: str, chat_id: str | int) -> None:
 
 
 def _handle_help(chat_id: str | int) -> None:
-    """T16: Static help text."""
-    _tg_send(chat_id, _HELP_TEXT)
+    """T16: Static help text with persistent panel keyboard (REQ-3)."""
+    _tg_send(chat_id, _HELP_TEXT, reply_markup=MAIN_PANEL)
 
 
 # ── /forex (T5) ───────────────────────────────────────────────────────────────
@@ -1404,13 +1449,6 @@ def _wrap_vincular(fn: Callable) -> Handler:
     return adapter
 
 
-def _wrap_precio(fn: Callable) -> Handler:
-    """Wrap _handle_precio (message, text, chat_id) into uniform Handler."""
-    def adapter(chat_id: int, user_id: str, raw_text: str, args: list[str]) -> None:
-        message = {"chat": {"id": chat_id}, "text": raw_text}
-        return fn(message, raw_text, chat_id)
-    return adapter
-
 
 def _wrap_idioma(fn: Callable) -> Handler:
     """Wrap _handle_idioma (message, text, chat_id) into uniform Handler."""
@@ -1491,7 +1529,7 @@ _COMMAND_DISPATCH: dict[str, Handler] = {
     "/help":         _wrap_simple(_handle_help),
     "/vault":        _wrap_simple(_handle_vault),
     "/watchlist":    _wrap_simple(_handle_watchlist),
-    "/precio":       _wrap_precio(_handle_precio),
+    "/precio":       _handle_precio,
     # PR2 handlers
     "/forex":        _handle_forex,
     "/movers":       _handle_movers,
@@ -1501,6 +1539,11 @@ _COMMAND_DISPATCH: dict[str, Handler] = {
     "/fire":         _handle_fire,
     "/cancel":       _handle_cancel,
 }
+
+# ADR-13: inject price formatter into FSM module at import time.
+# _format_precio_response is defined above; this call must happen AFTER that definition
+# and BEFORE any webhook can arrive.
+telegram_precio_session.set_formatter(_format_precio_response)
 
 
 # ── callback_query handler ─────────────────────────────────────────────────────
