@@ -15,6 +15,7 @@ Hand-crafted fixtures cover happy paths (see test_vault_snapshot.py).
 from __future__ import annotations
 
 import logging
+from datetime import date, timedelta
 from typing import Optional
 
 from supabase_client import get_supabase_service
@@ -116,6 +117,98 @@ def _to_base(amount_in_pos_currency: float, pos_currency: str, base_currency: st
     return amount_in_pos_currency * usd_per_pos / usd_per_base
 
 
+def _resolve_names(supa, user_id: str, tickers: list[str]) -> dict[str, str]:
+    """Return ticker → display name dict.
+
+    Resolution: positions.custom_name > ticker_memory.custom_name > ticker.
+
+    Implementation: TWO queries (no SQL join across schemas), merged in Python:
+      1. SELECT ticker, custom_name FROM positions
+           WHERE user_id=$1 AND ticker IN tickers AND custom_name IS NOT NULL
+      2. SELECT original_ticker, custom_name FROM ticker_memory
+           WHERE user_id=$1 AND original_ticker IN tickers AND custom_name IS NOT NULL
+
+    Then build the map by walking tickers:
+      name_map[t] = positions_map.get(t) or memory_map.get(t) or t
+
+    Empty list short-circuits to {}.
+    Any exception → log warning, return {t: t for t in tickers} (safe fallback).
+
+    ADR-2: two queries instead of SQL join (FK not declared); ADR-3: all open tickers.
+    """
+    if not tickers:
+        return {}
+    try:
+        pos_resp = (
+            supa.table("positions")
+            .select("ticker,custom_name")
+            .eq("user_id", user_id)
+            .in_("ticker", tickers)
+            .not_.is_("custom_name", "null")
+            .execute()
+        )
+        positions_map: dict[str, str] = {
+            row["ticker"]: row["custom_name"]
+            for row in (pos_resp.data or [])
+            if row.get("custom_name")
+        }
+
+        mem_resp = (
+            supa.table("ticker_memory")
+            .select("original_ticker,custom_name")
+            .eq("user_id", user_id)
+            .in_("original_ticker", tickers)
+            .not_.is_("custom_name", "null")
+            .execute()
+        )
+        memory_map: dict[str, str] = {
+            row["original_ticker"]: row["custom_name"]
+            for row in (mem_resp.data or [])
+            if row.get("custom_name")
+        }
+
+        return {
+            t: positions_map.get(t) or memory_map.get(t) or t
+            for t in tickers
+        }
+    except Exception as exc:
+        logger.warning("_resolve_names failed for user %s: %s", user_id, exc)
+        return {t: t for t in tickers}
+
+
+def _get_pnl_yesterday(supa, user_id: str, base_currency: str) -> float | None:
+    """Return yesterday's P&L delta, in base_currency, or None.
+
+    Reads portfolio_history for date = (today_utc - 1 day) and (today_utc - 2 days).
+    Returns total_value(t-1) - total_value(t-2). If either row missing → None.
+    Cast to float at the boundary (matches existing total: float).
+    Any exception → log warning, return None. Never raises.
+
+    ADR-10: two portfolio_history rows (t-1, t-2), no new migration.
+    """
+    try:
+        today = date.today()
+        yesterday = today - timedelta(days=1)
+        day_before = today - timedelta(days=2)
+        resp = (
+            supa.table("portfolio_history")
+            .select("date,total_value")
+            .eq("user_id", user_id)
+            .in_("date", [str(yesterday), str(day_before)])
+            .order("date", desc=True)
+            .limit(2)
+            .execute()
+        )
+        rows = resp.data or []
+        if len(rows) < 2:
+            return None
+        # rows[0] = most recent (t-1), rows[1] = day before (t-2)
+        return float(rows[0]["total_value"]) - float(rows[1]["total_value"])
+    except Exception as exc:
+        logger.warning("_get_pnl_yesterday failed for user %s: %s", user_id, exc)
+        return None
+
+
 def get_vault_snapshot(
     user_id: str,
     account_id: Optional[str] = None,
@@ -171,10 +264,13 @@ def get_vault_snapshot(
             "pnl_day": 0.0,
             "top_up": None,
             "top_down": None,
+            "top_movers": {"up": [], "down": []},
             "position_count": 0,
             "base_currency": base_currency,
             "unassigned_count": unassigned_count,
             "unassigned_approx": unassigned_approx,
+            "name_map": {},
+            "pnl_yesterday": None,
         }
 
     # Fetch forex rates once for the whole snapshot (S2-D: freshness parity)
@@ -263,7 +359,7 @@ def get_vault_snapshot(
         total_pnl += unrealized_pnl
         total_day_pnl += day_pnl_base
 
-    # -- Top movers --
+    # -- Top movers (legacy single-entry) --
     top_up = None
     top_down = None
     if movers:
@@ -274,16 +370,38 @@ def get_vault_snapshot(
         if worst["change_pct"] < 0:
             top_down = worst
 
+    # -- Top movers v2 (telegram-bot-quick-wins ADR-7: tiebreak ticker ASC) --
+    # Each item shape: {"ticker": str, "change_pct": float}
+    # Positions with no prev_close are excluded (not in movers list at all).
+    top_movers = {
+        "up": sorted(
+            [m for m in movers if m["change_pct"] > 0],
+            key=lambda m: (-m["change_pct"], m["ticker"]),
+        )[:5],
+        "down": sorted(
+            [m for m in movers if m["change_pct"] < 0],
+            key=lambda m: (m["change_pct"], m["ticker"]),
+        )[:5],
+    }
+
+    # ADR-3: resolve names for ALL open tickers (not just movers).
+    tickers = [p["ticker"] for p in open_positions]
+    name_map = _resolve_names(supa, user_id, tickers)
+    pnl_yesterday = _get_pnl_yesterday(supa, user_id, base_currency)
+
     return {
         "total": round(total_value, 2),
         "pnl_total": round(total_pnl, 2),
         "pnl_day": round(total_day_pnl, 2),
         "top_up": top_up,
         "top_down": top_down,
+        "top_movers": top_movers,
         "position_count": len(open_positions),
         "base_currency": base_currency,
         "unassigned_count": unassigned_count,
         "unassigned_approx": unassigned_approx,
+        "name_map": name_map,
+        "pnl_yesterday": pnl_yesterday,
     }
 
 

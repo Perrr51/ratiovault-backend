@@ -136,6 +136,7 @@ from routers.portal import router as portal_router
 from routers.health import router as health_router
 from routers.telegram import router as telegram_router
 from routers.telegram_bot import router as telegram_bot_router
+from routers.forex import router as forex_router
 
 app.include_router(market_router)
 app.include_router(charts_router)
@@ -155,3 +156,4 @@ app.include_router(portal_router)
 app.include_router(health_router)
 app.include_router(telegram_router)
 app.include_router(telegram_bot_router)
+app.include_router(forex_router)

@@ -329,7 +329,7 @@ def test_vault_single_account_calls_snapshot(client):
     assert r.status_code == 200
     mock_snap.assert_called_once()
     payload = mock_instance.post.call_args[1]["json"]
-    assert "Vault" in payload["text"]
+    assert "Total:" in payload["text"]
     assert "10.000,00" in payload["text"] or "10000" in payload["text"]
 
 

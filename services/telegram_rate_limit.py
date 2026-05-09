@@ -9,8 +9,9 @@ Two-layer protection:
 # Postgres advisory locks (see plan docs).
 
 Command taxonomy:
-  META_COMMANDS  — /start /help /idioma /desvincular → bypass quota (not DOS).
-  QUOTA_COMMANDS — /vault /watchlist /precio        → RPC quota check.
+  META_COMMANDS  — /start /help /idioma /desvincular /cancel → bypass quota (not DOS).
+  QUOTA_COMMANDS — /vault /watchlist /precio (PR1) + /forex /movers /cuentas /dividendos (PR2)
+                   + /fire (PR3) → RPC quota check. All share the same Free=5/ISO-week budget pool.
   Unknown        → always deny with "unknown_command".
 
 Anti-DOS applies to ALL commands including META to prevent /help spam floods.
@@ -31,8 +32,14 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Command sets
 # ---------------------------------------------------------------------------
-META_COMMANDS = {"start", "help", "idioma", "desvincular", "vincular"}
-QUOTA_COMMANDS = {"vault", "watchlist", "precio", "vault_refresh"}
+META_COMMANDS = {"start", "help", "idioma", "desvincular", "vincular", "cancel"}
+QUOTA_COMMANDS = {
+    "vault", "watchlist", "precio", "vault_refresh",
+    # PR2: four new read-only commands share the same Free=5/ISO-week budget pool
+    "forex", "movers", "cuentas", "dividendos",
+    # PR3: /fire FIRE-calc conversational flow (quota consumed once at /fire start)
+    "fire",
+}
 
 # ---------------------------------------------------------------------------
 # Anti-DOS sliding window config
