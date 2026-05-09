@@ -230,3 +230,103 @@ class TestDispatchQuotaAlignment:
         """precio must be in QUOTA_COMMANDS."""
         from services.telegram_rate_limit import QUOTA_COMMANDS
         assert "precio" in QUOTA_COMMANDS
+
+
+# ---------------------------------------------------------------------------
+# REQ-3 / REQ-4 — Emoji-agnostic parser (slash-token extractor)
+# ---------------------------------------------------------------------------
+
+class TestEmojiAgnosticParser:
+    """Parser must extract the first /-prefixed token regardless of position.
+
+    Covers REQ-3 (emoji-prefixed routing) and REQ-4 (backward compat).
+    Added in RED phase before the parser refactor (T1.1 → T1.2 fail expected).
+    """
+
+    def _linked_user(self) -> dict:
+        return {"user_id": "user-test"}
+
+    def test_emoji_prefixed_vault_routes_to_vault_handler(self):
+        """'💰 /vault' must dispatch to the /vault handler path (rate-limit gate)."""
+        with patch("routers.telegram_bot.resolve_user_by_chat", return_value=self._linked_user()):
+            with patch(
+                "routers.telegram_bot.telegram_rate_limit.should_serve",
+                return_value=(False, "plan_exceeded"),
+            ):
+                with patch("routers.telegram_bot._tg_send") as mock_send:
+                    from routers.telegram_bot import _handle_message
+                    _handle_message(_make_message("💰 /vault"))
+
+        # Reaching the rate-limit gate proves the handler was dispatched.
+        mock_send.assert_called_once()
+        text = mock_send.call_args[0][1].lower()
+        assert "agotado" in text or "pro" in text or "semanal" in text, (
+            f"Expected plan-exceeded message from /vault handler, got: {text!r}"
+        )
+
+    def test_emoji_prefixed_idioma_with_arg_preserves_arg(self):
+        """'🌐 /idioma es' must route to /idioma with raw_args == 'es'."""
+        captured_args: list[str] = []
+
+        def fake_handler(chat_id, user_id, raw_args, args):
+            captured_args.append(raw_args)
+
+        with patch("routers.telegram_bot.resolve_user_by_chat", return_value=self._linked_user()):
+            with patch.dict(
+                "routers.telegram_bot._COMMAND_DISPATCH",
+                {"/idioma": fake_handler},
+            ):
+                from routers.telegram_bot import _handle_message
+                _handle_message(_make_message("🌐 /idioma es"))
+
+        assert captured_args == ["es"], (
+            f"raw_args must be 'es' for '🌐 /idioma es', got: {captured_args!r}"
+        )
+
+    def test_plain_slash_vault_still_routes(self):
+        """'/vault' (bare) must still dispatch to the /vault handler (REQ-4 regression)."""
+        with patch("routers.telegram_bot.resolve_user_by_chat", return_value=self._linked_user()):
+            with patch(
+                "routers.telegram_bot.telegram_rate_limit.should_serve",
+                return_value=(False, "plan_exceeded"),
+            ):
+                with patch("routers.telegram_bot._tg_send") as mock_send:
+                    from routers.telegram_bot import _handle_message
+                    _handle_message(_make_message("/vault"))
+
+        mock_send.assert_called_once()
+        text = mock_send.call_args[0][1].lower()
+        assert "agotado" in text or "pro" in text or "semanal" in text, (
+            f"Bare /vault must reach /vault handler, got: {text!r}"
+        )
+
+    def test_plain_text_without_slash_token_falls_through(self):
+        """'AAPL' (no slash token) must fall through — no dispatch handler invoked."""
+        with patch("routers.telegram_bot._tg_send") as mock_send:
+            from routers.telegram_bot import _handle_message
+            _handle_message(_make_message("AAPL"))
+
+        # It must send _HELP_TEXT (T17 fallthrough), NOT a handler-specific message.
+        mock_send.assert_called_once()
+        sent = mock_send.call_args[0][1].lower()
+        assert "vault" in sent and "watchlist" in sent, (
+            f"Plain text must fall through to help text, got: {sent!r}"
+        )
+
+    def test_start_with_deep_link_arg_preserves_arg(self):
+        """'/start abc123' must route to _handle_start with raw_args == 'abc123'."""
+        captured_args: list[str] = []
+
+        def fake_start(chat_id, user_id, raw_args, args):
+            captured_args.append(raw_args)
+
+        with patch.dict(
+            "routers.telegram_bot._COMMAND_DISPATCH",
+            {"/start": fake_start},
+        ):
+            from routers.telegram_bot import _handle_message
+            _handle_message(_make_message("/start abc123"))
+
+        assert captured_args == ["abc123"], (
+            f"raw_args must be 'abc123' for '/start abc123', got: {captured_args!r}"
+        )

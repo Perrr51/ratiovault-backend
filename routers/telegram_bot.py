@@ -261,15 +261,20 @@ def _handle_message(message: dict) -> None:
             # NOT_ACTIVE is a defensive fallthrough (should not happen here)
     # ── end PRECIO intercept ─────────────────────────────────────────────────
 
-    if not text.startswith("/"):
-        # T17 fallback — non-command text
+    parts = text.split()
+    cmd = next((p.lower() for p in parts if p.startswith("/")), "")
+    if cmd:
+        cmd_idx = next(i for i, p in enumerate(parts) if p.lower() == cmd)
+        args = parts[cmd_idx + 1:]
+        raw_args = " ".join(args)
+    else:
+        args = []
+        raw_args = ""
+
+    if not cmd:
+        # T17 fallback — no slash token in text (non-command or plain text)
         _tg_send(chat_id, _HELP_TEXT)
         return
-
-    parts = text.split(maxsplit=1)
-    cmd = parts[0].lower()
-    raw_args = parts[1] if len(parts) > 1 else ""
-    args = raw_args.split() if raw_args else []
 
     handler = _COMMAND_DISPATCH.get(cmd)
     if handler is None:
@@ -281,7 +286,8 @@ def _handle_message(message: dict) -> None:
     # inside their own handlers (they don't need a pre-resolved user_id here).
     # Handlers that need user_id resolve it themselves via resolve_user_by_chat.
     # The uniform Handler signature receives user_id="" for commands that self-resolve.
-    handler(chat_id, "", text, args)
+    # raw_args (post-command tokens only) keeps the dispatcher emoji-agnostic (REQ-3/ADR-3).
+    handler(chat_id, "", raw_args, args)
 
 
 def _emit_session_step(chat_id: int | str, step: telegram_fire_session.SessionStep) -> None:
@@ -1433,28 +1439,33 @@ def _wrap_simple(fn: Callable[[int], None]) -> Handler:
 
 def _wrap_start(fn: Callable) -> Handler:
     """Wrap _handle_start (message, text, chat_id) into uniform Handler."""
-    def adapter(chat_id: int, user_id: str, raw_text: str, args: list[str]) -> None:
-        # Reconstruct a minimal message dict for _handle_start
-        message = {"chat": {"id": chat_id}, "text": raw_text}
-        return fn(message, raw_text, chat_id)
+    def adapter(chat_id: int, user_id: str, raw_args: str, args: list[str]) -> None:
+        # Reconstruct full command text for inner handler (raw_args is post-command only).
+        text = f"/start {raw_args}".strip()
+        message = {"chat": {"id": chat_id}, "text": text}
+        return fn(message, text, chat_id)
     return adapter
 
 
 def _wrap_vincular(fn: Callable) -> Handler:
     """Wrap _handle_vincular (message, text, chat_id) into uniform Handler."""
-    def adapter(chat_id: int, user_id: str, raw_text: str, args: list[str]) -> None:
-        message = {"chat": {"id": chat_id}, "text": raw_text,
+    def adapter(chat_id: int, user_id: str, raw_args: str, args: list[str]) -> None:
+        # Reconstruct full command text; _handle_vincular regex expects /vincular <code>.
+        text = f"/vincular {raw_args}".strip()
+        message = {"chat": {"id": chat_id}, "text": text,
                    "from": {"language_code": "es"}}
-        return fn(message, raw_text, chat_id)
+        return fn(message, text, chat_id)
     return adapter
 
 
 
 def _wrap_idioma(fn: Callable) -> Handler:
     """Wrap _handle_idioma (message, text, chat_id) into uniform Handler."""
-    def adapter(chat_id: int, user_id: str, raw_text: str, args: list[str]) -> None:
-        message = {"chat": {"id": chat_id}, "text": raw_text}
-        return fn(message, raw_text, chat_id)
+    def adapter(chat_id: int, user_id: str, raw_args: str, args: list[str]) -> None:
+        # Reconstruct full command text; _handle_idioma splits on whitespace to extract locale.
+        text = f"/idioma {raw_args}".strip()
+        message = {"chat": {"id": chat_id}, "text": text}
+        return fn(message, text, chat_id)
     return adapter
 
 
