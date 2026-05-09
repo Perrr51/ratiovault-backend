@@ -196,6 +196,15 @@ def _fmt_pct(value: float) -> str:
 # ── Update dispatcher ──────────────────────────────────────────────────────────
 
 
+def _has_slash_command(text: str) -> bool:
+    """Return True if any whitespace-separated token in *text* starts with '/'.
+
+    This handles emoji-prefixed panel buttons such as '💰 /vault' or '❌ /cancel'
+    that would fail a plain ``text.startswith('/')`` check.
+    """
+    return any(p.startswith("/") for p in text.split())
+
+
 def handle_update(update: dict) -> None:
     """Route an incoming Telegram update."""
     message = update.get("message")
@@ -223,14 +232,16 @@ def _handle_message(message: dict) -> None:
 
     # ── FIRE-flow intercept (PR3) ─────────────────────────────────────────────
     if telegram_fire_session.has_active_session(int(chat_id)):
-        if text == "/cancel":
+        if text == "/cancel" or next((p for p in text.split() if p == "/cancel"), None):
             # META command: cancel session + ack. No quota consumed.
+            # Handles bare '/cancel' and emoji-prefixed '❌ /cancel'.
             telegram_fire_session.cancel_session(int(chat_id))
             _tg_send(chat_id, telegram_fire_session.CANCEL_ACK)
             return
-        if text.startswith("/"):
+        if _has_slash_command(text):
             # Other /command mid-flow → silent clear, fall through to dispatch.
             # ADR-D7: no extra quota consumed, no extra message.
+            # Handles bare '/cmd' and emoji-prefixed '💰 /cmd' panel buttons.
             telegram_fire_session.clear_session(int(chat_id))
             # Fall through to normal command dispatch below.
         else:
@@ -243,13 +254,15 @@ def _handle_message(message: dict) -> None:
     # ── PRECIO-flow intercept (PR-B) ──────────────────────────────────────────
     # Checked AFTER fire — fire has higher priority (ADR-7, REQ-11).
     if telegram_precio_session.has_active_session(int(chat_id)):
-        if text == "/cancel":
+        if text == "/cancel" or next((p for p in text.split() if p == "/cancel"), None):
             # Explicit cancel — clear session, send ack (REQ-9, design Flow E).
+            # Handles bare '/cancel' and emoji-prefixed '❌ /cancel'.
             telegram_precio_session.cancel_session(int(chat_id))
             _tg_send(chat_id, "Listo, hemos parado.")
             return
-        if text.startswith("/"):
+        if _has_slash_command(text):
             # Any other /command mid-flow → silent clear, fall through to dispatch (REQ-10).
+            # Handles bare '/cmd' and emoji-prefixed '💰 /cmd' panel buttons.
             telegram_precio_session.clear_session(int(chat_id))
             # Fall through to normal command dispatch below.
         else:
@@ -261,15 +274,20 @@ def _handle_message(message: dict) -> None:
             # NOT_ACTIVE is a defensive fallthrough (should not happen here)
     # ── end PRECIO intercept ─────────────────────────────────────────────────
 
-    if not text.startswith("/"):
-        # T17 fallback — non-command text
+    parts = text.split()
+    cmd = next((p.lower() for p in parts if p.startswith("/")), "")
+    if cmd:
+        cmd_idx = next(i for i, p in enumerate(parts) if p.lower() == cmd)
+        args = parts[cmd_idx + 1:]
+        raw_args = " ".join(args)
+    else:
+        args = []
+        raw_args = ""
+
+    if not cmd:
+        # T17 fallback — no slash token in text (non-command or plain text)
         _tg_send(chat_id, _HELP_TEXT)
         return
-
-    parts = text.split(maxsplit=1)
-    cmd = parts[0].lower()
-    raw_args = parts[1] if len(parts) > 1 else ""
-    args = raw_args.split() if raw_args else []
 
     handler = _COMMAND_DISPATCH.get(cmd)
     if handler is None:
@@ -281,7 +299,8 @@ def _handle_message(message: dict) -> None:
     # inside their own handlers (they don't need a pre-resolved user_id here).
     # Handlers that need user_id resolve it themselves via resolve_user_by_chat.
     # The uniform Handler signature receives user_id="" for commands that self-resolve.
-    handler(chat_id, "", text, args)
+    # raw_args (post-command tokens only) keeps the dispatcher emoji-agnostic (REQ-3/ADR-3).
+    handler(chat_id, "", raw_args, args)
 
 
 def _emit_session_step(chat_id: int | str, step: telegram_fire_session.SessionStep) -> None:
@@ -1433,28 +1452,33 @@ def _wrap_simple(fn: Callable[[int], None]) -> Handler:
 
 def _wrap_start(fn: Callable) -> Handler:
     """Wrap _handle_start (message, text, chat_id) into uniform Handler."""
-    def adapter(chat_id: int, user_id: str, raw_text: str, args: list[str]) -> None:
-        # Reconstruct a minimal message dict for _handle_start
-        message = {"chat": {"id": chat_id}, "text": raw_text}
-        return fn(message, raw_text, chat_id)
+    def adapter(chat_id: int, user_id: str, raw_args: str, args: list[str]) -> None:
+        # Reconstruct full command text for inner handler (raw_args is post-command only).
+        text = f"/start {raw_args}".strip()
+        message = {"chat": {"id": chat_id}, "text": text}
+        return fn(message, text, chat_id)
     return adapter
 
 
 def _wrap_vincular(fn: Callable) -> Handler:
     """Wrap _handle_vincular (message, text, chat_id) into uniform Handler."""
-    def adapter(chat_id: int, user_id: str, raw_text: str, args: list[str]) -> None:
-        message = {"chat": {"id": chat_id}, "text": raw_text,
+    def adapter(chat_id: int, user_id: str, raw_args: str, args: list[str]) -> None:
+        # Reconstruct full command text; _handle_vincular regex expects /vincular <code>.
+        text = f"/vincular {raw_args}".strip()
+        message = {"chat": {"id": chat_id}, "text": text,
                    "from": {"language_code": "es"}}
-        return fn(message, raw_text, chat_id)
+        return fn(message, text, chat_id)
     return adapter
 
 
 
 def _wrap_idioma(fn: Callable) -> Handler:
     """Wrap _handle_idioma (message, text, chat_id) into uniform Handler."""
-    def adapter(chat_id: int, user_id: str, raw_text: str, args: list[str]) -> None:
-        message = {"chat": {"id": chat_id}, "text": raw_text}
-        return fn(message, raw_text, chat_id)
+    def adapter(chat_id: int, user_id: str, raw_args: str, args: list[str]) -> None:
+        # Reconstruct full command text; _handle_idioma splits on whitespace to extract locale.
+        text = f"/idioma {raw_args}".strip()
+        message = {"chat": {"id": chat_id}, "text": text}
+        return fn(message, text, chat_id)
     return adapter
 
 

@@ -57,20 +57,20 @@ def test_main_panel_total_button_count() -> None:
 
 
 def test_main_panel_button_order_exact() -> None:
-    """All 10 buttons must appear in the exact locked order (row-major)."""
+    """All 10 buttons must appear in the exact locked order (row-major) with emoji prefix."""
     from services.telegram_keyboard import MAIN_PANEL
 
     kb = MAIN_PANEL["keyboard"]
-    assert kb[0][0]["text"] == "/vault"
-    assert kb[0][1]["text"] == "/forex"
-    assert kb[1][0]["text"] == "/movers"
-    assert kb[1][1]["text"] == "/cuentas"
-    assert kb[2][0]["text"] == "/dividendos"
-    assert kb[2][1]["text"] == "/fire"
-    assert kb[3][0]["text"] == "/watchlist"
-    assert kb[3][1]["text"] == "/idioma"
-    assert kb[4][0]["text"] == "/desvincular"
-    assert kb[4][1]["text"] == "/help"
+    assert kb[0][0]["text"] == "💰 /vault"
+    assert kb[0][1]["text"] == "💱 /forex"
+    assert kb[1][0]["text"] == "📈 /movers"
+    assert kb[1][1]["text"] == "🏦 /cuentas"
+    assert kb[2][0]["text"] == "💵 /dividendos"
+    assert kb[2][1]["text"] == "🔥 /fire"
+    assert kb[3][0]["text"] == "👁 /watchlist"
+    assert kb[3][1]["text"] == "🌐 /idioma"
+    assert kb[4][0]["text"] == "🔌 /desvincular"
+    assert kb[4][1]["text"] == "❓ /help"
 
 
 def test_main_panel_buttons_are_dicts_with_text_key() -> None:

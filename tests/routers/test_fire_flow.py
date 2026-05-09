@@ -304,3 +304,58 @@ def test_fire_without_linked_account_shows_vincular_message() -> None:
     mock_send.assert_called_once()
     sent_text = mock_send.call_args[0][1]
     assert "vincular" in sent_text.lower()
+
+
+# ── WARNING-1 fix: emoji-prefixed panel buttons mid-fire session ───────────────
+# Tests written RED before fix. After fix: GREEN.
+
+
+def test_emoji_prefixed_command_during_active_fire_session_clears_and_dispatches() -> None:
+    """'💰 /vault' mid-fire → session cleared, /vault dispatched (WARNING-1 fix)."""
+    from routers.telegram_bot import handle_update
+    import services.telegram_fire_session as sfs
+
+    sfs.start_session(1200)
+    assert sfs.has_active_session(1200)
+
+    with (
+        patch("routers.telegram_bot.resolve_user_by_chat", return_value={"user_id": "u-test"}),
+        patch(
+            "routers.telegram_bot.telegram_rate_limit.should_serve",
+            return_value=(False, "plan_exceeded"),
+        ),
+        patch("routers.telegram_bot._tg_send") as mock_send,
+    ):
+        handle_update(_make_update(1200, "💰 /vault"))
+
+    # Session must be cleared
+    assert not sfs.has_active_session(1200), (
+        "'💰 /vault' mid-fire must clear the fire session"
+    )
+    # /vault handler must have been dispatched (plan_exceeded gate fires → one send)
+    mock_send.assert_called_once()
+    text = mock_send.call_args[0][1].lower()
+    assert "agotado" in text or "pro" in text or "semanal" in text, (
+        f"Expected /vault handler plan_exceeded message, got: {text!r}"
+    )
+
+
+def test_emoji_prefixed_cancel_during_active_fire_session_cancels() -> None:
+    """'❌ /cancel' mid-fire → cancel ack sent, session cleared (WARNING-1 fix)."""
+    from routers.telegram_bot import handle_update
+    import services.telegram_fire_session as sfs
+
+    sfs.start_session(1201)
+    assert sfs.has_active_session(1201)
+
+    with patch("routers.telegram_bot._tg_send") as mock_send:
+        handle_update(_make_update(1201, "❌ /cancel"))
+
+    assert not sfs.has_active_session(1201), (
+        "'❌ /cancel' mid-fire must clear the fire session"
+    )
+    mock_send.assert_called_once()
+    sent_text = mock_send.call_args[0][1]
+    assert "cancel" in sent_text.lower(), (
+        f"Cancel ack expected, got: {sent_text!r}"
+    )

@@ -15,11 +15,11 @@ from typing import Final
 
 MAIN_PANEL: Final[dict] = {
     "keyboard": [
-        [{"text": "/vault"}, {"text": "/forex"}],
-        [{"text": "/movers"}, {"text": "/cuentas"}],
-        [{"text": "/dividendos"}, {"text": "/fire"}],
-        [{"text": "/watchlist"}, {"text": "/idioma"}],
-        [{"text": "/desvincular"}, {"text": "/help"}],
+        [{"text": "💰 /vault"}, {"text": "💱 /forex"}],
+        [{"text": "📈 /movers"}, {"text": "🏦 /cuentas"}],
+        [{"text": "💵 /dividendos"}, {"text": "🔥 /fire"}],
+        [{"text": "👁 /watchlist"}, {"text": "🌐 /idioma"}],
+        [{"text": "🔌 /desvincular"}, {"text": "❓ /help"}],
     ],
     "is_persistent": True,
     "resize_keyboard": True,
