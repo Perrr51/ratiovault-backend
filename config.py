@@ -48,6 +48,15 @@ class Settings(BaseSettings):
     # ── Fallback behavior (B-008) ───────────────────────────────────────────
     stooq_any_ticker_fallback: bool = True
 
+    # ── Contact form email adapters (WU1 ajustes-overhaul) ──────────────────
+    # Resend is the primary adapter; Zoho SMTP is the fallback.
+    # If neither is configured the app raises ConfigError at router include time.
+    resend_api_key: str = ""           # Bearer token for api.resend.com
+    zoho_smtp_host: str = "smtp.zoho.eu"
+    zoho_smtp_user: str = ""           # e.g. noreply@ratiovault.com
+    zoho_smtp_pass: str = ""
+    contact_from: str = "noreply@ratiovault.com"
+
     # ── Paddle Billing (supersedes LemonSqueezy 2026-04-30) ─────────────────
     # MoR processor. Webhook signature: Paddle-Signature header (ts + h1).
     # See ADR docs/decisions/2026-04-30-paddle-supersedes-lemonsqueezy.md.
