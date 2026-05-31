@@ -2,13 +2,8 @@
 
 GDPR retention:
 - prune `subscription_events` older than 90 days.
-- prune `telegram_link_tokens` that expired more than 7 days ago.
 
 Fail-closed: if `settings.internal_cron_token` is empty, every request 401s.
-
-Cron job setup (founder responsibility post-merge):
-  0 3 * * * curl -s -X POST https://api.ratiovault.com/internal/cron/prune-telegram-tokens \
-    -H "Authorization: Bearer $INTERNAL_CRON_TOKEN"
 """
 
 import hmac
@@ -24,7 +19,6 @@ from supabase_client import get_supabase_service
 router = APIRouter(tags=["internal"])
 
 RETENTION_DAYS = 90
-TELEGRAM_TOKEN_GRACE_DAYS = 7  # delete expired tokens after an extra 7-day grace
 
 
 def _authorize(request: Request, authorization: str | None) -> None:
@@ -60,7 +54,7 @@ def prune_events(request: Request, authorization: str = Header(None)):
 
 @router.post("/internal/cron/evaluate-alerts")
 def evaluate_alerts_cron(request: Request, authorization: str = Header(None)) -> dict:
-    """Evaluate all active price alerts and send Telegram notifications.
+    """Evaluate all active price alerts. Delivery pending email transport implementation.
 
     Called by VPS cron every 15 minutes. Requires the same bearer token
     as the other internal cron endpoints (settings.internal_cron_token).
@@ -75,31 +69,6 @@ def evaluate_alerts_cron(request: Request, authorization: str = Header(None)) ->
     """
     _authorize(request, authorization)
     return alerts_scheduler.evaluate_active_alerts()
-
-
-@router.post("/internal/cron/prune-telegram-tokens")
-def prune_telegram_tokens(request: Request, authorization: str = Header(None)):
-    """Delete expired telegram_link_tokens older than 7 days past their expires_at.
-
-    Retention: tokens expire after 24h (set at creation); we give a 7-day grace
-    before hard-deleting so any in-flight linking attempt has a clear error window.
-
-    Cron: daily, off-peak (e.g. 03:05 UTC). See module docstring for curl recipe.
-    """
-    _authorize(request, authorization)
-    cutoff = datetime.now(timezone.utc) - timedelta(days=TELEGRAM_TOKEN_GRACE_DAYS)
-    client = get_supabase_service()
-    resp = (
-        client.from_("telegram_link_tokens")
-        .delete()
-        .lt("expires_at", cutoff.isoformat())
-        .execute()
-    )
-    deleted = len(resp.data or [])
-    logger.info(
-        "prune-telegram-tokens cutoff=%s deleted=%d", cutoff.isoformat(), deleted
-    )
-    return {"deleted": deleted}
 
 
 @router.post("/internal/cron/prune-expired-undo-tickets")

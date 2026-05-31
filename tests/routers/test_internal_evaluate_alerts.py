@@ -1,7 +1,7 @@
 """Integration tests for POST /internal/cron/evaluate-alerts (T5).
 
 Auth tests use a mock TestClient (no Supabase stack needed).
-Happy-path test mocks both price_cache and telegram_notify.
+Happy-path test mocks price_cache; delivery is no-op (email transport pending).
 
 Covers R2/S2, R2/S3, R2,R12/S4, and end-to-end happy path.
 """
@@ -89,11 +89,11 @@ def test_evaluate_alerts_endpoint_correct_token_empty_db_200(app_client) -> None
     assert body == {"evaluated": 0, "fired": 0, "skipped": 0, "errors": 0}, body
 
 
-# ── T5.4 — happy path: 1 active alert fires via Telegram (end-to-end) ─────────
+# ── T5.4 — happy path: 1 active alert condition met → fired=1, delivery pending ─
 
 
-def test_evaluate_alerts_endpoint_happy_path_fires_telegram(app_client) -> None:
-    """Correct token + 1 active alert + mocked price + mocked send → fired=1."""
+def test_evaluate_alerts_endpoint_happy_path_fires(app_client) -> None:
+    """Correct token + 1 active alert + mocked price → fired=1, delivery pending (email seam)."""
     active_alert = {
         "id": "alert-happy",
         "user_id": "user-happy",
@@ -126,9 +126,7 @@ def test_evaluate_alerts_endpoint_happy_path_fires_telegram(app_client) -> None:
     with patch("services.alerts_scheduler.get_supabase_service", return_value=mock_supa), \
          patch("services.alerts_scheduler.get_prices_batch", return_value={
              "AAPL": {"ticker": "AAPL", "price": 200.0, "currency": "USD"}
-         }), \
-         patch("services.alerts_scheduler.resolve_chat_by_user", return_value=("chat-happy", "es")), \
-         patch("services.alerts_scheduler.send_message") as mock_send:
+         }):
 
         r = app_client.post(
             "/internal/cron/evaluate-alerts",
@@ -137,8 +135,5 @@ def test_evaluate_alerts_endpoint_happy_path_fires_telegram(app_client) -> None:
 
     assert r.status_code == 200, r.text
     body = r.json()
+    # Alert condition met → state updated → fired=1; no delivery transport yet
     assert body == {"evaluated": 1, "fired": 1, "skipped": 0, "errors": 0}, body
-    mock_send.assert_called_once()
-    # send_message was called with the resolved chat_id
-    send_chat_id = mock_send.call_args[0][0]
-    assert send_chat_id == "chat-happy"

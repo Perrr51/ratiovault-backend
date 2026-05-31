@@ -25,8 +25,6 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from services.price_cache import get_prices_batch
-from services.telegram_link import resolve_chat_by_user
-from services.telegram_notify import send_message
 from supabase_client import get_supabase_service
 
 logger = logging.getLogger(__name__)
@@ -159,25 +157,23 @@ def _update_alert_state(supa: Any, alert: dict, price: float) -> None:
 
 
 def evaluate_active_alerts() -> dict:
-    """Evaluate all active alerts and send Telegram notifications.
+    """Evaluate all active alerts. Delivery is pending email transport implementation.
 
     Returns:
         {"evaluated": int, "fired": int, "skipped": int, "errors": int}
         with the invariant evaluated == fired + skipped + errors (R12).
 
-    Algorithm (per design data flow):
+    Algorithm:
         1. SELECT alerts WHERE enabled=true AND status='active'
         2. Deduplicate tickers → single get_prices_batch call (R4)
         3. For each alert:
-            a. email/unknown channel → skip (R10)
-            b. operator not in allow-list → WARN + skip (R5)
-            c. price missing → errors++ (transient infra issue)
-            d. cooldown gate → skip (R6)
-            e. predicate false → continue (not a skip, not a fire — just not triggered)
-            f. resolve_chat_by_user → None → WARN + skip (R9)
-            g. send_message → raises → ERROR + errors++ (R11)
-            h. UPDATE state atomically (R7)
-            i. fired++
+            a. operator not in allow-list → WARN + skip (R5)
+            b. price missing → errors++ (transient infra issue)
+            c. cooldown gate → skip (R6)
+            d. predicate false → continue (not triggered)
+            e. UPDATE state atomically (R7)
+            f. TODO(email-alerts): deliver notification — skipped (pending)
+            g. fired++
     """
     supa = get_supabase_service()
 
@@ -206,25 +202,12 @@ def evaluate_active_alerts() -> dict:
     # 3. Evaluate each alert
     for alert in rows:
         alert_id = alert.get("id", "?")
-        user_id = alert.get("user_id", "?")
         ticker = alert.get("ticker", "")
         operator = alert.get("operator", "")
         target_value = alert.get("target_value", 0.0)
-        channel = alert.get("channel", "")
 
         try:
-            # a. Channel routing (R10) — email silently skipped
-            if channel == "email":
-                logger.info("alert %s: email channel skipped (not implemented this sprint)", alert_id)
-                skipped += 1
-                continue
-
-            if channel != "telegram":
-                logger.info("alert %s: unknown channel %r skipped", alert_id, channel)
-                skipped += 1
-                continue
-
-            # b. Operator allow-list (R5)
+            # a. Operator allow-list (R5)
             if operator not in _SUPPORTED_OPS:
                 logger.warning(
                     "alert %s: unsupported operator %r — skipping", alert_id, operator
@@ -232,7 +215,7 @@ def evaluate_active_alerts() -> dict:
                 skipped += 1
                 continue
 
-            # c. Price available?
+            # b. Price available?
             price_data = prices.get(ticker)
             if price_data is None:
                 logger.error("alert %s: no price data for ticker %r", alert_id, ticker)
@@ -241,35 +224,28 @@ def evaluate_active_alerts() -> dict:
 
             current_price: float = price_data.get("price", 0.0)
 
-            # d. Cooldown gate (R6)
+            # c. Cooldown gate (R6)
             if _in_cooldown(alert):
                 logger.debug("alert %s: in cooldown — skipping", alert_id)
                 skipped += 1
                 continue
 
-            # e. Predicate — if condition not met, move to next alert (not skipped, not fired)
+            # d. Predicate — if condition not met, move to next alert (not skipped, not fired)
             if not _matches(current_price, operator, target_value):
                 continue
 
-            # f. Resolve telegram chat_id (R8, NFR2)
-            chat_result = resolve_chat_by_user(user_id)
-            if chat_result is None:
-                logger.warning(
-                    "alert %s user %s: no notification_channels row — skipping", alert_id, user_id
-                )
-                skipped += 1
-                continue
-
-            chat_id, locale = chat_result
-
-            # g. Send notification (R11 — raises on failure, preventing state update)
-            message = _format_message(alert, current_price, locale)
-            send_message(chat_id, message)
-
-            # h. Atomic state update (R7) — only reached if send_message succeeded
+            # e. Atomic state update (R7) — mark alert as evaluated/triggered
             _update_alert_state(supa, alert, current_price)
 
-            # i. Count as fired
+            # f. TODO(email-alerts): implement email transport here.
+            #    Alert condition was met and state updated; notification delivery
+            #    is intentionally deferred until email transport is wired in.
+            logger.info(
+                "alert %s: condition met (price=%.4f %s %.4f) — delivery pending email transport",
+                alert_id, current_price, operator, target_value,
+            )
+
+            # g. Count as fired (evaluated + state updated; delivery pending)
             fired += 1
 
         except Exception as exc:  # noqa: BLE001

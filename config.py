@@ -36,12 +36,6 @@ class Settings(BaseSettings):
     supabase_service_role_key: str = ""
     supabase_jwt_secret: str = ""
 
-    # ── Telegram Bot ────────────────────────────────────────────────────────
-    telegram_bot_username: str = ""       # e.g. "RatioVaultBot" — used for deep_link_url
-    telegram_bot_token: str = ""          # BotFather token; empty = bot disabled (local dev)
-    telegram_webhook_secret: str = ""     # openssl rand -hex 32; must match setWebhook call
-    telegram_webhook_url: str = ""        # full HTTPS URL, e.g. https://api.ratiovault.com/telegram/webhook
-
     # ── Internal cron ───────────────────────────────────────────────────────
     internal_cron_token: str = ""
 

@@ -5,7 +5,6 @@ Authorized importers (see `tests/test_supabase_client.py::test_service_import_is
     - routers/checkout.py
     - routers/portal.py
     - routers/internal.py
-    - services/telegram_link.py
 """
 
 from functools import lru_cache

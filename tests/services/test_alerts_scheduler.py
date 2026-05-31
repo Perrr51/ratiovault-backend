@@ -1,16 +1,17 @@
 """Unit tests for services/alerts_scheduler.evaluate_active_alerts (T4).
 
-All 13 tests from design test plan. DB, price_cache, telegram_notify, and
-telegram_link are mocked — no Supabase or network access.
+Telegram delivery removed. Tests now cover evaluation-only behavior:
+DB, price_cache are mocked — no Supabase or network access.
+Delivery is intentionally no-op (TODO email-alerts seam).
 
-Covers R3–R12 / Scenarios S5–S15.
+Covers R3–R7, R12 / Scenarios S5–S10, S13, S15.
 """
 
 from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta, timezone
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -82,9 +83,7 @@ def test_alerts_scheduler_only_loads_enabled_active() -> None:
     mock_supa.table.return_value = mock_table
 
     with patch("services.alerts_scheduler.get_supabase_service", return_value=mock_supa), \
-         patch("services.alerts_scheduler.get_prices_batch", return_value={"AAPL": _price("AAPL", 50.0)}), \
-         patch("services.alerts_scheduler.resolve_chat_by_user", return_value=("chat-1", "es")), \
-         patch("services.alerts_scheduler.send_message"):
+         patch("services.alerts_scheduler.get_prices_batch", return_value={"AAPL": _price("AAPL", 50.0)}):
 
         result = alerts_scheduler.evaluate_active_alerts()
 
@@ -118,9 +117,7 @@ def test_alerts_scheduler_dedupes_tickers() -> None:
     mock_supa.table.return_value = mock_table
 
     with patch("services.alerts_scheduler.get_supabase_service", return_value=mock_supa), \
-         patch("services.alerts_scheduler.get_prices_batch") as mock_batch, \
-         patch("services.alerts_scheduler.resolve_chat_by_user", return_value=("chat-1", "es")), \
-         patch("services.alerts_scheduler.send_message"):
+         patch("services.alerts_scheduler.get_prices_batch") as mock_batch:
 
         mock_batch.return_value = {
             "AAPL": _price("AAPL", 50.0),
@@ -158,14 +155,12 @@ def test_alerts_scheduler_unknown_operator_skipped_with_warn(caplog) -> None:
 
     with patch("services.alerts_scheduler.get_supabase_service", return_value=mock_supa), \
          patch("services.alerts_scheduler.get_prices_batch", return_value={"AAPL": _price("AAPL", 200.0)}), \
-         patch("services.alerts_scheduler.send_message") as mock_send, \
          caplog.at_level(logging.WARNING, logger="services.alerts_scheduler"):
 
         result = alerts_scheduler.evaluate_active_alerts()
 
     assert result["skipped"] == 1
     assert result["fired"] == 0
-    mock_send.assert_not_called()
     # WARN log contains alert id and operator
     warn_logs = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
     assert any("a1" in msg and "crosses_up" in msg for msg in warn_logs), \
@@ -206,9 +201,7 @@ def test_alerts_scheduler_operator_matching_gt_gte_lt_lte(op, price, target, sho
     mock_supa.table.return_value = mock_table
 
     with patch("services.alerts_scheduler.get_supabase_service", return_value=mock_supa), \
-         patch("services.alerts_scheduler.get_prices_batch", return_value={"AAPL": _price("AAPL", price)}), \
-         patch("services.alerts_scheduler.resolve_chat_by_user", return_value=("chat-1", "es")), \
-         patch("services.alerts_scheduler.send_message"):
+         patch("services.alerts_scheduler.get_prices_batch", return_value={"AAPL": _price("AAPL", price)}):
 
         result = alerts_scheduler.evaluate_active_alerts()
 
@@ -222,7 +215,7 @@ def test_alerts_scheduler_operator_matching_gt_gte_lt_lte(op, price, target, sho
 
 
 def test_alerts_scheduler_cooldown_gate_blocks() -> None:
-    """last_triggered_at=now()-2h, cooldown_hours=24 → skipped, no message."""
+    """last_triggered_at=now()-2h, cooldown_hours=24 → skipped, no state update."""
     from services import alerts_scheduler
 
     triggered_2h_ago = _utc_iso(datetime.now(timezone.utc) - timedelta(hours=2))
@@ -243,14 +236,12 @@ def test_alerts_scheduler_cooldown_gate_blocks() -> None:
     mock_supa.table.return_value = mock_table
 
     with patch("services.alerts_scheduler.get_supabase_service", return_value=mock_supa), \
-         patch("services.alerts_scheduler.get_prices_batch", return_value={"AAPL": _price("AAPL", 200.0)}), \
-         patch("services.alerts_scheduler.send_message") as mock_send:
+         patch("services.alerts_scheduler.get_prices_batch", return_value={"AAPL": _price("AAPL", 200.0)}):
 
         result = alerts_scheduler.evaluate_active_alerts()
 
     assert result["skipped"] == 1
     assert result["fired"] == 0
-    mock_send.assert_not_called()
 
 
 # ── T4.6 — first-time alert (no cooldown) fires (R6/S10) ─────────────────────
@@ -285,9 +276,7 @@ def test_alerts_scheduler_first_time_no_cooldown() -> None:
     mock_supa.table.side_effect = table_side_effect
 
     with patch("services.alerts_scheduler.get_supabase_service", return_value=mock_supa), \
-         patch("services.alerts_scheduler.get_prices_batch", return_value={"AAPL": _price("AAPL", 200.0)}), \
-         patch("services.alerts_scheduler.resolve_chat_by_user", return_value=("chat-1", "es")), \
-         patch("services.alerts_scheduler.send_message"):
+         patch("services.alerts_scheduler.get_prices_batch", return_value={"AAPL": _price("AAPL", 200.0)}):
 
         result = alerts_scheduler.evaluate_active_alerts()
 
@@ -320,20 +309,18 @@ def test_alerts_scheduler_past_cooldown_fires() -> None:
     mock_supa.table.return_value = mock_table
 
     with patch("services.alerts_scheduler.get_supabase_service", return_value=mock_supa), \
-         patch("services.alerts_scheduler.get_prices_batch", return_value={"AAPL": _price("AAPL", 200.0)}), \
-         patch("services.alerts_scheduler.resolve_chat_by_user", return_value=("chat-1", "es")), \
-         patch("services.alerts_scheduler.send_message"):
+         patch("services.alerts_scheduler.get_prices_batch", return_value={"AAPL": _price("AAPL", 200.0)}):
 
         result = alerts_scheduler.evaluate_active_alerts()
 
     assert result["fired"] == 1
 
 
-# ── T4.8 — email channel silently skipped (R10/S13) ──────────────────────────
+# ── T4.8 — any channel passes evaluation (email-only seam, R10 removed) ──────
 
 
-def test_alerts_scheduler_email_silently_skipped() -> None:
-    """channel='email' → skipped, no exception, no state update."""
+def test_alerts_scheduler_any_channel_evaluates() -> None:
+    """channel value is no longer filtered — all alerts evaluate via operator/price/cooldown."""
     from services import alerts_scheduler
 
     alert = _make_alert(id="a1", operator="gt", target_value=50.0, channel="email")
@@ -350,125 +337,13 @@ def test_alerts_scheduler_email_silently_skipped() -> None:
     mock_supa.table.return_value = mock_table
 
     with patch("services.alerts_scheduler.get_supabase_service", return_value=mock_supa), \
-         patch("services.alerts_scheduler.get_prices_batch", return_value={"AAPL": _price("AAPL", 200.0)}), \
-         patch("services.alerts_scheduler.send_message") as mock_send:
+         patch("services.alerts_scheduler.get_prices_batch", return_value={"AAPL": _price("AAPL", 200.0)}):
 
         result = alerts_scheduler.evaluate_active_alerts()
 
-    assert result["skipped"] == 1
-    assert result["fired"] == 0
+    # Alert evaluates (condition met), state updated, delivery pending
+    assert result["fired"] == 1
     assert result["errors"] == 0
-    mock_send.assert_not_called()
-
-
-# ── T4.9 — telegram no link skipped with WARN (R9/S12) ───────────────────────
-
-
-def test_alerts_scheduler_telegram_no_link_skipped_with_warn(caplog) -> None:
-    """resolve_chat_by_user returns None → WARN logged, skipped, no state update."""
-    from services import alerts_scheduler
-
-    alert = _make_alert(id="a1", operator="gt", target_value=50.0, channel="telegram")
-
-    mock_result = MagicMock()
-    mock_result.data = [alert]
-
-    mock_table = MagicMock()
-    mock_table.select.return_value = mock_table
-    mock_table.eq.return_value = mock_table
-    mock_table.execute.return_value = mock_result
-
-    mock_supa = MagicMock()
-    mock_supa.table.return_value = mock_table
-
-    with patch("services.alerts_scheduler.get_supabase_service", return_value=mock_supa), \
-         patch("services.alerts_scheduler.get_prices_batch", return_value={"AAPL": _price("AAPL", 200.0)}), \
-         patch("services.alerts_scheduler.resolve_chat_by_user", return_value=None), \
-         patch("services.alerts_scheduler.send_message") as mock_send, \
-         caplog.at_level(logging.WARNING, logger="services.alerts_scheduler"):
-
-        result = alerts_scheduler.evaluate_active_alerts()
-
-    assert result["skipped"] == 1
-    assert result["fired"] == 0
-    mock_send.assert_not_called()
-    warn_logs = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
-    assert any("a1" in msg and "user-1" in msg for msg in warn_logs), \
-        f"expected WARN with alert id and user_id, got: {warn_logs}"
-
-
-# ── T4.10 — telegram resolves chat ignoring destination (R8,NFR2/S11) ─────────
-
-
-def test_alerts_scheduler_telegram_resolves_chat_ignoring_destination() -> None:
-    """destination='garbage' → send_message called with 'real_chat_id', not garbage."""
-    from services import alerts_scheduler
-
-    alert = _make_alert(
-        id="a1", operator="gt", target_value=50.0,
-        channel="telegram", destination="garbage_destination",
-        user_id="user-safe"
-    )
-
-    mock_result = MagicMock()
-    mock_result.data = [alert]
-
-    mock_table = MagicMock()
-    mock_table.select.return_value = mock_table
-    mock_table.eq.return_value = mock_table
-    mock_table.execute.return_value = mock_result
-
-    mock_supa = MagicMock()
-    mock_supa.table.return_value = mock_table
-
-    with patch("services.alerts_scheduler.get_supabase_service", return_value=mock_supa), \
-         patch("services.alerts_scheduler.get_prices_batch", return_value={"AAPL": _price("AAPL", 200.0)}), \
-         patch("services.alerts_scheduler.resolve_chat_by_user", return_value=("real_chat_id", "es")) as mock_resolve, \
-         patch("services.alerts_scheduler.send_message") as mock_send:
-
-        result = alerts_scheduler.evaluate_active_alerts()
-
-    # resolve was called with user_id, not destination
-    mock_resolve.assert_called_once_with("user-safe")
-    # send_message was called with real_chat_id, not destination
-    assert mock_send.called
-    send_chat_id = mock_send.call_args[0][0]
-    assert send_chat_id == "real_chat_id", f"expected real_chat_id, got {send_chat_id}"
-    assert "garbage" not in str(mock_send.call_args)
-
-
-# ── T4.11 — send failure → no state update (R11/S14) ─────────────────────────
-
-
-def test_alerts_scheduler_send_failure_no_state_update() -> None:
-    """send_message raises → errors++, no DB write for that alert."""
-    from services import alerts_scheduler
-
-    import httpx as _httpx
-    alert = _make_alert(id="a1", operator="gt", target_value=50.0, channel="telegram")
-
-    mock_result = MagicMock()
-    mock_result.data = [alert]
-
-    mock_table = MagicMock()
-    mock_table.select.return_value = mock_table
-    mock_table.eq.return_value = mock_table
-    mock_table.execute.return_value = mock_result
-
-    mock_supa = MagicMock()
-    mock_supa.table.return_value = mock_table
-
-    with patch("services.alerts_scheduler.get_supabase_service", return_value=mock_supa), \
-         patch("services.alerts_scheduler.get_prices_batch", return_value={"AAPL": _price("AAPL", 200.0)}), \
-         patch("services.alerts_scheduler.resolve_chat_by_user", return_value=("chat-1", "es")), \
-         patch("services.alerts_scheduler.send_message", side_effect=_httpx.RequestError("timeout")):
-
-        result = alerts_scheduler.evaluate_active_alerts()
-
-    assert result["errors"] == 1
-    assert result["fired"] == 0
-    # DB update (table.update) must NOT have been called
-    mock_supa.table.return_value.update.assert_not_called()
 
 
 # ── T4.12 — state update on fire (R7/S9) ─────────────────────────────────────
@@ -493,9 +368,7 @@ def test_alerts_scheduler_state_update_on_fire() -> None:
     mock_supa.table.return_value = mock_query
 
     with patch("services.alerts_scheduler.get_supabase_service", return_value=mock_supa), \
-         patch("services.alerts_scheduler.get_prices_batch", return_value={"AAPL": _price("AAPL", 200.0)}), \
-         patch("services.alerts_scheduler.resolve_chat_by_user", return_value=("chat-1", "es")), \
-         patch("services.alerts_scheduler.send_message"):
+         patch("services.alerts_scheduler.get_prices_batch", return_value={"AAPL": _price("AAPL", 200.0)}):
 
         result = alerts_scheduler.evaluate_active_alerts()
 
@@ -519,13 +392,13 @@ def test_alerts_scheduler_state_update_on_fire() -> None:
 def test_alerts_scheduler_response_arithmetic_invariant() -> None:
     """evaluated == fired + skipped + errors always holds."""
     from services import alerts_scheduler
-    import httpx as _httpx
 
     alerts = [
         _make_alert(id="fire1", operator="gt", target_value=50.0, ticker="AAPL"),
-        _make_alert(id="skip1", operator="gt", target_value=50.0, ticker="MSFT", channel="email"),
-        _make_alert(id="err1",  operator="gt", target_value=50.0, ticker="GOOG",
-                    user_id="user-err"),
+        _make_alert(id="skip1", operator="gt", target_value=50.0, ticker="MSFT",
+                    last_triggered_at=_utc_iso(datetime.now(timezone.utc) - timedelta(hours=1)),
+                    cooldown_hours=24),
+        _make_alert(id="err1",  operator="gt", target_value=50.0, ticker="GOOG"),
         _make_alert(id="skip2", operator="crosses_up", ticker="TSLA"),
     ]
 
@@ -541,24 +414,13 @@ def test_alerts_scheduler_response_arithmetic_invariant() -> None:
     mock_supa = MagicMock()
     mock_supa.table.return_value = mock_query
 
-    def resolve_side_effect(uid):
-        if uid == "user-err":
-            return ("chat-err", "es")
-        return ("chat-ok", "es")
-
-    def send_side_effect(chat_id, text):
-        if chat_id == "chat-err":
-            raise _httpx.RequestError("timeout")
-
     with patch("services.alerts_scheduler.get_supabase_service", return_value=mock_supa), \
          patch("services.alerts_scheduler.get_prices_batch", return_value={
              "AAPL": _price("AAPL", 200.0),
              "MSFT": _price("MSFT", 200.0),
-             "GOOG": _price("GOOG", 200.0),
+             # GOOG missing → errors++
              "TSLA": _price("TSLA", 200.0),
-         }), \
-         patch("services.alerts_scheduler.resolve_chat_by_user", side_effect=resolve_side_effect), \
-         patch("services.alerts_scheduler.send_message", side_effect=send_side_effect):
+         }):
 
         result = alerts_scheduler.evaluate_active_alerts()
 
