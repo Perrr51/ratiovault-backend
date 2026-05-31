@@ -11,6 +11,7 @@ import logging
 import re
 import time
 from typing import Optional
+from urllib.parse import quote
 
 logger = logging.getLogger(__name__)
 
@@ -121,7 +122,7 @@ def fetch_stooq_history(yahoo_ticker: str, start: str, end: str) -> Optional[dic
     stooq_ticker = yahoo_to_stooq_ticker(yahoo_ticker)
     d1 = start.replace('-', '')
     d2 = end.replace('-', '')
-    url = f"https://stooq.com/q/d/l/?s={stooq_ticker}&d1={d1}&d2={d2}&i=d"
+    url = f"https://stooq.com/q/d/l/?s={quote(stooq_ticker, safe='')}&d1={d1}&d2={d2}&i=d"
 
     try:
         with httpx.Client(timeout=15.0) as client:
@@ -198,7 +199,7 @@ def fetch_stooq_quote(yahoo_ticker: str) -> Optional[dict]:
     Uses synchronous httpx.Client for compatibility with sync endpoints.
     """
     stooq_ticker = yahoo_to_stooq_ticker(yahoo_ticker)
-    url = f"https://stooq.com/q/l/?s={stooq_ticker}&f=sd2t2ohlcvn&h&e=csv"
+    url = f"https://stooq.com/q/l/?s={quote(stooq_ticker, safe='')}&f=sd2t2ohlcvn&h&e=csv"
 
     try:
         with httpx.Client(timeout=10.0) as client:

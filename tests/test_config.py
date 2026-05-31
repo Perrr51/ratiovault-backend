@@ -46,3 +46,25 @@ def test_settings_rejects_whitespace_notification_secret(fresh_config):
 def test_settings_accepts_non_empty_notification_secret(fresh_config):
     cfg = _reload_with_secret("pdl_ntfset_test_value")
     assert cfg.settings.paddle_notification_secret == "pdl_ntfset_test_value"
+
+
+# ── CORS wildcard guard (SEC-1 item 1.5) ─────────────────────────────────────
+
+
+def test_validate_settings_rejects_cors_wildcard(monkeypatch):
+    """validate_settings() must raise ValueError when CORS origins contain '*'."""
+    from config import settings, validate_settings
+    monkeypatch.setattr(settings, "cors_origins", "*")
+    # Ensure the later sec_user_agent check would pass if the CORS check were absent
+    monkeypatch.setattr(settings, "sec_user_agent", "RatioVault me@real.com")
+    with pytest.raises(ValueError, match="CORS wildcard"):
+        validate_settings()
+
+
+def test_validate_settings_accepts_explicit_origins(monkeypatch):
+    """validate_settings() must NOT raise when CORS origins are explicit URLs."""
+    from config import settings, validate_settings
+    monkeypatch.setattr(settings, "cors_origins", "https://ratiovault.com")
+    monkeypatch.setattr(settings, "sec_user_agent", "RatioVault me@real.com")
+    # Should not raise ValueError("CORS wildcard...")
+    validate_settings()

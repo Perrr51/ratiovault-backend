@@ -12,6 +12,18 @@ import pytest
 from fastapi.testclient import TestClient
 
 SECRET = "test-jwt"
+
+
+@pytest.fixture(autouse=True)
+def reset_limiter():
+    """Reset the in-process rate-limiter window before every test.
+
+    Prevents window pollution when the rate-limit test (which fires 11
+    requests) runs before other tests that expect 2xx responses.
+    """
+    from deps import limiter
+    limiter.reset()
+    yield
 API_KEY = "pdl_apikey_test"
 PORTAL_URL = "https://customer-portal.paddle.com/cpls_xyz?token=tmp"
 
@@ -132,3 +144,18 @@ def test_no_api_key_returns_500(client, monkeypatch):
     monkeypatch.setattr(settings, "paddle_api_key", "")
     r = client.post("/subscription/portal", headers={"Authorization": f"Bearer {_token()}"})
     assert r.status_code == 500
+
+
+def test_portal_rate_limit_enforced(client):
+    """11th request within the window must return 429 (10/minute limit)."""
+    from deps import limiter
+    limiter.reset()  # isolate from any prior window pollution
+    with patch("routers.portal.httpx.Client") as MockClient:
+        MockClient.return_value.__enter__.return_value.post.return_value = _ok_response()
+        headers = {"Authorization": f"Bearer {_token()}"}
+        codes = [
+            client.post("/subscription/portal", headers=headers).status_code
+            for _ in range(11)
+        ]
+    assert codes[-1] == 429, f"Expected 429 on 11th request, got {codes[-1]}; all codes: {codes}"
+    assert 200 in codes, "At least some requests should have succeeded before throttle"

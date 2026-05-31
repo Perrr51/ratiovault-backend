@@ -11,10 +11,11 @@ specific subscriptions; we include it when the user has an active sub.
 import logging
 
 import httpx
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, Header, HTTPException, Request
 
 from auth import verify_supabase_jwt
 from config import settings
+from deps import limiter
 from supabase_client import get_supabase_service
 
 REQUEST_TIMEOUT_S = 10.0
@@ -24,7 +25,8 @@ router = APIRouter(tags=["subscription"])
 
 
 @router.post("/subscription/portal")
-def create_portal_session(authorization: str = Header(None)):
+@limiter.limit("10/minute")
+def create_portal_session(request: Request, authorization: str = Header(None)):
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing or malformed Authorization header")
     token = authorization.removeprefix("Bearer ").strip()

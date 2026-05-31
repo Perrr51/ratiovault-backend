@@ -6,8 +6,9 @@ parsing exceptions. They never raise: any failure is reported in the
 """
 
 import time
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 
+from deps import limiter
 from stooq import fetch_stooq_quote
 from justetf import get_scraper
 
@@ -26,7 +27,8 @@ def _envelope(ok: bool, started: float, error: str | None) -> dict:
 
 
 @router.get("/health/stooq")
-def health_stooq():
+@limiter.limit("30/minute")
+def health_stooq(request: Request):
     started = time.monotonic()
     try:
         quote = fetch_stooq_quote(_STOOQ_PROBE_TICKER)
@@ -39,7 +41,8 @@ def health_stooq():
 
 
 @router.get("/health/justetf")
-def health_justetf():
+@limiter.limit("30/minute")
+def health_justetf(request: Request):
     started = time.monotonic()
     try:
         results = get_scraper().search_etfs(_JUSTETF_PROBE_QUERY)

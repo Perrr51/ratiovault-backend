@@ -24,6 +24,7 @@ POST /telegram/webhook
 """
 from __future__ import annotations
 
+import hmac
 import html
 import logging
 import random
@@ -1789,7 +1790,7 @@ async def telegram_webhook(
     Always returns 200 on auth-pass so Telegram does not retry.
     """
     expected = settings.telegram_webhook_secret
-    if not expected or x_telegram_bot_api_secret_token != expected:
+    if not expected or not hmac.compare_digest(x_telegram_bot_api_secret_token or "", expected):
         raise HTTPException(status_code=401, detail="invalid secret")
 
     try:
