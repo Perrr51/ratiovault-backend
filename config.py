@@ -113,6 +113,11 @@ def validate_settings():
     warning so the app can still boot with reduced functionality (e.g.
     subscription endpoints fail closed when Paddle / Supabase creds missing).
     """
+    if "*" in settings.cors_origins_list:
+        raise ValueError(
+            "CORS wildcard '*' cannot be used with allow_credentials=True"
+        )
+
     if not settings.sec_user_agent or "contact@example.com" in settings.sec_user_agent:
         raise ValueError(
             "SEC_USER_AGENT must be configured with a valid email address. "

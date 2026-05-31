@@ -100,3 +100,23 @@ def prune_telegram_tokens(request: Request, authorization: str = Header(None)):
         "prune-telegram-tokens cutoff=%s deleted=%d", cutoff.isoformat(), deleted
     )
     return {"deleted": deleted}
+
+
+@router.post("/internal/cron/prune-expired-undo-tickets")
+def prune_expired_undo_tickets(request: Request, authorization: str = Header(None)):
+    """Delete expired import_undo_tickets that were never restored.
+
+    Calls the `prune_expired_undo_tickets` RPC (SECURITY DEFINER, service_role
+    only) which deletes tickets where `expires_at < now() AND restored_at IS NULL`.
+    Returns the count of deleted rows.
+
+    Cron: daily, off-peak (e.g. 03:10 UTC). Example curl:
+        curl -s -X POST https://api.ratiovault.com/internal/cron/prune-expired-undo-tickets \\
+          -H "Authorization: Bearer $INTERNAL_CRON_TOKEN"
+    """
+    _authorize(request, authorization)  # timing-safe via hmac.compare_digest
+    client = get_supabase_service()
+    resp = client.rpc("prune_expired_undo_tickets").execute()
+    deleted = (resp.data or {}).get("deleted", 0)
+    logger.info("prune-expired-undo-tickets deleted=%d", deleted)
+    return {"deleted": deleted}
