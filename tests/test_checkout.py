@@ -15,6 +15,18 @@ SECRET = "test-jwt-secret"
 PADDLE_KEY = "pdl_apikey_test"
 
 
+@pytest.fixture(autouse=True)
+def reset_limiter():
+    """Reset the in-process rate-limiter window before every test.
+
+    Prevents window pollution when the rate-limit test (which fires 11
+    requests) runs before other tests that expect 2xx responses.
+    """
+    from deps import limiter
+    limiter.reset()
+    yield
+
+
 @pytest.fixture
 def client(monkeypatch):
     from config import settings
@@ -149,3 +161,18 @@ def test_paddle_network_error_returns_502(client):
         r = client.post("/subscription/checkout", json={"interval": "monthly"},
                         headers={"Authorization": f"Bearer {_token()}"})
     assert r.status_code == 502
+
+
+def test_checkout_rate_limit_enforced(client):
+    """11th request within the window must return 429 (10/minute limit)."""
+    from deps import limiter
+    limiter.reset()  # isolate from any prior window pollution
+    with patch("routers.checkout.httpx.Client") as mock_cls:
+        mock_cls.return_value.__enter__.return_value.post.return_value = _mock_paddle_response()
+        headers = {"Authorization": f"Bearer {_token()}"}
+        codes = [
+            client.post("/subscription/checkout", json={"interval": "monthly"}, headers=headers).status_code
+            for _ in range(11)
+        ]
+    assert codes[-1] == 429, f"Expected 429 on 11th request, got {codes[-1]}; all codes: {codes}"
+    assert 200 in codes, "At least some requests should have succeeded before throttle"

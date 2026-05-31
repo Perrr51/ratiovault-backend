@@ -11,11 +11,12 @@ to the webhook so we can resolve back to the Supabase user.
 import logging
 
 import httpx
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, Header, HTTPException, Request
 from pydantic import BaseModel
 
 from auth import verify_supabase_jwt
 from config import settings
+from deps import limiter
 
 logger = logging.getLogger(__name__)
 
@@ -51,24 +52,25 @@ def _resolve_price_id(plan: str, interval: str) -> str:
 
 
 @router.post("/subscription/checkout")
-def create_checkout(request: CheckoutRequest, authorization: str = Header(None)):
+@limiter.limit("10/minute")
+def create_checkout(request: Request, body: CheckoutRequest, authorization: str = Header(None)):
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing or malformed Authorization header")
     token = authorization.removeprefix("Bearer ").strip()
 
     claims = verify_supabase_jwt(token, settings.supabase_jwt_secret)
 
-    if request.plan not in ("pro", "founder"):
-        raise HTTPException(status_code=400, detail=f"Unknown plan: {request.plan}")
+    if body.plan not in ("pro", "founder"):
+        raise HTTPException(status_code=400, detail=f"Unknown plan: {body.plan}")
 
     if not settings.paddle_api_key:
         raise HTTPException(status_code=500, detail="Paddle API key not configured")
 
-    price_id = _resolve_price_id(request.plan, request.interval)
+    price_id = _resolve_price_id(body.plan, body.interval)
 
-    body = {
+    request_body = {
         "items": [{"price_id": price_id, "quantity": 1}],
-        "custom_data": {"uid": claims["uid"], "plan": request.plan},
+        "custom_data": {"uid": claims["uid"], "plan": body.plan},
         "customer": {"email": claims["email"]},
         "collection_mode": "automatic",
         # enable_checkout=true is required to receive a hosted checkout URL
@@ -84,7 +86,7 @@ def create_checkout(request: CheckoutRequest, authorization: str = Header(None))
                     "Authorization": f"Bearer {settings.paddle_api_key}",
                     "Content-Type": "application/json",
                 },
-                json=body,
+                json=request_body,
             )
     except httpx.HTTPError as exc:
         logger.error("Paddle /transactions network error: %s", exc)
@@ -98,8 +100,8 @@ def create_checkout(request: CheckoutRequest, authorization: str = Header(None))
         raise HTTPException(status_code=502, detail="Payment provider error")
 
     try:
-        payload = resp.json()
-        checkout_url = payload["data"]["checkout"]["url"]
+        response_payload = resp.json()
+        checkout_url = response_payload["data"]["checkout"]["url"]
     except (KeyError, ValueError, TypeError) as exc:
         logger.error("Paddle /transactions malformed response: %s", exc)
         raise HTTPException(status_code=502, detail="Payment provider malformed response")
