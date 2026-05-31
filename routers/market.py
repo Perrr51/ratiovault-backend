@@ -199,7 +199,7 @@ def get_quotes(request: Request, tickers: str):
             return {
                 "price": 0.0, "previousClose": 0.0, "open": 0.0,
                 "high": 0.0, "low": 0.0, "trailingPE": None,
-                "dividendYield": None, "error": str(e)
+                "dividendYield": None, "error": "data_unavailable"
             }
 
     # Fetch each ticker individually to prevent one failure from breaking the batch

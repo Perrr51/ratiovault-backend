@@ -155,7 +155,7 @@ def get_chart_data(request: Request, ticker: str, interval: str = "1M", indicato
             "open": [],
             "high": [],
             "low": [],
-            "error": str(e)
+            "error": "data_unavailable"
         }
 
 

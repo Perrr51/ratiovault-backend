@@ -250,7 +250,7 @@ def get_etf_holdings(request: Request, tickers: str = ""):
                                     "weight": round(float(item.get("holdingPercent", 0)) * 100, 2)
                                 })
             except Exception as e:
-                data["error"] = f"No fund data available: {str(e)[:100]}"
+                data["error"] = "No fund data available"
 
             results[ticker] = data
 
@@ -260,7 +260,7 @@ def get_etf_holdings(request: Request, tickers: str = ""):
                 "sectors": {},
                 "topHoldings": [],
                 "totalWeight": 0,
-                "error": str(e)[:200]
+                "error": "data_unavailable"
             }
 
     return results

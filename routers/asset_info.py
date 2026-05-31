@@ -135,7 +135,7 @@ def get_asset_info(request: Request, tickers: str):
             logger.warning(f"Failed to fetch asset info for {t}: {e}")
             # Use pattern-based fallback
             fallback = _infer_asset_type(t)
-            result[t] = {**fallback, "logoDomain": "", "error": str(e)}
+            result[t] = {**fallback, "logoDomain": "", "error": "data_unavailable"}
     return result
 
 
