@@ -92,15 +92,19 @@ def test_evaluate_alerts_endpoint_correct_token_empty_db_200(app_client) -> None
 # ── T5.4 — happy path: 1 active alert condition met → fired=1, delivery pending ─
 
 
-def test_evaluate_alerts_endpoint_happy_path_fires(app_client) -> None:
-    """Correct token + 1 active alert + mocked price → fired=1, delivery pending (email seam)."""
+def test_evaluate_alerts_endpoint_happy_path_pending(app_client) -> None:
+    """Correct token + 1 active alert + mocked price → condition met but delivery pending.
+
+    Email transport is not yet implemented. State must NOT be mutated.
+    Alert is counted as skipped (delivery pending), NOT fired (R7 seam).
+    """
     active_alert = {
         "id": "alert-happy",
         "user_id": "user-happy",
         "ticker": "AAPL",
         "operator": "gt",
         "target_value": 100.0,
-        "channel": "telegram",
+        "channel": "email",
         "destination": "ignored",
         "enabled": True,
         "status": "active",
@@ -117,7 +121,6 @@ def test_evaluate_alerts_endpoint_happy_path_fires(app_client) -> None:
     mock_table = MagicMock()
     mock_table.select.return_value = mock_table
     mock_table.eq.return_value = mock_table
-    mock_table.update.return_value = mock_table
     mock_table.execute.return_value = mock_result
 
     mock_supa = MagicMock()
@@ -135,5 +138,7 @@ def test_evaluate_alerts_endpoint_happy_path_fires(app_client) -> None:
 
     assert r.status_code == 200, r.text
     body = r.json()
-    # Alert condition met → state updated → fired=1; no delivery transport yet
-    assert body == {"evaluated": 1, "fired": 1, "skipped": 0, "errors": 0}, body
+    # Condition met → delivery pending → skipped=1, fired=0; state NOT mutated
+    assert body == {"evaluated": 1, "fired": 0, "skipped": 1, "errors": 0}, body
+    # DB update must NOT have been called (R7: state only advances after delivery)
+    mock_table.update.assert_not_called()

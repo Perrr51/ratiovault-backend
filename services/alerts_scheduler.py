@@ -4,22 +4,21 @@ Pure orchestrator: no FastAPI deps, no I/O it doesn't own.
 Called by POST /internal/cron/evaluate-alerts (R2, R12).
 
 Design refs: ADR-D1 (single function), ADR-D2 (price_cache reuse),
-ADR-D3 (ignore alerts.destination), ADR-D5 (per-alert atomic UPDATE),
-ADR-D6 (send_message raises on failure), ADR-D7 (operator allow-list),
-ADR-D8 (skip vs error taxonomy), ADR-D9 (locale-aware message).
+ADR-D5 (per-alert atomic UPDATE), ADR-D7 (operator allow-list),
+ADR-D8 (skip vs error taxonomy).
 
 T0 audit notes:
 - trigger_history is jsonb (JSON array), NOT jsonb[].
   Append uses: trigger_history || jsonb_build_array(jsonb_build_object(...))
   In Python/supabase-py we build the list in Python and pass it as JSON.
-- notification_channels.external_id holds the Telegram chat_id.
-- notification_channels.locale is TEXT NOT NULL DEFAULT 'en'.
 - _authorize helper in routers/internal.py is already module-level.
+- Email transport is NOT yet implemented. When a condition is met the alert
+  state is NOT mutated — see TODO(email-alerts) seam in evaluate_active_alerts().
+  State must only advance AFTER successful delivery (R7).
 """
 
 from __future__ import annotations
 
-import json
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -31,15 +30,6 @@ logger = logging.getLogger(__name__)
 
 # Operators the scheduler supports this sprint (ADR-D7).
 _SUPPORTED_OPS = ("gt", "gte", "lt", "lte")
-
-# Operator labels for Spanish and English notification messages (ADR-D9).
-_OP_LABEL: dict[str, dict[str, str]] = {
-    "gt":  {"es": "mayor que",    "en": "above"},
-    "gte": {"es": "mayor o igual que", "en": "at or above"},
-    "lt":  {"es": "menor que",    "en": "below"},
-    "lte": {"es": "menor o igual que", "en": "at or below"},
-}
-
 
 # ── Predicate ────────────────────────────────────────────────────────────────
 
@@ -55,39 +45,6 @@ def _matches(price: float, operator: str, target: float) -> bool:
     if operator == "lte":
         return price <= target
     return False  # unreachable — callers check allow-list before calling
-
-
-# ── Message formatter ─────────────────────────────────────────────────────────
-
-
-def _format_message(alert: dict, price: float, locale: str) -> str:
-    """Format the Telegram notification text.
-
-    ES template (default):
-        🔔 Alerta {ticker}
-        Precio actual: {price} {currency}
-        Condición: {operator_label} {target}
-
-    EN template when locale == 'en'.
-    """
-    ticker = alert.get("ticker", "")
-    target = alert.get("target_value", 0)
-    currency = alert.get("currency", "USD")
-    operator = alert.get("operator", "")
-    lang = locale if locale in ("es", "en") else "es"
-    op_label = _OP_LABEL.get(operator, {}).get(lang, operator)
-
-    if lang == "en":
-        return (
-            f"🔔 Alert {ticker}\n"
-            f"Current price: {price:.2f} {currency}\n"
-            f"Condition: {op_label} {target}"
-        )
-    return (
-        f"🔔 Alerta {ticker}\n"
-        f"Precio actual: {price:.2f} {currency}\n"
-        f"Condición: {op_label} {target}"
-    )
 
 
 # ── Cooldown check ────────────────────────────────────────────────────────────
@@ -162,6 +119,8 @@ def evaluate_active_alerts() -> dict:
     Returns:
         {"evaluated": int, "fired": int, "skipped": int, "errors": int}
         with the invariant evaluated == fired + skipped + errors (R12).
+        While email transport is unimplemented, condition-met alerts count as
+        skipped (delivery pending) and fired will always be 0.
 
     Algorithm:
         1. SELECT alerts WHERE enabled=true AND status='active'
@@ -171,9 +130,9 @@ def evaluate_active_alerts() -> dict:
             b. price missing → errors++ (transient infra issue)
             c. cooldown gate → skip (R6)
             d. predicate false → continue (not triggered)
-            e. UPDATE state atomically (R7)
-            f. TODO(email-alerts): deliver notification — skipped (pending)
-            g. fired++
+            e. TODO(email-alerts): deliver THEN call _update_alert_state
+               (state must only advance after successful delivery — R7).
+               Until email transport lands, count as skipped (delivery pending).
     """
     supa = get_supabase_service()
 
@@ -234,19 +193,17 @@ def evaluate_active_alerts() -> dict:
             if not _matches(current_price, operator, target_value):
                 continue
 
-            # e. Atomic state update (R7) — mark alert as evaluated/triggered
-            _update_alert_state(supa, alert, current_price)
-
-            # f. TODO(email-alerts): implement email transport here.
-            #    Alert condition was met and state updated; notification delivery
-            #    is intentionally deferred until email transport is wired in.
+            # e. Condition met — delivery pending.
+            # TODO(email-alerts): when email transport lands, deliver THEN call
+            # _update_alert_state (state must only advance after successful
+            # delivery — R7). Until then, do NOT mutate alert state: no
+            # trigger_count increment, no last_triggered_at update, no cooldown.
             logger.info(
-                "alert %s: condition met (price=%.4f %s %.4f) — delivery pending email transport",
+                "alert %s: condition met (price=%.4f %s %.4f) — delivery pending email transport,"
+                " state NOT mutated",
                 alert_id, current_price, operator, target_value,
             )
-
-            # g. Count as fired (evaluated + state updated; delivery pending)
-            fired += 1
+            skipped += 1
 
         except Exception as exc:  # noqa: BLE001
             logger.error("alert %s: unexpected error — %s", alert_id, exc, exc_info=True)

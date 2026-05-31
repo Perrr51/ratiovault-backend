@@ -25,7 +25,7 @@ def _make_alert(
     ticker: str = "AAPL",
     operator: str = "gt",
     target_value: float = 100.0,
-    channel: str = "telegram",
+    channel: str = "email",
     destination: str = "garbage",
     enabled: bool = True,
     status: str = "active",
@@ -179,7 +179,12 @@ def test_alerts_scheduler_unknown_operator_skipped_with_warn(caplog) -> None:
     ("lte", 100.0, 100.0, True),  # 100 <= 100 → fire
 ])
 def test_alerts_scheduler_operator_matching_gt_gte_lt_lte(op, price, target, should_fire) -> None:
-    """All 4 supported operators evaluate correctly."""
+    """All 4 supported operators evaluate correctly.
+
+    When condition is met (should_fire=True), alert counts as skipped/pending
+    (delivery deferred — no state mutation until email transport exists).
+    No DB update must be called in either case.
+    """
     from services import alerts_scheduler
 
     alert = _make_alert(id="a1", operator=op, target_value=target, ticker="AAPL")
@@ -192,11 +197,6 @@ def test_alerts_scheduler_operator_matching_gt_gte_lt_lte(op, price, target, sho
     mock_table.eq.return_value = mock_table
     mock_table.execute.return_value = mock_result
 
-    mock_update_table = MagicMock()
-    mock_update_table.update.return_value = mock_update_table
-    mock_update_table.eq.return_value = mock_update_table
-    mock_update_table.execute.return_value = MagicMock()
-
     mock_supa = MagicMock()
     mock_supa.table.return_value = mock_table
 
@@ -205,10 +205,17 @@ def test_alerts_scheduler_operator_matching_gt_gte_lt_lte(op, price, target, sho
 
         result = alerts_scheduler.evaluate_active_alerts()
 
+    # fired is always 0 until email transport is wired in
+    assert result["fired"] == 0, f"fired must be 0 for op={op} price={price} target={target}"
     if should_fire:
-        assert result["fired"] == 1, f"expected fired=1 for op={op} price={price} target={target}"
+        # Condition met → delivery pending → counted as skipped (no state mutation)
+        assert result["skipped"] == 1, (
+            f"expected skipped=1 (pending) for op={op} price={price} target={target}"
+        )
+        # DB update must NOT have been called (state must not advance before delivery)
+        mock_table.update.assert_not_called()
     else:
-        assert result["fired"] == 0, f"expected fired=0 for op={op} price={price} target={target}"
+        assert result["skipped"] == 0, f"expected skipped=0 for op={op} price={price} target={target}"
 
 
 # ── T4.5 — cooldown gate blocks (R6/S8) ──────────────────────────────────────
@@ -248,7 +255,11 @@ def test_alerts_scheduler_cooldown_gate_blocks() -> None:
 
 
 def test_alerts_scheduler_first_time_no_cooldown() -> None:
-    """last_triggered_at=NULL → no cooldown, evaluates normally."""
+    """last_triggered_at=NULL → no cooldown, condition evaluated.
+
+    Condition is met but state must NOT advance until email delivery exists.
+    Alert is counted skipped (pending) and DB update must not be called.
+    """
     from services import alerts_scheduler
 
     alert = _make_alert(
@@ -264,31 +275,30 @@ def test_alerts_scheduler_first_time_no_cooldown() -> None:
     mock_table.eq.return_value = mock_table
     mock_table.execute.return_value = mock_result
 
-    mock_update_table = MagicMock()
-    mock_update_table.update.return_value = mock_update_table
-    mock_update_table.eq.return_value = mock_update_table
-    mock_update_table.execute.return_value = MagicMock()
-
-    def table_side_effect(name):
-        return mock_table
-
     mock_supa = MagicMock()
-    mock_supa.table.side_effect = table_side_effect
+    mock_supa.table.return_value = mock_table
 
     with patch("services.alerts_scheduler.get_supabase_service", return_value=mock_supa), \
          patch("services.alerts_scheduler.get_prices_batch", return_value={"AAPL": _price("AAPL", 200.0)}):
 
         result = alerts_scheduler.evaluate_active_alerts()
 
-    assert result["fired"] == 1
-    assert result["skipped"] == 0
+    # Condition met but delivery pending — state must not advance
+    assert result["fired"] == 0
+    assert result["skipped"] == 1
+    # DB update must NOT have been called (R7: state only advances after delivery)
+    mock_table.update.assert_not_called()
 
 
 # ── T4.7 — past cooldown fires (R6,R7/S9) ────────────────────────────────────
 
 
 def test_alerts_scheduler_past_cooldown_fires() -> None:
-    """last_triggered_at=now()-25h, cooldown_hours=24 → fires normally."""
+    """last_triggered_at=now()-25h, cooldown_hours=24 → past cooldown, condition evaluated.
+
+    Condition is met but state must NOT advance until email delivery exists.
+    Alert is counted skipped (pending) and DB update must not be called.
+    """
     from services import alerts_scheduler
 
     triggered_25h_ago = _utc_iso(datetime.now(timezone.utc) - timedelta(hours=25))
@@ -313,14 +323,23 @@ def test_alerts_scheduler_past_cooldown_fires() -> None:
 
         result = alerts_scheduler.evaluate_active_alerts()
 
-    assert result["fired"] == 1
+    # Past cooldown + condition met → delivery pending → state must not advance
+    assert result["fired"] == 0
+    assert result["skipped"] == 1
+    # DB update must NOT have been called (R7: state only advances after delivery)
+    mock_table.update.assert_not_called()
 
 
 # ── T4.8 — any channel passes evaluation (email-only seam, R10 removed) ──────
 
 
 def test_alerts_scheduler_any_channel_evaluates() -> None:
-    """channel value is no longer filtered — all alerts evaluate via operator/price/cooldown."""
+    """channel value is no longer filtered — all alerts evaluate via operator/price/cooldown.
+
+    Condition is met but state must NOT advance until email delivery exists.
+    Alert is counted skipped (delivery pending), NOT fired.
+    DB update must not be called (R7: state only advances after delivery).
+    """
     from services import alerts_scheduler
 
     alert = _make_alert(id="a1", operator="gt", target_value=50.0, channel="email")
@@ -341,16 +360,25 @@ def test_alerts_scheduler_any_channel_evaluates() -> None:
 
         result = alerts_scheduler.evaluate_active_alerts()
 
-    # Alert evaluates (condition met), state updated, delivery pending
-    assert result["fired"] == 1
+    # Condition met → delivery pending → skipped (not fired), no state mutation
+    assert result["fired"] == 0
+    assert result["skipped"] == 1
     assert result["errors"] == 0
+    # DB update must NOT have been called (R7: state only advances after delivery)
+    mock_table.update.assert_not_called()
 
 
-# ── T4.12 — state update on fire (R7/S9) ─────────────────────────────────────
+# ── T4.12 — state NOT mutated while delivery is unimplemented (R7 seam) ───────
 
 
-def test_alerts_scheduler_state_update_on_fire() -> None:
-    """On fire: trigger_count+1, last_triggered_at set, trigger_history appended, status unchanged."""
+def test_alerts_scheduler_state_not_mutated_pending_delivery() -> None:
+    """Condition met but email transport absent → DB state must NOT advance.
+
+    R7: state must only advance AFTER successful delivery.
+    Until email transport exists: no trigger_count increment, no
+    last_triggered_at update, no trigger_history append. Alert is counted
+    as skipped (delivery pending), never fired.
+    """
     from services import alerts_scheduler
 
     alert = _make_alert(
@@ -372,18 +400,12 @@ def test_alerts_scheduler_state_update_on_fire() -> None:
 
         result = alerts_scheduler.evaluate_active_alerts()
 
-    assert result["fired"] == 1
+    # Condition met → delivery pending → skipped (not fired)
+    assert result["fired"] == 0
+    assert result["skipped"] == 1
 
-    # Check update was called with the correct fields
-    update_call_args = mock_query.update.call_args
-    assert update_call_args is not None, "DB update was not called"
-    update_payload = update_call_args[0][0]
-    assert "trigger_count" in update_payload
-    assert update_payload["trigger_count"] == 4  # 3 + 1
-    assert "last_triggered_at" in update_payload
-    assert "trigger_history" in update_payload
-    # status must NOT be changed to anything else
-    assert update_payload.get("status") != "triggered"
+    # DB update must NOT have been called — state does not advance before delivery
+    mock_query.update.assert_not_called()
 
 
 # ── T4.13 — response arithmetic invariant (R12/S15) ──────────────────────────
