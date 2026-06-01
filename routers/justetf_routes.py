@@ -84,6 +84,9 @@ async def etf_search(request: Request, q: str = ""):
 
 @router.get("/etf/sectors/{isin}")
 @limiter.limit("30/minute")
+# No JWT auth on this route — intentional. Consistent with all other market-data routes
+# in this router (/etf/profile, /etf/similar, /etf/search), which are rate-limited only.
+# justETF data is public; auth would add latency with no security benefit for cached reads.
 async def etf_sectors(request: Request, isin: str):
     """Get ETF sector breakdown by ISIN with 7-day persistent cache.
 
