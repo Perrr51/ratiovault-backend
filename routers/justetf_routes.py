@@ -141,19 +141,23 @@ async def etf_sectors(request: Request, isin: str):
         profile = _fetch_etf_sectors(isin)
         sectors = profile.get("sectors", {})
 
-        # Write-through UPSERT — only on successful scrape
-        try:
-            supabase.table("etf_sector_cache").upsert(
-                {
-                    "isin": isin,
-                    "sectors": sectors,
-                    "source": "justetf",
-                    "fetched_at": now.isoformat(),
-                },
-                on_conflict="isin",
-            ).execute()
-        except Exception as exc:
-            logger.warning("[etf/sectors] cache write failed for %s: %s", isin, exc)
+        # Write-through UPSERT — only when scrape returned non-empty sectors.
+        # Guard: if sectors is empty (justETF page has no sector table for this ISIN,
+        # e.g. money-market or bond ETF with no equity breakdown), skip the write.
+        # Spec S6: never persist empty/poisoned rows that would stale-serve {} for 7d.
+        if sectors:
+            try:
+                supabase.table("etf_sector_cache").upsert(
+                    {
+                        "isin": isin,
+                        "sectors": sectors,
+                        "source": "justetf",
+                        "fetched_at": now.isoformat(),
+                    },
+                    on_conflict="isin",
+                ).execute()
+            except Exception as exc:
+                logger.warning("[etf/sectors] cache write failed for %s: %s", isin, exc)
 
         return {
             "isin": isin,

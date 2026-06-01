@@ -208,6 +208,38 @@ class TestEtfSectorsEndpoint:
         resp = _client().get("/etf/sectors/IE00BK5B")
         assert resp.status_code in (400, 422)
 
+    def test_successful_scrape_with_no_sectors_does_not_write_cache(self, monkeypatch):
+        """Scrape succeeds but returns no sectors key → must NOT upsert empty row.
+
+        Spec S6: never persist empty/poisoned rows. A successful scrape that finds
+        no sector table on the justETF page (e.g. money-market ETF) returns
+        profile without 'sectors' key → sectors = {}. The endpoint must return
+        gracefully but must NOT write {} to etf_sector_cache.
+        """
+        mock_sb = _make_supabase_mock(row=None)
+
+        def fake_fetch_no_sectors(isin):
+            # Scrape succeeds but page has no sector table → no 'sectors' key
+            return {"isin": isin}
+
+        import routers.justetf_routes as routes_mod
+
+        monkeypatch.setattr(routes_mod, "get_supabase_service", lambda: mock_sb)
+        monkeypatch.setattr(routes_mod, "_fetch_etf_sectors", fake_fetch_no_sectors)
+
+        resp = _client().get(f"/etf/sectors/{VWCE_ISIN}")
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["isin"] == VWCE_ISIN
+        assert body["sectors"] == {}
+        assert body["stale"] is False
+        # CRITICAL: no empty row must be written to cache
+        assert not mock_sb._upsert_called, (
+            "Cache must NOT be written when scrape succeeds but returns empty sectors "
+            "(spec S6: no empty/poisoned rows)"
+        )
+
     def test_invalid_isin_lowercase_rejected(self, monkeypatch):
         """Lowercase ISIN → normalized to uppercase and validated.
 
