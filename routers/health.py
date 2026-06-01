@@ -16,6 +16,7 @@ router = APIRouter()
 
 _STOOQ_PROBE_TICKER = "AAPL.US"
 _JUSTETF_PROBE_QUERY = "VWCE"
+_JUSTETF_PROBE_ISIN = "IE00BK5BQT80"  # VWCE ISIN for sectors probe
 
 
 def _envelope(ok: bool, started: float, error: str | None) -> dict:
@@ -52,3 +53,33 @@ def health_justetf(request: Request):
     if not results:
         return _envelope(False, started, "justetf returned no results")
     return _envelope(True, started, None)
+
+
+@router.get("/health/justetf/sectors")
+@limiter.limit("10/minute")
+def health_justetf_sectors(request: Request):
+    """Probe the justETF sector parsing path with a known ISIN (VWCE).
+
+    Verifies that _parse_profile returns at least 1 sector row. Never raises.
+    Lower rate limit (10/min) since this triggers a live HTTP scrape.
+    """
+    started = time.monotonic()
+    try:
+        profile = get_scraper().get_etf_profile(_JUSTETF_PROBE_ISIN)
+        if not profile:
+            return _envelope(False, started, "justetf sectors probe: no profile returned")
+        sectors = profile.get("sectors", {})
+        if not sectors:
+            return {
+                **_envelope(False, started, "justetf sectors probe: no sectors in profile"),
+                "sectors_ok": False,
+            }
+        return {
+            **_envelope(True, started, None),
+            "sectors_ok": True,
+        }
+    except Exception as exc:
+        return {
+            **_envelope(False, started, str(exc) or exc.__class__.__name__),
+            "sectors_ok": False,
+        }
