@@ -142,6 +142,41 @@ class JustETFScraper:
                     if yield_match:
                         result["dividendYield"] = float(yield_match.group(1))
 
+        # Extract sector allocation table.
+        # pct stored as percentage points (0-100), consistent with etf_sector_cache
+        # and calcETFSectorBreakdown frontend consumer.
+        # Selector: data-testid="tl_etf-holdings_sectors_value_name" on the name cell;
+        # the sibling value cell (next <td> in the same <tr>) holds the pct string.
+        sectors: dict[str, float] = {}
+        for name_cell in soup.find_all(attrs={"data-testid": "tl_etf-holdings_sectors_value_name"}):
+            sector_name = name_cell.get_text(strip=True)
+            if not sector_name:
+                continue
+            # Walk to the parent row and find the next sibling td with the pct value.
+            row = name_cell.parent
+            if row is None:
+                continue
+            cells = row.find_all("td")
+            # The name cell may be first or last in the row — find it and get the
+            # next sibling td that contains a percentage-like string.
+            found_name = False
+            for cell in cells:
+                if found_name:
+                    pct_text = cell.get_text(strip=True)
+                    try:
+                        pct_value = float(pct_text.rstrip("%").strip())
+                        sectors[sector_name] = pct_value
+                    except (ValueError, AttributeError):
+                        # Skip malformed rows (e.g. "n/a") — do not crash
+                        pass
+                    break
+                if cell is name_cell:
+                    found_name = True
+        # Only emit the key when at least one sector was successfully parsed.
+        # Absent key → frontend treats ticker as fully unresolved → Otros bucket.
+        if sectors:
+            result["sectors"] = sectors
+
         return result
 
     def find_similar_etfs(self, isin: str) -> list:
