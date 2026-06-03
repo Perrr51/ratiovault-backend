@@ -82,6 +82,49 @@ async def etf_search(request: Request, q: str = ""):
     return {"query": q, "results": results}
 
 
+@router.get("/etf/resolve-isin/{ticker}")
+@limiter.limit("15/minute")
+# No JWT auth — consistent with all other market-data routes in this router.
+# justETF data is public; rate-limit is the only guard needed.
+async def etf_resolve_isin(request: Request, ticker: str):
+    """Resolve ISIN for a ticker using justETF search + confidence gate.
+
+    Strips EU exchange suffix from ticker, queries the justETF Wicket/DataTables
+    API, and returns a confidence verdict.
+
+    Confidence values:
+      - 'high': exactly 1 distinct ISIN found; safe to auto-write to DB.
+      - 'low': 2+ distinct ISINs found (ambiguous); candidates returned for
+               manual selection/confirmation.
+      - 'none': no match, scraper failure, or empty input.
+
+    This endpoint NEVER returns 5xx — degrades to confidence='none' on any
+    scraper or internal error. Returns 400 on invalid ticker input.
+
+    Rate limit: 15 requests/minute (same as /etf/sectors).
+    """
+    ticker = ticker.strip()
+    if not ticker:
+        raise HTTPException(status_code=400, detail="Ticker must not be empty")
+    if len(ticker) > 20:
+        raise HTTPException(status_code=400, detail="Ticker too long (max 20 chars)")
+
+    try:
+        from justetf import resolve_isin_from_ticker
+        result = resolve_isin_from_ticker(ticker)
+    except Exception as exc:  # noqa: BLE001 — degrade, never 5xx
+        logger.error("[etf/resolve-isin] error for %s: %s", ticker, exc)
+        result = {"isin": None, "confidence": "none", "name": None, "candidates": []}
+
+    return {
+        "ticker": ticker,
+        "isin": result.get("isin"),
+        "confidence": result.get("confidence", "none"),
+        "name": result.get("name"),
+        "candidates": result.get("candidates", []),
+    }
+
+
 @router.get("/etf/sectors/{isin}")
 @limiter.limit("30/minute")
 # No JWT auth on this route — intentional. Consistent with all other market-data routes

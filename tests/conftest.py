@@ -184,3 +184,16 @@ def pg_conn(supabase_local):  # noqa: ARG001 — fixture ensures DB reset has ru
     """
     with psycopg.connect(LOCAL_DB_DSN, autocommit=True) as conn:
         yield conn
+
+
+# ---------------------------------------------------------------------------
+# Custom markers
+# ---------------------------------------------------------------------------
+# Register here so `pytest -m external` works and these tests are excluded
+# from the default suite (they require live network access to justETF).
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "external: marks tests that require live network access "
+        "(deselected by default; run with -m external)",
+    )
