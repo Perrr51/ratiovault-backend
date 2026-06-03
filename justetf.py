@@ -13,6 +13,12 @@ _cache_ttl = 86400  # 24 hours
 JUSTETF_BASE = "https://www.justetf.com/en"
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
+# EU exchange suffixes stripped when normalising a ticker root.
+_EU_SUFFIXES = re.compile(
+    r'\.(?:DE|L|SW|AS|MI|PA|MC|F|XD)$',
+    re.IGNORECASE,
+)
+
 
 class JustETFScraper:
     def __init__(self):
@@ -23,16 +29,47 @@ class JustETFScraper:
         )
         self._counter = None
 
-    def _get_counter(self):
-        """Extract dynamic counter from justETF search page."""
+    def _get_fetch_callback_url(self) -> str | None:
+        """Extract the Wicket DataTables fetchCallbackUrl from the justETF search page.
+
+        justETF migrated from HTML-snippet arrays to a Wicket/DataTables JSON API.
+        The DataTables source URL is session-scoped and embedded as JSON in the page.
+        Format in page: {"fetchCallbackUrl":"/en/search.html?<wicket-component-path>"}
+
+        Returns the full absolute callback URL, or None if not found.
+        Cache result per session (reset on 5xx / connection error).
+        """
         if self._counter:
             return self._counter
+
         resp = self.session.get(f"{JUSTETF_BASE}/search.html")
         resp.raise_for_status()
-        match = re.search(r'search\.html\?(\d+)', resp.text)
+        page_body = resp.text
+
+        match = re.search(r'"fetchCallbackUrl"\s*:\s*"([^"]+)"', page_body)
         if match:
-            self._counter = match.group(1)
+            path = match.group(1)
+            # Path is relative (/en/search.html?...) — make it absolute.
+            if path.startswith("/"):
+                self._counter = f"https://www.justetf.com{path}"
+            else:
+                self._counter = path
         return self._counter
+
+    # Keep _get_counter as a backward-compatible alias (used by find_similar_etfs).
+    def _get_counter(self) -> str | None:
+        """Legacy alias for _get_fetch_callback_url. Returns only the query-string part
+        for backward compatibility with callers that append it to the base URL.
+
+        NOTE: callers in search_etfs and find_similar_etfs should prefer
+        _get_fetch_callback_url() which returns the full absolute URL.
+        """
+        full_url = self._get_fetch_callback_url()
+        if full_url is None:
+            return None
+        # Extract just the query-string portion (after the '?')
+        idx = full_url.find("?")
+        return full_url[idx + 1:] if idx >= 0 else None
 
     def fetch_all_etfs(self):
         """Fetch all ETF data from justETF. Returns list of dicts."""
@@ -247,39 +284,53 @@ class JustETFScraper:
             return []
 
     def search_etfs(self, query: str) -> list:
-        """Search ETFs by name or keyword."""
+        """Search ETFs by ticker root using the justETF Wicket/DataTables JSON API.
+
+        Changed in Phase 2: justETF migrated from HTML-snippet arrays to a
+        Wicket/DataTables JSON API. This implementation:
+          1. GETs /en/search.html to extract the session-scoped fetchCallbackUrl.
+          2. POSTs a DataTables payload to that URL requesting the full ETF list.
+          3. Filters the returned rows client-side by exact ticker match.
+
+        The API returns the full ETF catalogue (~3400 records) as structured JSON
+        dicts. Each row includes: ticker, isin, name, fundCurrency, domicileCountry,
+        distributionPolicy, ter, etc. No HTML parsing is required.
+
+        Args:
+            query: ticker root (suffix already stripped; e.g. "VWCE", "VUSA").
+
+        Returns:
+            List of matching row dicts (may be empty on no match or scraper failure).
+        """
         cache_key = f"search:{query.lower()}"
         cached = _etf_cache.get(cache_key)
-        if cached and (datetime.now() - cached["ts"]).total_seconds() < 3600:  # 1h cache for searches
+        if cached and (datetime.now() - cached["ts"]).total_seconds() < 3600:
             return cached["data"]
 
         try:
-            url = f"{JUSTETF_BASE}/search.html"
-            counter = self._get_counter()
-            if counter:
-                url = f"{url}?{counter}"
+            callback_url = self._get_fetch_callback_url()
+            if not callback_url:
+                return []
 
             payload = {
-                "draw": 1,
-                "start": 0,
-                "length": 20,
+                "draw": "1",
+                "start": "0",
+                "length": "-1",          # full catalogue
+                "search[value]": "",      # no server-side filter; we filter client-side
+                "search[regex]": "false",
                 "lang": "en",
                 "country": "DE",
                 "universeType": "private",
                 "defaultCurrency": "EUR",
-                "search": query,
             }
 
-            resp = self.session.post(url, data=payload)
+            resp = self.session.post(callback_url, data=payload)
             resp.raise_for_status()
-            raw = resp.json().get("data", [])
+            all_rows: list[dict] = resp.json().get("data", [])
 
-            # Parse results - justETF returns HTML snippets in arrays
-            results = []
-            for item in raw:
-                parsed = self._parse_search_result(item)
-                if parsed:
-                    results.append(parsed)
+            # Filter rows by exact ticker match (case-insensitive)
+            q_upper = query.upper()
+            results = [r for r in all_rows if str(r.get("ticker", "")).upper() == q_upper]
 
             _etf_cache[cache_key] = {"data": results, "ts": datetime.now()}
             return results
@@ -287,12 +338,22 @@ class JustETFScraper:
             return []
 
     def _parse_search_result(self, item) -> dict | None:
-        """Parse a single search result from justETF API response."""
+        """Legacy HTML-snippet parser — DEPRECATED.
+
+        The justETF Wicket/DataTables API now returns structured JSON dicts
+        directly. This method is retained only so existing callers that passed
+        raw list items through find_similar_etfs() do not crash, but it should
+        not be called in new code.
+        """
         if not isinstance(item, (list, dict)):
             return None
 
+        # New API: row is already a clean dict — pass through if it has an ISIN.
+        if isinstance(item, dict):
+            return item if item.get("isin") else None
+
         result = {}
-        raw = item if isinstance(item, list) else [item]
+        raw = item  # list of HTML-snippet strings (legacy format)
 
         for field in raw:
             if not isinstance(field, str):
@@ -332,3 +393,115 @@ def get_scraper() -> JustETFScraper:
     if _scraper is None:
         _scraper = JustETFScraper()
     return _scraper
+
+
+# ---------------------------------------------------------------------------
+# Pure confidence gate (no I/O, fully unit-testable)
+# ---------------------------------------------------------------------------
+
+def compute_isin_confidence(ticker_root: str, search_rows: "list[dict] | None") -> dict:
+    """Pure function: compute ISIN resolution confidence from justETF search rows.
+
+    Normalises ticker_root (strips EU exchange suffix, uppercases), then:
+      - Filters rows whose 'ticker' field matches the normalised root.
+      - Collects distinct ISINs from matched rows.
+      - Returns confidence 'high' iff exactly 1 distinct ISIN is found.
+      - Returns confidence 'low' with candidates iff 2+ distinct ISINs (ambiguous).
+      - Returns confidence 'none' if no match or empty/None input.
+
+    The currency cross-check from the original design is intentionally ABSENT:
+    justETF 'fundCurrency' is the fund base currency (USD for most EU UCITS ETFs)
+    and does NOT match the yfinance trading currency (EUR for .DE, GBP for .L).
+    Using it would mis-reject nearly every EU ETF. Removed per Phase 0 spike.
+
+    Args:
+        ticker_root: ticker with or without EU exchange suffix (e.g. "VWCE" or
+                     "VWCE.DE"). Suffix is stripped internally.
+        search_rows: list of row dicts from search_etfs(). May be None (scraper
+                     failure) or empty (no results). Each row must have at least
+                     'ticker', 'isin', 'name' keys.
+
+    Returns:
+        dict with keys:
+            isin (str | None): resolved ISIN or None
+            confidence ('high' | 'low' | 'none')
+            name (str | None): fund name for the resolved ISIN (high only)
+            candidates (list[dict]): [{isin, name}, ...] for low/ambiguous results;
+                                     empty list for none; single-entry list for high
+    """
+    # Normalise: strip EU exchange suffix, uppercase
+    root = _EU_SUFFIXES.sub("", ticker_root.strip()).upper()
+
+    # Degenerate input
+    if not search_rows:
+        return {"isin": None, "confidence": "none", "name": None, "candidates": []}
+
+    # Step 1 — filter rows by exact ticker match
+    matched = [
+        r for r in search_rows
+        if str(r.get("ticker") or r.get("symbol") or "").upper() == root
+    ]
+
+    if not matched:
+        return {"isin": None, "confidence": "none", "name": None, "candidates": []}
+
+    # Step 2 — collect distinct ISINs (preserving first-occurrence order)
+    seen_isins: dict[str, str] = {}  # isin → name
+    for row in matched:
+        isin = row.get("isin") or ""
+        if isin and isin not in seen_isins:
+            seen_isins[isin] = row.get("name") or ""
+
+    distinct_isins = list(seen_isins.items())  # [(isin, name), ...]
+
+    # Step 3 — gate decision
+    if len(distinct_isins) == 1:
+        isin, name = distinct_isins[0]
+        return {
+            "isin": isin,
+            "confidence": "high",
+            "name": name or None,
+            "candidates": [{"isin": isin, "name": name}],
+        }
+
+    if len(distinct_isins) >= 2:
+        candidates = [{"isin": i, "name": n} for i, n in distinct_isins]
+        return {
+            "isin": None,
+            "confidence": "low",
+            "name": None,
+            "candidates": candidates,
+        }
+
+    # Matched rows all had empty ISINs — treat as no match
+    return {"isin": None, "confidence": "none", "name": None, "candidates": []}
+
+
+# ---------------------------------------------------------------------------
+# Resolver: strip suffix → search → gate → cached result
+# ---------------------------------------------------------------------------
+
+def resolve_isin_from_ticker(ticker: str) -> dict:
+    """Resolve ISIN for a ticker using the justETF Wicket search + confidence gate.
+
+    Thin orchestrator: normalise ticker root → call search_etfs → compute_isin_confidence.
+    Result is cached in _etf_cache with a 1-hour TTL (same as search_etfs).
+
+    Args:
+        ticker: full ticker with or without exchange suffix (e.g. "VWCE.DE" or "VWCE").
+
+    Returns:
+        dict from compute_isin_confidence: {isin, confidence, name, candidates}
+    """
+    root = _EU_SUFFIXES.sub("", ticker.strip()).upper()
+    cache_key = f"resolve:{root}"
+    cached = _etf_cache.get(cache_key)
+    if cached and (datetime.now() - cached["ts"]).total_seconds() < 3600:
+        return cached["data"]
+
+    scraper = get_scraper()
+    rows = scraper.search_etfs(root)
+    result = compute_isin_confidence(root, rows)
+
+    _etf_cache[cache_key] = {"data": result, "ts": datetime.now()}
+    return result
